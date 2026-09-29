@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from bpmn_framework import GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
+from validate_bpmn import xsd_errors_xml
 
 ROOT_PROCESS_ID = "Process_Root"
 ROOT_START_TASK_ID = "Event_RootStart"
@@ -250,6 +251,10 @@ def execute_generated_code(
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit)
+        errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
+        if errors:
+            return "", {}, "XML не прошёл проверку по XSD BPMN 2.0: " + "; ".join(errors[:3])
+        audit["xsd_valid"] = errors is not None
         return xml, audit, ""
     except Exception as exc:  # noqa: BLE001 — песочница обязана не падать
         return "", {}, f"Ошибка исполнения кода: {type(exc).__name__}: {exc}"

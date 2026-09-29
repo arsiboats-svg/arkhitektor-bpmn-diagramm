@@ -212,12 +212,14 @@
     "critical": [],
     "ok": true
   },
+  "xsd_valid": true,
   "generation": {
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
-      "LLM недоступна — включён встроенный эмулятор"
+      "облачный API: OPENAI_API_KEY не задан"
     ],
+    "rejected": [],
     "elapsed_s": 0.02,
     "parsed": {
       "title": "Технологическое присоединение льготного потребителя (до 15 кВт) к электрическим сетям",

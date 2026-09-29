@@ -163,7 +163,7 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 Цепочка `generate_bpmn_from_text` никогда не бросает исключение:
 
 1. **Облачная модель по OpenAI-совместимому API** — если задан `OPENAI_API_KEY`. Основной режим демо:
-   Groq, GPT-OSS 120B (ответ за секунды); запасной — Google Gemini Flash.
+   Groq, GPT-OSS 120B (ответ за секунды); запасной — любой OpenAI-совместимый провайдер с открытой моделью (`FALLBACK_*`).
 2. **Ollama** (`http://localhost:11434/api/generate`) — офлайн-режим для закрытого контура, модель выбирается
    автоматически: `qwen2.5-coder`, затем `llama3`. На ноутбуке 7B-модель отвечает 2–4 минуты.
 3. **Встроенный эмулятор** — разбор нумерованных шагов, ролей, условий («Если … — перейти к п.N, иначе …»), «Параллельно:» и этапов. Сам генерирует код для `DIAGRAM`.
@@ -193,7 +193,7 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 | `LLM_RETRY_MAX_CALL_S` | `90` — повтор не делается, если первый ответ шёл дольше (иначе ожидание удваивается) |
 | `OPENAI_API_KEY` | если задан, подключается внешний API |
 | `OPENAI_BASE_URL`, `OPENAI_MODEL` | адрес и модель совместимого API (Groq: `openai/gpt-oss-120b`) |
-| `FALLBACK_API_KEY`, `FALLBACK_BASE_URL`, `FALLBACK_MODEL` | запасной OpenAI-совместимый провайдер (Gemini / OpenRouter), если основной отказал |
+| `FALLBACK_API_KEY`, `FALLBACK_BASE_URL`, `FALLBACK_MODEL` | запасной OpenAI-совместимый провайдер с открытой моделью (например, OpenRouter), если основной отказал |
 | `OPENAI_REASONING_EFFORT` | для рассуждающих моделей: `low` — быстрее и экономнее по лимиту токенов |
 | `BPMN_AI_MODE=emulator` | принудительно использовать только эмулятор |
 
@@ -208,6 +208,12 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 - **Открытый стандарт:** результат — обычный BPMN 2.0 XML, его можно доработать в любом BPMN-редакторе (Camunda Modeler, bpmn.io, ARIS-импорт).
 
 ## ✅ Проверено
+
+- **Официальная XSD-схема BPMN 2.0 (OMG, `schemas/BPMN20.xsd`)**: каждый сгенерированный файл проверяется
+  перед выдачей пользователю (отметка «✓ XSD BPMN 2.0» под кнопкой); невалидный XML не отдаётся.
+  Отдельно: `python3 validate_bpmn.py file.bpmn`.
+- **Модели — только open-source** (правила хакатона): `openai/gpt-oss-120b` (Apache 2.0) через Groq, офлайн —
+  `qwen2.5-coder` в Ollama. Переход на стек партнёра (Yandex Cloud) — смена `OPENAI_BASE_URL`/`OPENAI_MODEL`.
 
 - Все `.bpmn` (демо и три примера) импортируются в bpmn-js 17.11.1 без предупреждений.
 - `validate_bpmn.py`: 0 диагональных сегментов, 0 наложений блоков, 0 пересечений чужих блоков стрелками, 0 коллизий подписей.

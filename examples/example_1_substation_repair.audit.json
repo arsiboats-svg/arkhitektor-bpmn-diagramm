@@ -226,13 +226,15 @@
     "critical": [],
     "ok": true
   },
+  "xsd_valid": true,
   "generation": {
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
-      "LLM недоступна — включён встроенный эмулятор"
+      "облачный API: OPENAI_API_KEY не задан"
     ],
-    "elapsed_s": 0.02,
+    "rejected": [],
+    "elapsed_s": 0.04,
     "parsed": {
       "title": "Аварийно-восстановительные работы на ПС 110 кВ с оформлением наряда-допуска",
       "steps": 16,

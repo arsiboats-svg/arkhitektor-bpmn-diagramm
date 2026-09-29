@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Офлайн-валидатор BPMN-файлов: целостность ссылок, ортогональность, наезды, подписи.
+"""Офлайн-валидатор BPMN-файлов: официальная XSD-схема BPMN 2.0 (OMG), целостность ссылок,
+ортогональность, наезды, подписи.
 
 Использование:  python3 validate_bpmn.py file1.bpmn [file2.bpmn ...]
 Код возврата 0 — все проверки пройдены.
@@ -8,7 +9,9 @@
 from __future__ import annotations
 
 import sys
-from typing import Dict, List, Tuple
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 NS = {
@@ -50,8 +53,37 @@ def _seg_hits(a: Tuple[float, float], b: Tuple[float, float], r: Rect) -> bool:
     return True
 
 
+SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "BPMN20.xsd"  # OMG formal/2010-05-04
+
+
+@lru_cache(maxsize=1)
+def _xsd():  # type: ignore[no-untyped-def]
+    try:
+        from lxml import etree
+    except ImportError:
+        return None
+    return etree.XMLSchema(etree.parse(str(SCHEMA_PATH)))
+
+
+def xsd_errors(path: str) -> Optional[List[str]]:
+    """Ошибки по официальной XSD BPMN 2.0; None — lxml не установлен (проверка пропущена)."""
+    return xsd_errors_xml(Path(path).read_bytes())
+
+
+def xsd_errors_xml(xml: "str | bytes") -> Optional[List[str]]:
+    schema = _xsd()
+    if schema is None:
+        return None
+    from lxml import etree
+
+    data = xml.encode("utf-8") if isinstance(xml, str) else xml
+    if schema.validate(etree.fromstring(data)):
+        return []
+    return [f"XSD, строка {e.line}: {e.message}" for e in schema.error_log]
+
+
 def validate(path: str) -> List[str]:
-    problems: List[str] = []
+    problems: List[str] = list(xsd_errors(path) or [])
     root = ET.parse(path).getroot()
     ids = [e.get("id") for e in root.iter() if e.get("id")]
     idset = set(ids)
@@ -139,6 +171,8 @@ def validate(path: str) -> List[str]:
 
 
 def main(argv: List[str]) -> int:
+    if _xsd() is None:
+        print("[WARN] lxml не установлен — проверка по XSD BPMN 2.0 пропущена (pip install lxml)")
     failed = 0
     for path in argv:
         problems = validate(path)

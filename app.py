@@ -445,8 +445,9 @@ def main() -> None:
                 note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
             elif gen.get("attempts", 1) > 1:
                 note = f" · исправлено со {gen['attempts']}-й попытки"
+            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
             st.markdown(
-                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{note}</div>',
+                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
                 unsafe_allow_html=True,
             )
         st.download_button(

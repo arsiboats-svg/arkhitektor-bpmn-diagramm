@@ -2,3 +2,4 @@
 # Ниже — только зависимости веб-интерфейса и HTTP-клиента для Ollama / OpenAI-совместимого API.
 streamlit>=1.35
 requests>=2.31
+lxml>=5.0        # проверка по официальной XSD BPMN 2.0 (validate_bpmn.py)
