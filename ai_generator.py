@@ -319,16 +319,20 @@ def _call_openai(prompt: str) -> Tuple[str, str]:
     base = os.getenv("OPENAI_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     system, _, regulation = prompt.partition("ТЕКСТ РЕГЛАМЕНТА:")
+    payload: Dict[str, Any] = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system.strip()},
+            {"role": "user", "content": "ТЕКСТ РЕГЛАМЕНТА:\n" + regulation.strip()},
+        ],
+    }
+    # Рассуждающие модели (gpt-oss на Groq): low — меньше «мыслей», быстрее и в пределах лимита токенов/мин.
+    if os.getenv("OPENAI_REASONING_EFFORT"):
+        payload["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT")
     data = _http_json(
         f"{base}/chat/completions",
-        {
-            "model": model,
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": system.strip()},
-                {"role": "user", "content": "ТЕКСТ РЕГЛАМЕНТА:\n" + regulation.strip()},
-            ],
-        },
+        payload,
         headers={"Authorization": f"Bearer {key}"},
         timeout=float(os.getenv("OPENAI_TIMEOUT", "90")),
     )

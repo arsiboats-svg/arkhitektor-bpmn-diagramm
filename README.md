@@ -63,7 +63,7 @@ Ollama в облаке недоступна: приложение за ~1,5 с �
 ```mermaid
 flowchart LR
     U[Регламент<br/>текст] --> AI[ai_generator.py<br/>generate_bpmn_from_text]
-    AI -->|1| OA[Облачный API: Groq Llama 3.3 70B<br/>если задан OPENAI_API_KEY]
+    AI -->|1| OA[Облачный API: Groq GPT-OSS 120B<br/>если задан OPENAI_API_KEY]
     AI -->|2| OL[Ollama, офлайн-контур<br/>qwen2.5-coder / llama3]
     AI -->|3, fail-safe| EM[Семантический эмулятор<br/>без сети]
     OL --> CODE[Python-код для DIAGRAM]
@@ -161,7 +161,7 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 Цепочка `generate_bpmn_from_text` никогда не бросает исключение:
 
 1. **Облачная модель по OpenAI-совместимому API** — если задан `OPENAI_API_KEY`. Основной режим демо:
-   Groq, Llama 3.3 70B (ответ за секунды); запасной — Google Gemini Flash.
+   Groq, GPT-OSS 120B (ответ за секунды); запасной — Google Gemini Flash.
 2. **Ollama** (`http://localhost:11434/api/generate`) — офлайн-режим для закрытого контура, модель выбирается
    автоматически: `qwen2.5-coder`, затем `llama3`. На ноутбуке 7B-модель отвечает 2–4 минуты.
 3. **Встроенный эмулятор** — разбор нумерованных шагов, ролей, условий («Если … — перейти к п.N, иначе …»), «Параллельно:» и этапов. Сам генерирует код для `DIAGRAM`.
@@ -190,7 +190,8 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 | `LLM_MAX_ATTEMPTS` | `2` — попыток на движок: при ошибках структуры модель получает их список и исправляет код |
 | `LLM_RETRY_MAX_CALL_S` | `90` — повтор не делается, если первый ответ шёл дольше (иначе ожидание удваивается) |
 | `OPENAI_API_KEY` | если задан, подключается внешний API |
-| `OPENAI_BASE_URL`, `OPENAI_MODEL` | адрес и модель совместимого API |
+| `OPENAI_BASE_URL`, `OPENAI_MODEL` | адрес и модель совместимого API (Groq: `openai/gpt-oss-120b`) |
+| `OPENAI_REASONING_EFFORT` | для рассуждающих моделей: `low` — быстрее и экономнее по лимиту токенов |
 | `BPMN_AI_MODE=emulator` | принудительно использовать только эмулятор |
 
 ---
