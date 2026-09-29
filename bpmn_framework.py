@@ -54,7 +54,8 @@ POOL_GAP_Y = 70.0
 NODE_ROW_GAP_Y = 26.0
 SUBPROCESS_LABEL_STYLE = "LabelStyle_SubprocessTitle"
 SUBPROCESS_TITLE_PT = 15         # заголовок раскрытого подпроцесса — крупнее подписей задач (12)
-LABEL_LIFT = 12.0              # сдвиг подписей над стрелками (y - 12)
+LABEL_LIFT = 12.0
+LABEL_GAP = 6.0                # минимальный зазор между подписями              # сдвиг подписей над стрелками (y - 12)
 CHAR_W = 6.8                   # средняя ширина символа подписи (px)
 LINE_H = 15.0
 
@@ -866,6 +867,8 @@ class BPMNDiagramBuilder:
             for other in placed:
                 if _rects_intersect(rect, other, 0.0):
                     total += 100.0
+                elif _rects_intersect(rect, (other[0] - LABEL_GAP, other[1] - LABEL_GAP, other[2] + LABEL_GAP, other[3] + LABEL_GAP), 0.0):
+                    total += 40.0  # подписи «слипаются» и читаются как одна
             inflated = (rect[0] - 1.0, rect[1] - 1.0, rect[2] + 1.0, rect[3] + 1.0)
             for a, b in segments:
                 if _hits_rect(a, b, inflated):
@@ -894,7 +897,8 @@ class BPMNDiagramBuilder:
                 for n, nr in node_rects
                 if n.kind == "subProcess" and all(nr[0] <= p[0] <= nr[2] and nr[1] <= p[1] <= nr[3] for p in link.waypoints)
             }
-            link.label_rect = choose(self._edge_label_candidates(link.waypoints, w, h), home)
+            from_gateway = self.nodes[link.source_id].kind in GATEWAY_KINDS if link.source_id in self.nodes else False
+            link.label_rect = choose(self._edge_label_candidates(link.waypoints, w, h, near_source=from_gateway), home)
 
         for node in self.nodes.values():
             if not node.name:
@@ -927,7 +931,7 @@ class BPMNDiagramBuilder:
             node.label_rect = choose(cands, {node.owner_id})
 
     @staticmethod
-    def _edge_label_candidates(points: Sequence[Point], w: float, h: float) -> List[Rect]:
+    def _edge_label_candidates(points: Sequence[Point], w: float, h: float, near_source: bool = False) -> List[Rect]:
         segs = list(zip(points, points[1:]))
         horizontal = sorted(
             (s for s in segs if abs(s[0][1] - s[1][1]) < 0.01), key=lambda s: -abs(s[0][0] - s[1][0])
@@ -955,6 +959,29 @@ class BPMNDiagramBuilder:
         # она упирается в блоки, мимо которых идёт обход, и читается как их подпись.
         goes_under = bool(horizontal) and points and horizontal[0][0][1] > max(points[0][1], points[-1][1]) + 0.01
         cands: List[Rect] = below + above if goes_under else above + below
+        if near_source and not goes_under and len(points) >= 2:
+            # Условие ветки — у выхода из шлюза (конвенция BPMN), а не у конца стрелки, где его
+            # легко принять за подпись следующего узла.
+            (x0, y0), (x1, y1) = points[0], points[1]
+            start: List[Rect] = []
+            if abs(x0 - x1) < 0.01:  # вертикальный выход: сбоку от линии; узкий вариант — в несколько строк
+                sign = 1.0 if y1 > y0 else -1.0
+                text_w = max(w - 10.0, 1.0) * max(1, round(h / 15.0))
+                for wv in (w, 96.0):
+                    hv = 15.0 * math.ceil(text_w / (wv - 8.0)) if wv < w else h
+                    if abs(y1 - y0) < hv + 24:
+                        continue
+                    y_near, y_far = y0 + sign * 12, y0 + sign * (12 + hv)
+                    top, bottom = min(y_near, y_far), max(y_near, y_far)
+                    start += [(x0 + 8, top, x0 + 8 + wv, bottom), (x0 - 8 - wv, top, x0 - 8, bottom)]
+            elif abs(y0 - y1) < 0.01 and abs(x1 - x0) >= w * 0.6:  # горизонтальный выход: над/под линией
+                sign = 1.0 if x1 > x0 else -1.0
+                cx = x0 + sign * (8 + w / 2)
+                start += [
+                    (cx - w / 2, y0 - LABEL_LIFT - 2 - h, cx + w / 2, y0 - LABEL_LIFT - 2),
+                    (cx - w / 2, y0 + LABEL_LIFT - 4, cx + w / 2, y0 + LABEL_LIFT - 4 + h),
+                ]
+            cands = start + cands
         for a, b in vertical:  # справа/слева от вертикальных участков
             y1, y2, x = min(a[1], b[1]), max(a[1], b[1]), a[0]
             for f in fractions:

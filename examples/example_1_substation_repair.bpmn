@@ -240,7 +240,7 @@
       <bpmndi:BPMNShape id="Gateway_3_di" bpmnElement="Gateway_3" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
         <dc:Bounds x="3414.0" y="140.0" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3293.8" y="103.0" width="139.2" height="15.0" />
+          <dc:Bounds x="3293.8" y="123.0" width="139.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Gateway_4_di" bpmnElement="Gateway_4" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
@@ -344,7 +344,7 @@
         <di:waypoint x="1519.0" y="748.0" />
         <di:waypoint x="1628.0" y="748.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1527.7" y="719.0" width="91.6" height="15.0" />
+          <dc:Bounds x="1527.0" y="542.0" width="91.6" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_16_di" bpmnElement="Flow_16" bioc:stroke="#C62828" color:border-color="#C62828">
@@ -353,7 +353,7 @@
         <di:waypoint x="1116.0" y="265.0" />
         <di:waypoint x="1116.0" y="295.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1281.9" y="236.0" width="71.2" height="15.0" />
+          <dc:Bounds x="1527.0" y="453.0" width="71.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_17_di" bpmnElement="Flow_17" bioc:stroke="#455A64" color:border-color="#455A64">
@@ -365,7 +365,7 @@
         <di:waypoint x="3305.0" y="165.0" />
         <di:waypoint x="3414.0" y="165.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3257.2" y="121.0" width="150.0" height="30.0" />
+          <dc:Bounds x="3313.0" y="651.0" width="96.0" height="60.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_19_di" bpmnElement="Flow_19" bioc:stroke="#C62828" color:border-color="#C62828">
