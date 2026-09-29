@@ -825,6 +825,21 @@ class BPMNDiagramBuilder:
         self._layout_groups()
         self._route_all()
         self._place_labels()
+        self._fit_last_pool_to_labels()
+
+    def _fit_last_pool_to_labels(self) -> None:
+        """Подпись под нижней стрелкой-обходом может выйти за пул — растим нижний пул и его нижнюю дорожку."""
+        if not self.pools:
+            return
+        pool = max(self.pools.values(), key=lambda p: p.y)
+        rects = [l.label_rect for l in self.links if l.label_rect] + [n.label_rect for n in self.nodes.values() if n.label_rect]
+        inside = [r for r in rects if pool.y <= r[1] <= pool.y + pool.height + 60]
+        overflow = max((r[3] for r in inside), default=0.0) + 6.0 - (pool.y + pool.height)
+        if overflow <= 0 or not pool.lane_ids:
+            return
+        pool.height += overflow
+        lowest = max((self.lanes[i] for i in pool.lane_ids), key=lambda lane: lane.y)
+        lowest.height += overflow
 
     # ---------------------------------------------------------------- labels
     def _place_labels(self) -> None:
@@ -839,10 +854,12 @@ class BPMNDiagramBuilder:
         lo_x = min((p.x for p in self.pools.values()), default=0.0) + POOL_HEADER_W
         hi_x = max((p.x + p.width for p in self.pools.values()), default=10_000.0)
 
-        def cost(rect: Rect) -> float:
+        def cost(rect: Rect, home: Set[str]) -> float:
             total = 0.0
             for node, nr in node_rects:
-                if _rects_intersect(rect, nr) and not (node.kind == "subProcess" and _rect_contains(nr, rect)):
+                # Внутри подпроцесса подпись допустима, только если её стрелка/узел сами лежат в нём:
+                # иначе подпись возвратной стрелки «прилипает» к чужой рамке и читается как его часть.
+                if _rects_intersect(rect, nr) and not (node.id in home and _rect_contains(nr, rect)):
                     total += 100.0
             for other in placed:
                 if _rects_intersect(rect, other, 0.0):
@@ -855,10 +872,10 @@ class BPMNDiagramBuilder:
                 total += 30.0
             return total
 
-        def choose(cands: Sequence[Rect]) -> Rect:
+        def choose(cands: Sequence[Rect], home: Set[str]) -> Rect:
             best, best_cost = cands[0], float("inf")
             for idx, rect in enumerate(cands):
-                c = cost(rect) + idx * 0.05
+                c = cost(rect, home) + idx * 0.05
                 if c < best_cost:
                     best, best_cost = rect, c
                 if c < 0.5:
@@ -870,7 +887,12 @@ class BPMNDiagramBuilder:
             if not link.condition_name:
                 continue
             w, h = _label_box(link.condition_name, 40.0, 150.0)
-            link.label_rect = choose(self._edge_label_candidates(link.waypoints, w, h))
+            home = {
+                n.id
+                for n, nr in node_rects
+                if n.kind == "subProcess" and all(nr[0] <= p[0] <= nr[2] and nr[1] <= p[1] <= nr[3] for p in link.waypoints)
+            }
+            link.label_rect = choose(self._edge_label_candidates(link.waypoints, w, h), home)
 
         for node in self.nodes.values():
             if not node.name:
@@ -900,7 +922,7 @@ class BPMNDiagramBuilder:
                 cands.append((node.x + node.width + 6, mid - h / 2, node.x + node.width + 6 + w, mid + h / 2))
             else:
                 continue
-            node.label_rect = choose(cands)
+            node.label_rect = choose(cands, {node.owner_id})
 
     @staticmethod
     def _edge_label_candidates(points: Sequence[Point], w: float, h: float) -> List[Rect]:
@@ -912,20 +934,25 @@ class BPMNDiagramBuilder:
             (s for s in segs if abs(s[0][0] - s[1][0]) < 0.01), key=lambda s: -abs(s[0][1] - s[1][1])
         )
         fractions = (0.5, 0.25, 0.75, 0.1, 0.9)
-        cands: List[Rect] = []
+        above: List[Rect] = []
+        below: List[Rect] = []
         for tier in (0.0, 18.0):  # над линией: нижний край подписи на LABEL_LIFT + 2 выше стрелки
             for a, b in horizontal:
                 x1, x2, y = min(a[0], b[0]), max(a[0], b[0]), a[1]
                 for f in fractions:
                     cx = x1 + (x2 - x1) * f
-                    cands.append((cx - w / 2, y - LABEL_LIFT - 2 - h - tier, cx + w / 2, y - LABEL_LIFT - 2 - tier))
+                    above.append((cx - w / 2, y - LABEL_LIFT - 2 - h - tier, cx + w / 2, y - LABEL_LIFT - 2 - tier))
         for tier in (0.0, 18.0):  # под линией
             for a, b in horizontal:
                 x1, x2, y = min(a[0], b[0]), max(a[0], b[0]), a[1]
                 for f in fractions:
                     cx = x1 + (x2 - x1) * f
                     top = y + LABEL_LIFT - 4 + tier
-                    cands.append((cx - w / 2, top, cx + w / 2, top + h))
+                    below.append((cx - w / 2, top, cx + w / 2, top + h))
+        # Стрелка-обход «понизу» (U-маршрут возврата ниже обоих концов): подпись под линией — над ней
+        # она упирается в блоки, мимо которых идёт обход, и читается как их подпись.
+        goes_under = bool(horizontal) and points and horizontal[0][0][1] > max(points[0][1], points[-1][1]) + 0.01
+        cands: List[Rect] = below + above if goes_under else above + below
         for a, b in vertical:  # справа/слева от вертикальных участков
             y1, y2, x = min(a[1], b[1]), max(a[1], b[1]), a[0]
             for f in fractions:

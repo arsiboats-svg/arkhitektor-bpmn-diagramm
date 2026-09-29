@@ -391,7 +391,7 @@
         <di:waypoint x="3215.0" y="876.0" />
         <di:waypoint x="3215.0" y="846.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3520.4" y="847.0" width="105.2" height="15.0" />
+          <dc:Bounds x="3520.4" y="884.0" width="105.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_23_di" bpmnElement="Flow_23" bioc:stroke="#455A64" color:border-color="#455A64">
