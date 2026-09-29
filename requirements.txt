@@ -1,0 +1,4 @@
+# Движок (bpmn_framework.py) и ИИ-модуль (ai_generator.py) работают на стандартной библиотеке Python 3.9+.
+# Ниже — только зависимости веб-интерфейса и HTTP-клиента для Ollama / OpenAI-совместимого API.
+streamlit>=1.35
+requests>=2.31
