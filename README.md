@@ -1,93 +1,184 @@
-# template-gitlab-b2e039f6
+# ⚡ Архитектор BPMN-диаграмм — ПАО «Интер РАО»
 
-Template for task: GitLab репозиторий
+**Регламент на русском языке → валидный BPMN 2.0.2 → аудит бизнес-архитектуры. За секунды, без ручной доводки.**
 
-## Getting started
+Решение для трека «Архитектор BPMN-диаграмм» хакатона «ИИ-ассистенты для энергетики».
+Заказчик — Дирекция бизнес-архитектуры ПАО «Интер РАО».
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- Диаграмма открывается и редактируется на [demo.bpmn.io](https://demo.bpmn.io) без ошибок и предупреждений.
+- Это не «карта токийского метро»: сложные этапы уходят в раскрытые подпроцессы, все стрелки ортогональные (90°), блоки и подписи не пересекаются.
+- Вместе с диаграммой считается аудит процесса: bus-factor, критический путь SLA, циклы возврата, тупики.
+- Работает без интернета и без LLM: если нейросеть недоступна, включается встроенный семантический эмулятор.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+---
 
-## Add your files
+## 🚀 Запуск за одну минуту
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
 ```
-cd existing_repo
-git remote add origin https://git.codenrock.com/codenrock/ii-assistenty/template-gitlab-b2e039f6.git
-git branch -M main
-git push -uf origin main
+
+Откроется `http://localhost:8501`. Первый пример генерируется автоматически.
+
+Проверка без веб-интерфейса:
+
+```bash
+python3 test_pipeline.py                  # демо-сценарий -> demo_process.bpmn + аудит в консоли
+python3 build_examples.py                 # пересборка examples/*.bpmn и *.audit.json
+python3 validate_bpmn.py demo_process.bpmn examples/*.bpmn   # строгая офлайн-проверка, код 0 = OK
 ```
 
-## Integrate with your tools
+---
 
-- [ ] [Set up project integrations](https://git.codenrock.com/codenrock/ii-assistenty/template-gitlab-b2e039f6/-/settings/integrations)
+## 🧭 Инструкция для жюри (3 шага)
 
-## Collaborate with your team
+1. `streamlit run app.py`. Слева выберите один из трёх готовых регламентов или вставьте свой текст.
+2. Нажмите **«🚀 Сгенерировать BPMN 2.0»**. Справа появится интерактивная диаграмма (перетаскивание — панорама, `Ctrl` + колесо или кнопки ＋/－ — масштаб).
+3. Нажмите **«⬇️ Скачать .bpmn»** и откройте файл на https://demo.bpmn.io (*Open file*). Ниже диаграммы находится дашборд **«Аудит бизнес-архитектуры»**.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+Готовые файлы лежат в `examples/`: `.txt` (исходный регламент), `.bpmn` (результат) и `.audit.json` (аудит).
 
-## Test and Deploy
+---
 
-Use the built-in continuous integration in GitLab.
+## 🏗 Архитектура
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+```mermaid
+flowchart LR
+    U[Регламент<br/>текст] --> AI[ai_generator.py<br/>generate_bpmn_from_text]
+    AI -->|1| OL[Ollama<br/>qwen2.5-coder / llama3]
+    AI -->|2| OA[OpenAI-совместимый API<br/>если задан OPENAI_API_KEY]
+    AI -->|3, fail-safe| EM[Семантический эмулятор<br/>без сети]
+    OL --> CODE[Python-код для DIAGRAM]
+    OA --> CODE
+    EM --> CODE
+    CODE --> SB[Песочница<br/>AST-проверка, whitelist]
+    SB --> FW[bpmn_framework.py<br/>BPMNDiagramBuilder]
+    FW --> L[Раскладка слоями<br/>+ Manhattan-роутинг]
+    FW --> A[Аудит<br/>Bellman-Ford, bus-factor]
+    L --> X[BPMN 2.0.2 XML<br/>+ BPMN in Color]
+    X --> UI[app.py<br/>Streamlit + bpmn-js]
+    A --> UI
+```
 
-***
+| Файл | Роль |
+| --- | --- |
+| `bpmn_framework.py` | Ядро: API песочницы `DIAGRAM.*`, раскладка, роутинг, XML, аудит, самовосстановление |
+| `ai_generator.py` | `generate_bpmn_from_text(text) -> (bpmn_xml, audit_data, error)`, `execute_generated_code(code)`, системный промпт, клиенты LLM, эмулятор |
+| `app.py` | Веб-интерфейс (Streamlit) с просмотрщиком bpmn-js и дашбордом аудита |
+| `examples/` | Три регламента и результаты генерации |
+| `validate_bpmn.py` | Независимый строгий валидатор выходных файлов |
+| `build_examples.py`, `test_pipeline.py` | Пересборка примеров и демо-сценарий |
+| `assets/` | bpmn-js 17.11.1 (локальная копия для работы без интернета) |
 
-# Editing this README
+### Контракт API песочницы жюри
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Сигнатуры сохранены без изменений:
 
-## Suggestions for a good README
+```python
+pool_id, lane_ids = DIAGRAM.add_pool(parent_id, ["Диспетчер", "Начальник смены"])
+DIAGRAM.add_task(name, parent_id)  # так же add_user_task и add_script_task
+DIAGRAM.create_subprocess(name, parent_id)
+DIAGRAM.add_exclusive_gateway(name, parent_id)  # так же add_parallel_gateway и add_inclusive_gateway
+DIAGRAM.add_group(name, parent_id)
+DIAGRAM.add_link(source_id, target_id, condition_name="")
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+---
 
-## Name
-Choose a self-explaining name for your project.
+## 🧩 Как мы избегаем «карты метро»
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+| Приём | Что делает |
+| --- | --- |
+| Строгая декомпозиция | Если у одного подразделения больше 3 шагов подряд, они сворачиваются в `create_subprocess` (раскрытый, с внутренними Начало и Завершено) |
+| Дорожки | `add_pool` с ролями: каждая задача лежит в дорожке своего исполнителя |
+| Слоистая раскладка | DFS находит обратные рёбра, затем строятся слои по длиннейшему пути: колонки задают X, дорожки задают Y |
+| Ортогональный роутинг | Перебор путей (прямой, Z, L, U, обход) с штрафами за изгибы, наложения и пересечения с блоками |
+| Подписи | Условия на шлюзах ставятся кандидатным поиском вне узлов, линий и других подписей, на 12 px выше стрелки |
+| Широкие подпроцессы | Увеличенные внутренние отступы, чтобы стрелки внутри подпроцесса не прижимались к границе |
+| Единый финал | Все ветки смыкаются в `ROOT_END_TASK_ID` |
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+**BPMN in Color** (`bioc` и `color`, стандартные неймспейсы bpmn.io и OMG):
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+| Элемент | Контур / заливка |
+| --- | --- |
+| Начало | `#2E7D32` / `#E8F5E9` |
+| Конец | `#C62828` / `#FFEBEE` |
+| Задачи (`task`, `userTask`, `scriptTask`) | `#1565C0` / `#E3F2FD` |
+| Шлюзы (XOR, AND, OR) | `#F57F17` / `#FFF8E1` |
+| Подпроцесс | `#4527A0` / `#EDE7F6` |
+| Возвратные (rework) стрелки | красные `#C62828` |
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Чистота XML:
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+- Нет атрибута `isMarkerVisible`.
+- Тег `<bpmn:group>` не попадает в `<bpmn:process>`: группа размещена в `<bpmn:collaboration>` с `category` / `categoryValue`, это валидно по схеме BPMN 2.0.2.
+- Каждый элемент модели имеет пару в `bpmndi`.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+---
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## 📊 Аудит бизнес-архитектуры
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Считается на графе процесса, а не «на глаз»:
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+| Карточка | Как считается |
+| --- | --- |
+| **Bus-factor** | Доля атомарных задач у одной роли (учитывается содержимое подпроцессов). Порог — **45%**: выше него процесс держится на одном подразделении |
+| **Критический путь (SLA)** | Самый длинный путь по часам алгоритмом **Беллмана — Форда** (веса `−часы`) с восстановлением маршрута; подпроцесс весит как его внутренний критический путь. Сравнивается с целевым сроком |
+| **Циклы возврата** | Обратные рёбра: список, время каждого цикла и рост срока при худшем возврате |
+| **Тупики и сироты** | Узлы без выхода или входа; автоматически подключаются, действие фиксируется в отчёте |
+| **Рекомендации** | Автоматически по найденным рискам: перераспределить задачи, ввести параллельность, ужесточить входной контроль |
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+### Три готовых кейса
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+| Пример | Что показывает |
+| --- | --- |
+| `example_1_substation_repair` | Аварийный ремонт на ПС 110 кВ, наряд-допуск, служба безопасности. Целевой срок — 12 ч |
+| `example_2_equipment_procurement` | Закупка силового трансформатора: проверка СБ, тендер, повторные торги. Возврат заметно выбивается из SLA |
+| `example_3_grid_connection` | Технологическое присоединение льготного потребителя, замечания к ТУ |
 
-## License
-For open source projects, say how it is licensed.
+---
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## 🛡 Отказоустойчивость
+
+Цепочка `generate_bpmn_from_text` никогда не бросает исключение:
+
+1. **Ollama** (`http://localhost:11434/api/generate`) — модель выбирается автоматически: `qwen2.5-coder`, затем `llama3`.
+2. **OpenAI-совместимый API** — если задан `OPENAI_API_KEY`.
+3. **Встроенный эмулятор** — разбор нумерованных шагов, ролей, условий («Если … — перейти к п.N, иначе …»), «Параллельно:» и этапов. Сам генерирует код для `DIAGRAM`.
+
+Защита от плохого ответа модели:
+
+- Код перед запуском проходит AST-проверку в песочнице: запрещены `import`, `open`, `eval`, `exec`, dunder-атрибуты и циклы `while`.
+- Разрешены только методы `DIAGRAM` и безопасные builtins.
+- Ответ LLM в markdown-обёртке очищается. Если код невалиден или падает, включается эмулятор, а причина попадает в «Трассу выбора движка».
+- Самовосстановление графа: несуществующие id не роняют сборку (`skipped_links`), дубли и самопетли отбрасываются, межуровневые связи поднимаются до подпроцесса, тупики и «сироты» подключаются к финалу и старту.
+
+Переменные окружения (все необязательны):
+
+| Переменная | Значение по умолчанию |
+| --- | --- |
+| `OLLAMA_URL` | `http://localhost:11434` |
+| `OLLAMA_MODEL` | автовыбор `qwen2.5-coder` → `llama3` |
+| `OLLAMA_TIMEOUT` | таймаут запроса, секунды |
+| `OPENAI_API_KEY` | если задан, подключается внешний API |
+| `OPENAI_BASE_URL`, `OPENAI_MODEL` | адрес и модель совместимого API |
+| `BPMN_AI_MODE=emulator` | принудительно использовать только эмулятор |
+
+---
+
+## 💼 Бизнес-ценность
+
+- **Скорость:** регламент на 2 страницы превращается в модель за секунды вместо дней ручного моделирования.
+- **Единый стиль:** все процессы Компании выглядят одинаково (цвета, дорожки, декомпозиция), а значит их проще согласовывать и поддерживать.
+- **Аудит из коробки:** узкие места и зависимость от одного подразделения видны до внедрения регламента, а не после сбоя.
+- **Безопасность для ИТ-контура:** локальный запуск (Ollama), без отправки регламентов вовне; при недоступной LLM система деградирует мягко.
+- **Открытый стандарт:** результат — обычный BPMN 2.0 XML, его можно доработать в любом BPMN-редакторе (Camunda Modeler, bpmn.io, ARIS-импорт).
+
+## ✅ Проверено
+
+- Все `.bpmn` (демо и три примера) импортируются в bpmn-js 17.11.1 без предупреждений.
+- `validate_bpmn.py`: 0 диагональных сегментов, 0 наложений блоков, 0 пересечений чужих блоков стрелками, 0 коллизий подписей.
+- Headless-прогон Streamlit (`AppTest`) для примеров и свободного текста с неизвестными ролями проходит без исключений.
+- Ветки Ollama и OpenAI проверены на поддельном локальном сервере. Проверка на боевой модели зависит от окружения жюри.
