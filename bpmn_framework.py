@@ -35,7 +35,7 @@ TNS = "http://bpmn.io/schema/bpmn"
 # Геометрия
 # --------------------------------------------------------------------------- #
 TASK_W, TASK_H = 140.0, 80.0
-TASK_H_MAX = 124.0             # длинное название — блок выше, но не бесконечно
+TASK_H_MAX = 150.0             # длинное название — блок выше, но не бесконечно
 GATEWAY_S = 50.0
 EVENT_S = 36.0
 SUBPROCESS_MIN_W, SUBPROCESS_MIN_H = 560.0, 240.0
@@ -138,10 +138,29 @@ def _kind_size(kind: str) -> Tuple[float, float]:
     return TASK_W, TASK_H
 
 
+def _wrapped_lines(text: str, width: float, char_w: float = 7.2) -> int:
+    """Число строк при переносе по словам, как в bpmn-js (кириллица 12px Arial ≈ 7.2 px/символ)."""
+    lines, cur = 1, 0.0
+    for word in text.split():
+        w = len(word) * char_w
+        if cur and cur + char_w * 0.5 + w > width:
+            lines, cur = lines + 1, w
+        else:
+            cur += (char_w * 0.5 if cur else 0.0) + w
+        while cur > width:  # слово длиннее строки bpmn-js переносит посимвольно
+            lines, cur = lines + 1, cur - width
+    return lines
+
+
 def _task_height(name: str) -> float:
-    """Высота задачи под текст: длинное название не должно вылезать за блок (иконка занимает угол)."""
-    lines = math.ceil(CHAR_W * 1.05 * len(name) / (TASK_W - 22.0)) if name else 1
-    return min(TASK_H_MAX, max(TASK_H, 15.0 * lines + 22.0))
+    """Высота задачи под текст.
+
+    bpmn-js центрирует текст по вертикали, а иконку задачи (человек/скрипт, ~20 px) рисует в левом
+    верхнем углу. Блок выше текста минимум на 2×24 px — первая строка гарантированно ниже иконки
+    и не перекрывает первые буквы; длинное название не выходит за рамку.
+    """
+    lines = _wrapped_lines(name, TASK_W - 10.0) if name else 1
+    return min(TASK_H_MAX, max(TASK_H, 14.5 * lines + 48.0))
 
 
 def _label_box(text: str, min_w: float, max_w: float) -> Tuple[float, float]:
@@ -921,6 +940,11 @@ class BPMNDiagramBuilder:
                     (node.x + node.width + 4, top + node.height / 2 - h / 2, node.x + node.width + 4 + w, top + node.height / 2 + h / 2),
                     (node.x - 4 - w, top + node.height / 2 - h / 2, node.x - 4, top + node.height / 2 + h / 2),
                 ]
+                # Запасные места, если рядом уже стоят подписи стрелок: ярусом ниже/выше и со сдвигом.
+                for dy in (0.0, 18.0, 40.0):
+                    for dx in (-w / 2 + 8, w / 2 - 8, 0.0):
+                        cands.append((cx - w / 2 + dx, bottom + 4 + dy, cx + w / 2 + dx, bottom + 4 + dy + h))
+                        cands.append((cx - w / 2 + dx, top - 4 - h - dy, cx + w / 2 + dx, top - 4 - dy))
             elif node.kind in GATEWAY_KINDS:
                 w, h = _label_box(node.name, 60.0, 150.0)
                 cands = []
@@ -983,7 +1007,7 @@ class BPMNDiagramBuilder:
                     y_near, y_far = y0 + sign * 12, y0 + sign * (12 + hv)
                     top, bottom = min(y_near, y_far), max(y_near, y_far)
                     start += [(x0 + 8, top, x0 + 8 + wv, bottom), (x0 - 8 - wv, top, x0 - 8, bottom)]
-            elif abs(y0 - y1) < 0.01 and abs(x1 - x0) >= w * 0.6:  # горизонтальный выход: над/под линией
+            elif abs(y0 - y1) < 0.01 and abs(x1 - x0) >= w + 16:  # горизонтальный выход: над/под, не длиннее участка
                 sign = 1.0 if x1 > x0 else -1.0
                 cx = x0 + sign * (8 + w / 2)
                 start += [
