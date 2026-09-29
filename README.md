@@ -28,7 +28,23 @@ streamlit run app.py
 python3 test_pipeline.py                  # демо-сценарий -> demo_process.bpmn + аудит в консоли
 python3 build_examples.py                 # пересборка examples/*.bpmn и *.audit.json
 python3 validate_bpmn.py demo_process.bpmn examples/*.bpmn   # строгая офлайн-проверка, код 0 = OK
+python3 stress_test.py                    # «кривые» регламенты из stress_tests/ -> stress_tests/out/report.md
+python3 stress_test.py --llm              # то же через LLM
 ```
+
+---
+
+## ☁️ Развёртывание (Streamlit Community Cloud)
+
+1. Зеркало репозитория на GitHub (Streamlit Cloud подключается только к GitHub).
+2. https://share.streamlit.io → **Create app** → репозиторий, ветка `main`, файл `app.py`;
+   в **Advanced settings** выбрать Python **3.12**.
+3. **Secrets**: вставить содержимое `.streamlit/secrets.toml.example` с ключом Groq
+   (бесплатно: https://console.groq.com/keys). Без ключа сервис работает на эмуляторе.
+4. **Deploy** → постоянная ссылка вида `https://<имя>.streamlit.app`.
+
+Ollama в облаке недоступна: приложение за ~1,5 с понимает это и переходит к API или эмулятору.
+Установка проверена с нуля на Python 3.10, 3.12 и 3.14 (`pip install -r requirements.txt`).
 
 ---
 
@@ -47,8 +63,8 @@ python3 validate_bpmn.py demo_process.bpmn examples/*.bpmn   # строгая о
 ```mermaid
 flowchart LR
     U[Регламент<br/>текст] --> AI[ai_generator.py<br/>generate_bpmn_from_text]
-    AI -->|1| OL[Ollama<br/>qwen2.5-coder / llama3]
-    AI -->|2| OA[OpenAI-совместимый API<br/>если задан OPENAI_API_KEY]
+    AI -->|1| OA[Облачный API: Groq Llama 3.3 70B<br/>если задан OPENAI_API_KEY]
+    AI -->|2| OL[Ollama, офлайн-контур<br/>qwen2.5-coder / llama3]
     AI -->|3, fail-safe| EM[Семантический эмулятор<br/>без сети]
     OL --> CODE[Python-код для DIAGRAM]
     OA --> CODE
@@ -144,11 +160,19 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 
 Цепочка `generate_bpmn_from_text` никогда не бросает исключение:
 
-1. **Ollama** (`http://localhost:11434/api/generate`) — модель выбирается автоматически: `qwen2.5-coder`, затем `llama3`.
-2. **OpenAI-совместимый API** — если задан `OPENAI_API_KEY`.
+1. **Облачная модель по OpenAI-совместимому API** — если задан `OPENAI_API_KEY`. Основной режим демо:
+   Groq, Llama 3.3 70B (ответ за секунды); запасной — Google Gemini Flash.
+2. **Ollama** (`http://localhost:11434/api/generate`) — офлайн-режим для закрытого контура, модель выбирается
+   автоматически: `qwen2.5-coder`, затем `llama3`. На ноутбуке 7B-модель отвечает 2–4 минуты.
 3. **Встроенный эмулятор** — разбор нумерованных шагов, ролей, условий («Если … — перейти к п.N, иначе …»), «Параллельно:» и этапов. Сам генерирует код для `DIAGRAM`.
 
 Защита от плохого ответа модели:
+
+- **Контроль качества графа** до самовосстановления: задача с несколькими выходами без шлюза, шлюз без ветвления,
+  узел без входа, ссылка на несуществующий id — ответ отклоняется, модель получает список ошибок и одну попытку
+  исправиться; иначе включается эмулятор. Причина видна прямо под кнопкой генерации и в «Трассе выбора движка».
+- **Нормализация текста** (`normalize_regulation`): колонтитулы PDF («Стр. 5 из 17»), переносы слов,
+  разорванные ссылки «п.\n3.2.5», многоуровневая нумерация «3.2.1.» → сквозная «1.» вместе со ссылками.
 
 - Код перед запуском проходит AST-проверку в песочнице: запрещены `import`, `open`, `eval`, `exec`, dunder-атрибуты и циклы `while`.
 - Разрешены только методы `DIAGRAM` и безопасные builtins.
@@ -161,7 +185,10 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` |
 | `OLLAMA_MODEL` | автовыбор `qwen2.5-coder` → `llama3` |
-| `OLLAMA_TIMEOUT` | таймаут запроса, секунды |
+| `OLLAMA_TIMEOUT` | `300` — таймаут запроса, секунды (7B на MacBook M2 ≈ 5 ток/с, схема ≈ 3–4 мин) |
+| `OLLAMA_NUM_CTX` | `8192` — окно контекста (промпт ≈ 1800 токенов + ответ до 3500) |
+| `LLM_MAX_ATTEMPTS` | `2` — попыток на движок: при ошибках структуры модель получает их список и исправляет код |
+| `LLM_RETRY_MAX_CALL_S` | `90` — повтор не делается, если первый ответ шёл дольше (иначе ожидание удваивается) |
 | `OPENAI_API_KEY` | если задан, подключается внешний API |
 | `OPENAI_BASE_URL`, `OPENAI_MODEL` | адрес и модель совместимого API |
 | `BPMN_AI_MODE=emulator` | принудительно использовать только эмулятор |

@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .view_tmp.html
 .DS_Store
+stress_tests/out/
+.streamlit/secrets.toml

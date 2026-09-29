@@ -230,13 +230,18 @@
     "critical_path_layers": 16,
     "critical_path_hours": 520.55
   },
+  "quality": {
+    "issues": [],
+    "critical": [],
+    "ok": true
+  },
   "generation": {
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
       "LLM недоступна — включён встроенный эмулятор"
     ],
-    "elapsed_s": 0.01,
+    "elapsed_s": 0.02,
     "parsed": {
       "title": "Закупка силового трансформатора 110/10 кВ с проверкой СБ и тендерным комитетом",
       "steps": 13,

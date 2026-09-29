@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from bpmn_framework import BPMNDiagramBuilder
+from bpmn_framework import GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 
 ROOT_PROCESS_ID = "Process_Root"
 ROOT_START_TASK_ID = "Event_RootStart"
@@ -97,6 +97,25 @@ def build_prompt(regulation_text: str) -> str:
     return PROMPT_TEMPLATE.replace("<<REGULATION>>", regulation_text.strip())
 
 
+REPAIR_TEMPLATE = """
+
+ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:
+<<CODE>>
+
+В НЁМ НАЙДЕНЫ ОШИБКИ СТРУКТУРЫ ПРОЦЕССА:
+<<ISSUES>>
+
+Исправь их и верни ПОЛНЫЙ исправленный код целиком (только Python-код для DIAGRAM, без пояснений).
+Помни: ветвление только через шлюз, у каждой задачи ровно один выход, каждый узел имеет вход и выход."""
+
+
+def build_repair_prompt(regulation_text: str, code: str, issues: List[str]) -> str:
+    """Промпт второй попытки: исходная задача + прошлый код + найденные ошибки."""
+    return build_prompt(regulation_text) + (
+        REPAIR_TEMPLATE.replace("<<CODE>>", code.strip()).replace("<<ISSUES>>", "\n".join(f"- {i}" for i in issues))
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Песочница исполнения сгенерированного кода
 # --------------------------------------------------------------------------- #
@@ -148,6 +167,38 @@ def _validate_ast(tree: ast.AST) -> None:
                     raise UnsafeCodeError("слишком большой диапазон range")
 
 
+def _structure_issues(diagram: BPMNDiagramBuilder) -> List[str]:
+    """Логические ошибки графа ДО самовосстановления: то, что heal_graph скрыл бы «метро»."""
+    issues: List[str] = []
+    outgoing: Dict[str, List[Any]] = {}
+    incoming: Dict[str, int] = {}
+    for link in diagram.links:
+        outgoing.setdefault(link.source_id, []).append(link)
+        incoming[link.target_id] = incoming.get(link.target_id, 0) + 1
+    for node in diagram.nodes.values():
+        outs = outgoing.get(node.id, [])
+        if node.kind in WORK_KINDS | {"subProcess"} and len(outs) > 1:
+            issues.append(f"У задачи «{node.name}» {len(outs)} выхода — ветвление без шлюза")
+        if node.kind in GATEWAY_KINDS and len(outs) <= 1 and incoming.get(node.id, 0) <= 1:
+            issues.append(f"Шлюз «{node.name}» ничего не разветвляет и не сливает")
+        if node.kind in ("exclusiveGateway", "inclusiveGateway") and len(outs) > 1:
+            if any(not l.condition_name.strip() for l in outs):
+                issues.append(f"У шлюза «{node.name}» есть ветка без подписи условия")
+    return issues
+
+
+# Ошибки, при которых ответ модели отклоняется (остальные — предупреждения).
+_CRITICAL_MARKERS = ("ветвление без шлюза", "ничего не разветвляет", "без входа", "Несуществующие")
+
+
+def _quality_report(structure_issues: List[str], audit: Dict[str, Any]) -> Dict[str, Any]:
+    issues = list(structure_issues)
+    issues += [h for h in audit.get("auto_healed", []) if "без входа" in h or "Тупик" in h]
+    issues += [f"Связь пропущена: {s['reason']}" for s in audit.get("skipped_links", [])]
+    critical = [i for i in issues if any(m in i for m in _CRITICAL_MARKERS)]
+    return {"issues": issues, "critical": critical, "ok": not critical}
+
+
 def execute_generated_code(
     code_str: str,
     process_name: str = "Бизнес-процесс ПАО «Интер РАО»",
@@ -191,9 +242,11 @@ def execute_generated_code(
         if len(work_nodes) < 2:
             return "", {}, "Диаграмма содержит меньше двух рабочих узлов — регламент не распознан."
 
+        structure_issues = _structure_issues(diagram)
         diagram.heal_graph()
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
+        audit["quality"] = _quality_report(structure_issues, audit)
         return xml, audit, ""
     except Exception as exc:  # noqa: BLE001 — песочница обязана не падать
         return "", {}, f"Ошибка исполнения кода: {type(exc).__name__}: {exc}"
@@ -248,10 +301,13 @@ def _call_ollama(prompt: str) -> Tuple[str, str]:
     model = _pick_ollama_model(_ollama_models())
     if not model:
         raise RuntimeError("в Ollama нет моделей qwen2.5-coder / llama3")
+    # num_ctx: промпт ~1800 токенов + ответ до 3500 не помещаются в дефолтные 4096 Ollama.
+    # Таймаут 300 с: 7B-модель на MacBook M2 генерирует ~5 ток/с, схема — 3–4 минуты.
+    options = {"temperature": 0.1, "num_predict": 3500, "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "8192"))}
     data = _http_json(
         f"{_ollama_base()}/api/generate",
-        {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.1, "num_predict": 3500}},
-        timeout=float(os.getenv("OLLAMA_TIMEOUT", "120")),
+        {"model": model, "prompt": prompt, "stream": False, "keep_alive": "30m", "options": options},
+        timeout=float(os.getenv("OLLAMA_TIMEOUT", "300")),
     )
     return f"ollama:{model}", str(data.get("response", ""))
 
@@ -328,8 +384,42 @@ _DUR_RE = re.compile(
     re.I,
 )
 _REF_RE = re.compile(r"(?:п(?:ункт\w*|\.|п\.)?|шаг\w*)\s*(\d+)", re.I)
-_END_KW = re.compile(r"завершить|завершается|завершение процесса|прекрат|закрыть\s+(?:заявку|процесс|закупку)", re.I)
+_END_KW = re.compile(r"завершить|отказать|завершается|завершение процесса|прекрат|закрыть\s+(?:заявку|процесс|закупку)", re.I)
 _BACK_KW = re.compile(r"верну|возврат|доработ|повтор|заново", re.I)
+
+
+_PAGE_MARK_RE = re.compile(r"(?:стр\.?|страница)\s*\d+\s*(?:из\s*\d+)?", re.I)
+_MULTI_NUM_RE = re.compile(r"^(\d+(?:\.\d+)+)\.?\s+", re.M)
+
+
+def normalize_regulation(text: str) -> str:
+    """Чистит текст, скопированный из PDF/Word, до вида «шаг на строке».
+
+    - убирает колонтитулы («Стр. 5 из 17») и строки из одних номеров страниц;
+    - склеивает переносы слов («регистри-\\nрует») и ссылки, разорванные строкой («п.\\n3.2.5»);
+    - многоуровневую нумерацию «3.2.1.» переводит в сквозную «1.», «2.» … вместе со ссылками «п. 3.2.5».
+    """
+    text = text.replace("\r\n", "\n").replace("­", "")
+    text = re.sub(r"(\w)-\n\s*(\w)", r"\1\2", text)
+    text = re.sub(r"(\bп(?:\.|ункт\w*)|\bшаг\w*)\s*\n\s*(?=\d)", r"\1 ", text, flags=re.I)
+    lines = []
+    for line in text.split("\n"):
+        line = _PAGE_MARK_RE.sub("", line) if _PAGE_MARK_RE.search(line) and len(line.strip()) < 120 else line
+        if re.search(r"\S\s{8,}\S", line):  # колонтитул PDF: «ПАО …        СТО 123-2023»
+            continue
+        if not re.fullmatch(r"\s*[-–—]?\s*\d{1,3}\s*[-–—]?\s*", line):  # номер страницы
+            lines.append(line.rstrip())
+    text = "\n".join(lines)
+
+    numbers = _MULTI_NUM_RE.findall(text)
+    depth = max((n.count(".") for n in numbers), default=0)
+    steps = [n for n in numbers if n.count(".") == depth]  # «3.2 Раздел» — заголовок, «3.2.1.» — шаг
+    if len(steps) >= 2:
+        mapping = {num: str(i) for i, num in enumerate(dict.fromkeys(steps), start=1)}
+        text = _MULTI_NUM_RE.sub(lambda m: mapping[m.group(1)] + ". " if m.group(1) in mapping else m.group(0), text)
+        for num in sorted(mapping, key=len, reverse=True):
+            text = re.sub(r"(?<![\d.])" + re.escape(num) + r"(?![\d])", mapping[num], text)
+    return text
 
 
 def _to_hours(value: str, unit: str) -> float:
@@ -760,18 +850,21 @@ def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
         return []
     engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [("ollama", _call_ollama)]
     if os.getenv("OPENAI_API_KEY"):
-        engines.append(("openai", _call_openai))
+        # Облачная модель (Groq / Gemini) отвечает за секунды — она первая; Ollama — офлайн-резерв.
+        engines.insert(0, ("openai", _call_openai))
     return engines
 
 
 def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple[str, Dict[str, Any], str]:
     """Регламент (RU) → (bpmn_xml, audit_data, error).
 
-    Порядок: локальная Ollama (qwen2.5-coder / llama3) → внешний API (если задан OPENAI_API_KEY) →
+    Порядок: облачный API (если задан OPENAI_API_KEY) → локальная Ollama (qwen2.5-coder / llama3) →
     встроенный семантический эмулятор. Исключения сети наружу не выходят.
+    Ответ модели с ошибками структуры (висящие узлы, ветвление без шлюза) отклоняется;
+    модель получает список ошибок и одну попытку исправиться (LLM_MAX_ATTEMPTS).
     """
     started = time.time()
-    text = (regulation_text or "").strip()
+    text = normalize_regulation(regulation_text or "").strip()
     if len(text) < 20:
         return "", {}, "Регламент пуст или слишком короткий: введите не менее одного-двух шагов процесса."
 
@@ -783,24 +876,40 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
 
     trace: List[str] = []
     if use_llm:
-        prompt = build_prompt(text)
+        max_attempts = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
+        retry_limit_s = float(os.getenv("LLM_RETRY_MAX_CALL_S", "90"))
         for name, call in _engines():
-            try:
-                engine_label, raw = call(prompt)
-            except Exception as exc:  # noqa: BLE001 — недоступность модели не должна ронять приложение
-                trace.append(f"{name}: недоступен ({type(exc).__name__})")
-                continue
-            xml, audit, err = execute_generated_code(raw, process_name, sla)
-            if not err:
-                audit["generation"] = {
-                    "engine": engine_label,
-                    "fallback": False,
-                    "trace": trace,
-                    "code": _strip_markdown(raw),
-                    "elapsed_s": round(time.time() - started, 2),
-                }
-                return xml, audit, ""
-            trace.append(f"{engine_label}: результат отклонён — {err}")
+            prompt = build_prompt(text)
+            for attempt in range(1, max_attempts + 1):
+                call_started = time.time()
+                try:
+                    engine_label, raw = call(prompt)
+                except Exception as exc:  # noqa: BLE001 — недоступность модели не должна ронять приложение
+                    reason = "таймаут" if "Timeout" in type(exc).__name__ else type(exc).__name__
+                    trace.append(f"{name}: недоступен ({reason})")
+                    break
+                call_s = time.time() - call_started
+                xml, audit, err = execute_generated_code(raw, process_name, sla)
+                quality = audit.get("quality", {}) if not err else {}
+                if not err and quality.get("ok"):
+                    audit["generation"] = {
+                        "engine": engine_label,
+                        "fallback": False,
+                        "attempts": attempt,
+                        "trace": trace,
+                        "code": _strip_markdown(raw),
+                        "elapsed_s": round(time.time() - started, 2),
+                    }
+                    return xml, audit, ""
+                problems = [err] if err else quality["critical"]
+                trace.append(
+                    f"{engine_label}, попытка {attempt} ({call_s:.0f} с): результат отклонён — "
+                    + "; ".join(problems[:5])
+                )
+                if attempt < max_attempts and call_s > retry_limit_s:
+                    trace.append(f"{engine_label}: повтор пропущен — модель отвечала дольше {retry_limit_s:.0f} с")
+                    break
+                prompt = build_repair_prompt(text, _strip_markdown(raw), problems)
 
     try:
         code, info = emulate_generation(text)

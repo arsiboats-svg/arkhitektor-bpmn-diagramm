@@ -221,13 +221,18 @@
     "critical_path_layers": 18,
     "critical_path_hours": 9.7
   },
+  "quality": {
+    "issues": [],
+    "critical": [],
+    "ok": true
+  },
   "generation": {
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
       "LLM недоступна — включён встроенный эмулятор"
     ],
-    "elapsed_s": 0.01,
+    "elapsed_s": 0.02,
     "parsed": {
       "title": "Аварийно-восстановительные работы на ПС 110 кВ с оформлением наряда-допуска",
       "steps": 16,

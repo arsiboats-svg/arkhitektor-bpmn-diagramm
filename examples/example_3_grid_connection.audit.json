@@ -207,13 +207,18 @@
     "critical_path_layers": 17,
     "critical_path_hours": 374.55
   },
+  "quality": {
+    "issues": [],
+    "critical": [],
+    "ok": true
+  },
   "generation": {
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
       "LLM недоступна — включён встроенный эмулятор"
     ],
-    "elapsed_s": 0.01,
+    "elapsed_s": 0.02,
     "parsed": {
       "title": "Технологическое присоединение льготного потребителя (до 15 кВт) к электрическим сетям",
       "steps": 14,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -17,6 +18,19 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from ai_generator import generate_bpmn_from_text
+
+
+def _secrets_to_env() -> None:
+    """Ключи LLM из .streamlit/secrets.toml / Streamlit Cloud Secrets → переменные окружения для ai_generator."""
+    try:
+        for key, value in st.secrets.items():
+            if isinstance(value, (str, int, float)):
+                os.environ.setdefault(key, str(value))
+    except Exception:  # noqa: BLE001 — secrets.toml нет: работаем на переменных окружения / эмуляторе
+        pass
+
+
+_secrets_to_env()
 
 ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
@@ -333,7 +347,9 @@ def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None
             progress.progress(pct, text=label)
             time.sleep(0.25)
     if progress:
-        progress.progress(45, text="Генерация кода DIAGRAM (LLM или встроенный эмулятор)…")
+        progress.progress(
+            45, text="Генерация кода DIAGRAM (LLM или встроенный эмулятор)… Локальной модели может потребоваться до 5 минут."
+        )
     xml, audit, error = generate_bpmn_from_text(text, use_llm=use_llm)
     if progress:
         progress.progress(78, text="Раскладка по слоям, ортогональные стрелки, BPMN in Color…")
@@ -376,7 +392,8 @@ def main() -> None:
         st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
     if "result" not in st.session_state and st.session_state["reg_text"].strip():
         with st.spinner("Готовим эталонный пример…"):
-            run_generation(st.session_state["reg_text"], use_llm=True, show_progress=False)
+            # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
+            run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
 
     left, right = st.columns([5, 7], gap="large")
 
@@ -409,9 +426,14 @@ def main() -> None:
         if result and not result["error"]:
             gen = result["audit"].get("generation", {})
             engine = gen.get("engine", "—")
-            fallback = " (fail-safe: LLM недоступна)" if gen.get("fallback") and engine == "semantic-emulator" else ""
+            note = ""
+            if gen.get("fallback") and engine == "semantic-emulator":
+                reasons = gen.get("trace") or ["LLM недоступна"]
+                note = f"<br>⚠️ fail-safe: {esc(reasons[-1])}"
+            elif gen.get("attempts", 1) > 1:
+                note = f" · исправлено со {gen['attempts']}-й попытки"
             st.markdown(
-                f'<div class="engine">Движок: <b>{esc(engine)}</b>{fallback} · {gen.get("elapsed_s", 0)} с</div>',
+                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{note}</div>',
                 unsafe_allow_html=True,
             )
         st.download_button(
