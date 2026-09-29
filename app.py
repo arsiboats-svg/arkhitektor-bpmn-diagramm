@@ -17,20 +17,26 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 import streamlit.components.v1 as components
 
-from ai_generator import generate_bpmn_from_text
+from ai_generator import cloud_engine_status, generate_bpmn_from_text
 
 
-def _secrets_to_env() -> None:
-    """Ключи LLM из .streamlit/secrets.toml / Streamlit Cloud Secrets → переменные окружения для ai_generator."""
+def _secrets_to_env() -> List[str]:
+    """Ключи LLM из .streamlit/secrets.toml / Streamlit Cloud Secrets → переменные окружения для ai_generator.
+
+    Возвращает имена найденных секретов (без значений) — для диагностики в интерфейсе.
+    """
+    names: List[str] = []
     try:
         for key, value in st.secrets.items():
+            names.append(str(key))
             if isinstance(value, (str, int, float)):
-                os.environ.setdefault(key, str(value))
+                os.environ.setdefault(str(key), str(value).strip())
     except Exception:  # noqa: BLE001 — secrets.toml нет: работаем на переменных окружения / эмуляторе
         pass
+    return names
 
 
-_secrets_to_env()
+SECRET_NAMES = _secrets_to_env()
 
 ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
@@ -416,6 +422,8 @@ def main() -> None:
             value=True,
             help="Если модель недоступна, автоматически включается встроенный семантический эмулятор.",
         )
+        secrets_note = f" · секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES else ""
+        st.caption(f"Облачная модель: {cloud_engine_status()}{secrets_note}")
         if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
             if not st.session_state["reg_text"].strip():
                 st.warning("Введите текст регламента.")

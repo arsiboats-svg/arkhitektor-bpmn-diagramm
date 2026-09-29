@@ -844,6 +844,14 @@ def emulate_generation(regulation_text: str) -> Tuple[str, Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Главная точка входа
 # --------------------------------------------------------------------------- #
+def cloud_engine_status() -> str:
+    """Строка для интерфейса: подключена ли облачная модель (без раскрытия ключа)."""
+    if not os.getenv("OPENAI_API_KEY"):
+        return "не подключена (OPENAI_API_KEY не задан)"
+    host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv("OPENAI_BASE_URL", OPENAI_DEFAULT_BASE))
+    return f"{os.getenv('OPENAI_MODEL', 'gpt-4o-mini')} · {host}"
+
+
 def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
     mode = os.getenv("BPMN_AI_MODE", "auto").lower()
     if mode == "emulator":
@@ -878,6 +886,8 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
     if use_llm:
         max_attempts = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
         retry_limit_s = float(os.getenv("LLM_RETRY_MAX_CALL_S", "90"))
+        if not os.getenv("OPENAI_API_KEY"):
+            trace.append("облачный API: OPENAI_API_KEY не задан")
         for name, call in _engines():
             prompt = build_prompt(text)
             for attempt in range(1, max_attempts + 1):
