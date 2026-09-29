@@ -338,6 +338,11 @@ def render_details(audit: Dict[str, Any]) -> None:
         if gen.get("code"):
             st.markdown("**Сгенерированный код для DIAGRAM:**")
             st.code(gen["code"], language="python")
+        for item in gen.get("rejected", []):
+            st.markdown(
+                f"**Отклонённый ответ {item['engine']}, попытка {item['attempt']}:** " + "; ".join(item["problems"][:5])
+            )
+            st.code(item["code"], language="python")
         st.markdown("**JSON аудита:**")
         st.json({k: v for k, v in audit.items() if k != "generation"}, expanded=False)
 

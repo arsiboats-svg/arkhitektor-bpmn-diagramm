@@ -177,8 +177,9 @@ def _structure_issues(diagram: BPMNDiagramBuilder) -> List[str]:
         incoming[link.target_id] = incoming.get(link.target_id, 0) + 1
     for node in diagram.nodes.values():
         outs = outgoing.get(node.id, [])
-        if node.kind in WORK_KINDS | {"subProcess"} and len(outs) > 1:
-            issues.append(f"У задачи «{node.name}» {len(outs)} выхода — ветвление без шлюза")
+        targets = {l.target_id for l in outs}  # дубли в одну цель (после переадресации движком) — не ветвление
+        if node.kind in WORK_KINDS | {"subProcess"} and len(targets) > 1:
+            issues.append(f"У задачи «{node.name}» {len(targets)} выхода — ветвление без шлюза")
         if node.kind in GATEWAY_KINDS and len(outs) <= 1 and incoming.get(node.id, 0) <= 1:
             issues.append(f"Шлюз «{node.name}» ничего не разветвляет и не сливает")
         if node.kind in ("exclusiveGateway", "inclusiveGateway") and len(outs) > 1:
@@ -188,7 +189,9 @@ def _structure_issues(diagram: BPMNDiagramBuilder) -> List[str]:
 
 
 # Ошибки, при которых ответ модели отклоняется (остальные — предупреждения).
-_CRITICAL_MARKERS = ("ветвление без шлюза", "ничего не разветвляет", "без входа", "Несуществующие")
+# «Шлюз ничего не разветвляет» — лишь предупреждение: так бывает, когда ветка из подпроцесса
+# переадресована движком на сам подпроцесс; схема при этом корректна.
+_CRITICAL_MARKERS = ("ветвление без шлюза", "без входа", "Несуществующие")
 
 
 def _quality_report(structure_issues: List[str], audit: Dict[str, Any]) -> Dict[str, Any]:
@@ -908,6 +911,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
         process_name, sla = "Бизнес-процесс по регламенту", None
 
     trace: List[str] = []
+    rejected: List[Dict[str, Any]] = []  # отклонённые ответы LLM — для разбора в «Технических деталях»
     if use_llm:
         max_attempts = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
         retry_limit_s = float(os.getenv("LLM_RETRY_MAX_CALL_S", "90"))
@@ -931,11 +935,13 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                         "fallback": False,
                         "attempts": attempt,
                         "trace": trace,
+                        "rejected": rejected,
                         "code": _strip_markdown(raw),
                         "elapsed_s": round(time.time() - started, 2),
                     }
                     return xml, audit, ""
                 problems = [err] if err else quality["critical"]
+                rejected.append({"engine": engine_label, "attempt": attempt, "problems": problems, "code": _strip_markdown(raw)})
                 trace.append(
                     f"{engine_label}, попытка {attempt} ({call_s:.0f} с): результат отклонён — "
                     + "; ".join(problems[:5])
@@ -956,6 +962,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
         "engine": "semantic-emulator",
         "fallback": use_llm,
         "trace": trace or (["LLM отключён"] if not use_llm else ["LLM недоступна — включён встроенный эмулятор"]),
+        "rejected": rejected,
         "code": code,
         "elapsed_s": round(time.time() - started, 2),
         "parsed": info,
