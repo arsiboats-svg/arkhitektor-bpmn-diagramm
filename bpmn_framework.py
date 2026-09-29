@@ -35,6 +35,7 @@ TNS = "http://bpmn.io/schema/bpmn"
 # Геометрия
 # --------------------------------------------------------------------------- #
 TASK_W, TASK_H = 140.0, 80.0
+TASK_H_MAX = 124.0             # длинное название — блок выше, но не бесконечно
 GATEWAY_S = 50.0
 EVENT_S = 36.0
 SUBPROCESS_MIN_W, SUBPROCESS_MIN_H = 560.0, 240.0
@@ -135,6 +136,12 @@ def _kind_size(kind: str) -> Tuple[float, float]:
     if kind == "subProcess":
         return SUBPROCESS_MIN_W, SUBPROCESS_MIN_H
     return TASK_W, TASK_H
+
+
+def _task_height(name: str) -> float:
+    """Высота задачи под текст: длинное название не должно вылезать за блок (иконка занимает угол)."""
+    lines = math.ceil(CHAR_W * 1.05 * len(name) / (TASK_W - 22.0)) if name else 1
+    return min(TASK_H_MAX, max(TASK_H, 15.0 * lines + 22.0))
 
 
 def _label_box(text: str, min_w: float, max_w: float) -> Tuple[float, float]:
@@ -386,6 +393,8 @@ class BPMNDiagramBuilder:
         owner_id, lane_id, group_id = self._resolve_context(parent_id)
         node_id = self._claim(node_id or "", prefix)
         width, height = _kind_size(kind)
+        if kind in WORK_KINDS:
+            height = _task_height(str(name or ""))
         self._order += 1
         self.nodes[node_id] = FlowNode(
             id=node_id,

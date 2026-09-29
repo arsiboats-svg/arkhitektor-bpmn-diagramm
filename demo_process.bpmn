@@ -239,7 +239,7 @@
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_9_di" bpmnElement="Activity_9" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="2786.0" y="125.0" width="140.0" height="80.0" />
+        <dc:Bounds x="2786.0" y="124.0" width="140.0" height="82.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_10_di" bpmnElement="Activity_10" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
         <dc:Bounds x="2786.0" y="538.0" width="140.0" height="80.0" />

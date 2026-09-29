@@ -394,7 +394,7 @@ _SYSTEM_RE = re.compile(
 )
 _DUR_RE = re.compile(
     r"\(?\s*(?:(?:в течение|не более|до|срок[:\s]*)\s*)?(\d+(?:[.,]\d+)?)\s*"
-    r"(рабоч\w*\s+дн\w*|календарн\w*\s+дн\w*|сут\w*|дн\w*|час\w*|ч\b|мин\w*)\s*\)?",
+    r"(рабоч\w*\s+(?:дн\w*|день)|календарн\w*\s+(?:дн\w*|день)|сут\w*|дн\w*|день|час\w*|ч\b|мин\w*)\s*\)?",
     re.I,
 )
 _REF_RE = re.compile(r"(?:п(?:ункт\w*|\.|п\.)?|шаг\w*)\s*(\d+)", re.I)
@@ -464,12 +464,13 @@ def _task_title(text: str) -> str:
     words = [_infinitive(w) if re.fullmatch(r"[А-Яа-яЁё]+", w) else w for w in text.split(" ")]
     title = " ".join(words)
     title = title[:1].upper() + title[1:] if title else "Выполнить действие"
-    if len(title) > 70:
-        cut = title[:70].rsplit(" ", 1)[0]
+    if len(title) > TITLE_MAX:
+        cut = title[:TITLE_MAX].rsplit(" ", 1)[0]
         title = cut.rstrip(",;:—–- ") + "…"
     return title
 
 
+TITLE_MAX = 110  # длиннее — обрезаем по слову; блок задачи растёт по высоте под текст
 _CONNECTORS_RE = re.compile(r"^(?:затем|далее|потом|после этого|также|при этом)[,\s]+", re.I)
 _ADVERBS = {"автоматически", "затем", "далее", "также", "самостоятельно", "обязательно", "незамедлительно", "оперативно"}
 
