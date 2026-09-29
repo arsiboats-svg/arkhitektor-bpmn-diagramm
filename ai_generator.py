@@ -315,12 +315,13 @@ def _call_ollama(prompt: str) -> Tuple[str, str]:
     return f"ollama:{model}", str(data.get("response", ""))
 
 
-def _call_openai(prompt: str) -> Tuple[str, str]:
-    key = os.getenv("OPENAI_API_KEY")
+def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
+    """OpenAI-совместимый chat/completions. prefix: OPENAI_* — основной провайдер, FALLBACK_* — запасной."""
+    key = os.getenv(f"{prefix}_API_KEY")
     if not key:
-        raise RuntimeError("OPENAI_API_KEY не задан")
-    base = os.getenv("OPENAI_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        raise RuntimeError(f"{prefix}_API_KEY не задан")
+    base = os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
+    model = os.getenv(f"{prefix}_MODEL", "gpt-4o-mini")
     system, _, regulation = prompt.partition("ТЕКСТ РЕГЛАМЕНТА:")
     payload: Dict[str, Any] = {
         "model": model,
@@ -331,15 +332,16 @@ def _call_openai(prompt: str) -> Tuple[str, str]:
         ],
     }
     # Рассуждающие модели (gpt-oss на Groq): low — меньше «мыслей», быстрее и в пределах лимита токенов/мин.
-    if os.getenv("OPENAI_REASONING_EFFORT"):
-        payload["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT")
+    if os.getenv(f"{prefix}_REASONING_EFFORT"):
+        payload["reasoning_effort"] = os.getenv(f"{prefix}_REASONING_EFFORT")
     data = _http_json(
         f"{base}/chat/completions",
         payload,
         headers={"Authorization": f"Bearer {key}"},
         timeout=float(os.getenv("OPENAI_TIMEOUT", "90")),
     )
-    return f"openai:{model}", str(data["choices"][0]["message"]["content"])
+    label = "openai" if prefix == "OPENAI" else prefix.lower()
+    return f"{label}:{model}", str(data["choices"][0]["message"]["content"])
 
 
 # --------------------------------------------------------------------------- #
@@ -874,10 +876,14 @@ def _error_reason(exc: Exception) -> str:
 
 def cloud_engine_status() -> str:
     """Строка для интерфейса: подключена ли облачная модель (без раскрытия ключа)."""
-    if not os.getenv("OPENAI_API_KEY"):
+    parts = []
+    for prefix in ("OPENAI", "FALLBACK"):
+        if os.getenv(f"{prefix}_API_KEY"):
+            host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE))
+            parts.append(f"{os.getenv(f'{prefix}_MODEL', 'gpt-4o-mini')} · {host}")
+    if not parts:
         return "не подключена (OPENAI_API_KEY не задан)"
-    host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv("OPENAI_BASE_URL", OPENAI_DEFAULT_BASE))
-    return f"{os.getenv('OPENAI_MODEL', 'gpt-4o-mini')} · {host}"
+    return parts[0] + (f" · запасная: {parts[1]}" if len(parts) > 1 else "")
 
 
 def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
@@ -885,8 +891,11 @@ def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
     if mode == "emulator":
         return []
     engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [("ollama", _call_ollama)]
+    # Облачные модели отвечают за секунды — они первые; Ollama — офлайн-резерв.
+    # FALLBACK_* — запасной провайдер: Groq бывает недоступен с отдельных IP (HTTP 403).
+    if os.getenv("FALLBACK_API_KEY"):
+        engines.insert(0, ("fallback", lambda prompt: _call_openai(prompt, "FALLBACK")))
     if os.getenv("OPENAI_API_KEY"):
-        # Облачная модель (Groq / Gemini) отвечает за секунды — она первая; Ollama — офлайн-резерв.
         engines.insert(0, ("openai", _call_openai))
     return engines
 

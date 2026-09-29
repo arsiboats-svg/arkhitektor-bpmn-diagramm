@@ -191,6 +191,7 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 | `LLM_RETRY_MAX_CALL_S` | `90` — повтор не делается, если первый ответ шёл дольше (иначе ожидание удваивается) |
 | `OPENAI_API_KEY` | если задан, подключается внешний API |
 | `OPENAI_BASE_URL`, `OPENAI_MODEL` | адрес и модель совместимого API (Groq: `openai/gpt-oss-120b`) |
+| `FALLBACK_API_KEY`, `FALLBACK_BASE_URL`, `FALLBACK_MODEL` | запасной OpenAI-совместимый провайдер (Gemini / OpenRouter), если основной отказал |
 | `OPENAI_REASONING_EFFORT` | для рассуждающих моделей: `low` — быстрее и экономнее по лимиту токенов |
 | `BPMN_AI_MODE=emulator` | принудительно использовать только эмулятор |
 
