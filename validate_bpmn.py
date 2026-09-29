@@ -145,12 +145,12 @@ def validate(path: str) -> List[str]:
                 if _seg_hits(a, b, (r[0] + 1, r[1] + 1, r[2] - 1, r[3] - 1)):
                     problems.append(f"{eid}: пересекает блок {k}")
         lb = e.find("bpmndi:BPMNLabel", NS)
-        if lb is not None:
+        if lb is not None and lb.find("dc:Bounds", NS) is not None:
             label_rects.append((eid, _rect(lb)))
 
     for s in root.iter(_q("bpmndi", "BPMNShape")):
-        lb = s.find("bpmndi:BPMNLabel", NS)
-        if lb is not None:
+        lb = s.find("bpmndi:BPMNLabel", NS)  # подпись без Bounds (только labelStyle) рисуется внутри фигуры
+        if lb is not None and lb.find("dc:Bounds", NS) is not None:
             label_rects.append((s.get("bpmnElement", ""), _rect(lb)))
 
     for i, (la, ra) in enumerate(label_rects):

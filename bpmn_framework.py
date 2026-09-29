@@ -52,6 +52,8 @@ POOL_HEADER_W = 30.0
 POOL_X, POOL_Y = 160.0, 80.0
 POOL_GAP_Y = 70.0
 NODE_ROW_GAP_Y = 26.0
+SUBPROCESS_LABEL_STYLE = "LabelStyle_SubprocessTitle"
+SUBPROCESS_TITLE_PT = 15         # заголовок раскрытого подпроцесса — крупнее подписей задач (12)
 LABEL_LIFT = 12.0              # сдвиг подписей над стрелками (y - 12)
 CHAR_W = 6.8                   # средняя ширина символа подписи (px)
 LINE_H = 15.0
@@ -1497,6 +1499,10 @@ class BPMNDiagramBuilder:
         out.append(f'    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="{self.collaboration_id}">')
         out.extend(self._di_xml())
         out.append("    </bpmndi:BPMNPlane>")
+        # Стиль заголовков подпроцессов (BPMN DI 12.2.3.6 BPMNLabelStyle): крупный жирный шрифт.
+        out.append(f'    <bpmndi:BPMNLabelStyle id="{SUBPROCESS_LABEL_STYLE}">')
+        out.append(f'      <dc:Font name="Arial" size="{SUBPROCESS_TITLE_PT}" isBold="true" />')
+        out.append("    </bpmndi:BPMNLabelStyle>")
         out.append("  </bpmndi:BPMNDiagram>")
         out.append("</bpmn:definitions>")
         return "\n".join(out) + "\n"
@@ -1543,6 +1549,8 @@ class BPMNDiagramBuilder:
                 out.append("        <bpmndi:BPMNLabel>")
                 out.append(bounds(x1, y1, x2 - x1, y2 - y1, 10))
                 out.append("        </bpmndi:BPMNLabel>")
+            elif node.kind == "subProcess":
+                out.append(f'        <bpmndi:BPMNLabel labelStyle="{SUBPROCESS_LABEL_STYLE}" />')
             out.append("      </bpmndi:BPMNShape>")
 
         for link in self.links:

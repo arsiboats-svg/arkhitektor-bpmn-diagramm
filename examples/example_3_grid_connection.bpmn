@@ -193,6 +193,7 @@
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_4_di" bpmnElement="Activity_4" isExpanded="true" bioc:stroke="#4527A0" bioc:fill="#EDE7F6" color:border-color="#4527A0" color:background-color="#EDE7F6">
         <dc:Bounds x="1180.0" y="458.0" width="1344.0" height="240.0" />
+        <bpmndi:BPMNLabel labelStyle="LabelStyle_SubprocessTitle" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Event_1_di" bpmnElement="Event_1" bioc:stroke="#2E7D32" bioc:fill="#E8F5E9" color:border-color="#2E7D32" color:background-color="#E8F5E9">
         <dc:Bounds x="1236.0" y="570.0" width="36.0" height="36.0" />
@@ -413,5 +414,8 @@
         <di:waypoint x="2432.0" y="588.0" />
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
+    <bpmndi:BPMNLabelStyle id="LabelStyle_SubprocessTitle">
+      <dc:Font name="Arial" size="15" isBold="true" />
+    </bpmndi:BPMNLabelStyle>
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>

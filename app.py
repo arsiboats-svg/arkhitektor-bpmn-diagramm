@@ -193,7 +193,21 @@ def viewer_html(xml: str, height: int) -> str:
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
   function fit() {{ canvas().zoom('fit-viewport', 'auto'); }}
-  viewer.importXML(XML).then(() => fit()).catch(e => {{
+  // Заголовки раскрытых подпроцессов — крупнее и жирнее (bpmn-js рисует все подписи одним кеглем).
+  function emphasizeSubprocessTitles() {{
+    const registry = viewer.get('elementRegistry');
+    registry.filter(el => el.type === 'bpmn:SubProcess').forEach(el => {{
+      const label = registry.getGraphics(el).querySelector('text.djs-label');
+      if (!label) return;
+      label.style.fontSize = '16px';
+      label.style.fontWeight = '700';
+      label.querySelectorAll('tspan').forEach(t => {{
+        t.setAttribute('x', Math.max(4, (el.width - t.getComputedTextLength()) / 2));
+        t.setAttribute('y', parseFloat(t.getAttribute('y')) + 4);  // крупный кегль не должен касаться рамки
+      }});
+    }});
+  }}
+  viewer.importXML(XML).then(() => {{ emphasizeSubprocessTitles(); fit(); }}).catch(e => {{
     const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
   }});
   const zoomBy = k => canvas().zoom(canvas().zoom() * k, 'auto');
