@@ -844,6 +844,27 @@ def emulate_generation(regulation_text: str) -> Tuple[str, Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Главная точка входа
 # --------------------------------------------------------------------------- #
+def _error_reason(exc: Exception) -> str:
+    """Короткая причина сбоя LLM: для HTTP-ошибок — код и сообщение провайдера («401: Invalid API Key»)."""
+    if "Timeout" in type(exc).__name__:
+        return "таймаут"
+    response = getattr(exc, "response", None)  # requests.Response ложен при 4xx — сравниваем с None
+    if response is None:
+        response = getattr(exc, "fp", None)
+    status = getattr(response, "status_code", None) or getattr(exc, "code", None)
+    if status is None:
+        return type(exc).__name__
+    message = ""
+    try:
+        body = response.json() if hasattr(response, "json") else json.loads(response.read().decode("utf-8"))
+        error = body.get("error", body) if isinstance(body, dict) else body
+        message = error.get("message", "") if isinstance(error, dict) else str(error)
+    except Exception:  # noqa: BLE001
+        message = str(getattr(response, "text", ""))
+    message = re.sub(r"\s+", " ", message).strip()[:160]
+    return f"HTTP {status}: {message}" if message else f"HTTP {status}"
+
+
 def cloud_engine_status() -> str:
     """Строка для интерфейса: подключена ли облачная модель (без раскрытия ключа)."""
     if not os.getenv("OPENAI_API_KEY"):
@@ -895,8 +916,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                 try:
                     engine_label, raw = call(prompt)
                 except Exception as exc:  # noqa: BLE001 — недоступность модели не должна ронять приложение
-                    reason = "таймаут" if "Timeout" in type(exc).__name__ else type(exc).__name__
-                    trace.append(f"{name}: недоступен ({reason})")
+                    trace.append(f"{name}: недоступен ({_error_reason(exc)})")
                     break
                 call_s = time.time() - call_started
                 xml, audit, err = execute_generated_code(raw, process_name, sla)

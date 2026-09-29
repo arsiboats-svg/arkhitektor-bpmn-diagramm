@@ -437,7 +437,7 @@ def main() -> None:
             note = ""
             if gen.get("fallback") and engine == "semantic-emulator":
                 reasons = gen.get("trace") or ["LLM недоступна"]
-                note = f"<br>⚠️ fail-safe: {esc(reasons[-1])}"
+                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
             elif gen.get("attempts", 1) > 1:
                 note = f" · исправлено со {gen['attempts']}-й попытки"
             st.markdown(
