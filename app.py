@@ -8,15 +8,35 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-from ai_generator import generate_bpmn_from_text
+from ai_generator import assistant_chat, cloud_engine_status, generate_bpmn_from_text
+
+
+def _secrets_to_env() -> List[str]:
+    """Ключи LLM из .streamlit/secrets.toml / Streamlit Cloud Secrets → переменные окружения для ai_generator.
+
+    Возвращает имена найденных секретов (без значений) — для диагностики в интерфейсе.
+    """
+    names: List[str] = []
+    try:
+        for key, value in st.secrets.items():
+            names.append(str(key))
+            if isinstance(value, (str, int, float)):
+                os.environ.setdefault(str(key), str(value).strip())
+    except Exception:  # noqa: BLE001 — secrets.toml нет: работаем на переменных окружения / эмуляторе
+        pass
+    return names
+
+
+SECRET_NAMES = _secrets_to_env()
 
 ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
@@ -26,6 +46,13 @@ DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (�
 DIAGRAM_HEIGHT_WIDE = 820  # в широком режиме
 VIEW_SPLIT = "🗂  Раздельный вид"
 VIEW_WIDE = "🖥  Широкий вид"
+
+QUICK_PROMPTS = [
+    ("🔍 Разбор узких мест SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
+    ("⚡ Как ускорить процесс?", "Как ускорить процесс? Что даст наибольший эффект?"),
+    ("📝 Регламент для исполнителя", "Составь должностную инструкцию для самой загруженной роли по текущей схеме."),
+    ("🔮 Предложить следующий шаг", "Предложи следующий шаг процесса: чего не хватает в регламенте?"),
+]
 
 BLUE_DARK, BLUE = "#003366", "#1565C0"
 OK, WARN, BAD = "#2E7D32", "#F57F17", "#C62828"
@@ -144,7 +171,29 @@ textarea {{ font-size:.9rem !important; line-height:1.45 !important; }}
 table.loops {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 table.loops th {{ text-align:left; color:#607D8B; font-weight:700; border-bottom:2px solid #DCE6F3; padding:6px 8px; }}
 table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#263238; }}
+[data-testid="stRadio"] div[role="radiogroup"] {{
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label {{
+  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
+[data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
+[data-testid="stRadio"] div[role="radiogroup"] > label:hover {{ background:rgba(21,101,192,.10); }}
+[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) {{
+  background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); box-shadow:0 4px 12px rgba(21,101,192,.35);
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) p {{ color:#fff; }}
+.land-cap {{ color:#607D8B; font-size:.76rem; text-transform:uppercase; letter-spacing:.6px; font-weight:700; margin:10px 0 4px 0; }}
+.chip-sys, .chip-doc {{ display:inline-block; border-radius:999px; padding:6px 14px; margin:4px 6px 4px 0; font-size:.86rem; font-weight:600; }}
+.chip-sys {{ background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; }}
+.chip-doc {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; }}
+.chip-sys small, .chip-doc small {{ opacity:.7; font-weight:700; margin-left:6px; }}
+.land-empty {{ color:#78909C; font-size:.88rem; font-style:italic; margin:2px 0 6px 0; }}
 .engine {{ font-size:.82rem; color:#455A64; background:#E3F2FD; border-radius:10px; padding:8px 12px; margin:10px 0 6px 0; }}
+.ir-toast {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; border-radius:12px; padding:10px 14px; font-weight:700; margin:8px 0 14px 0; }}
+section[data-testid="stSidebar"] {{ background:#F7FBFF; }}
+section[data-testid="stSidebar"] .stMarkdown p {{ font-size:.92rem; }}
 </style>
 """
 
@@ -152,11 +201,35 @@ table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#26323
 # --------------------------------------------------------------------------- #
 # Компонент просмотра BPMN (bpmn-js)
 # --------------------------------------------------------------------------- #
-def viewer_html(xml: str, height: int) -> str:
+# Заголовки раскрытых подпроцессов — крупнее и жирнее (bpmn-js рисует все подписи одним кеглем).
+# Один и тот же код выполняется и в просмотрщике, и в странице экспорта SVG — файл выглядит как на экране.
+EMPHASIZE_JS = """
+  function emphasizeSubprocessTitles() {
+    const registry = viewer.get('elementRegistry');
+    registry.filter(el => el.type === 'bpmn:SubProcess').forEach(el => {
+      const label = registry.getGraphics(el).querySelector('text.djs-label');
+      if (!label) return;
+      label.style.fontSize = '16px';
+      label.style.fontWeight = '700';
+      label.querySelectorAll('tspan').forEach(t => {
+        t.setAttribute('x', Math.max(4, (el.width - t.getComputedTextLength()) / 2));
+        t.setAttribute('y', parseFloat(t.getAttribute('y')) + 4);  // крупный кегль не должен касаться рамки
+      });
+    });
+  }
+"""
+
+
+def _bpmn_js_tags() -> Tuple[str, str]:
     js_inline = read_asset("bpmn-navigated-viewer.production.min.js")
     css_inline = read_asset("diagram-js.css")
     js_tag = f"<script>{js_inline}</script>" if js_inline else f'<script src="{BPMN_JS_CDN}"></script>'
     css_tag = f"<style>{css_inline}</style>" if css_inline else f'<link rel="stylesheet" href="{DIAGRAM_CSS_CDN}">'
+    return js_tag, css_tag
+
+
+def viewer_html(xml: str, height: int) -> str:
+    js_tag, css_tag = _bpmn_js_tags()
     payload = json.dumps(xml).replace("</", "<\\/")
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
@@ -209,8 +282,8 @@ def viewer_html(xml: str, height: int) -> str:
   function fit() {{ try {{ canvas().zoom('fit-viewport', 'auto'); }} catch (e) {{}} }}
   // размеры контейнера меняются не мгновенно: вписываем сразу и после перерисовки/анимации
   function fitSoon() {{ fit(); requestAnimationFrame(fit); setTimeout(fit, 120); setTimeout(fit, 350); }}
-
-  viewer.importXML(XML).then(() => fit()).catch(e => {{
+  {EMPHASIZE_JS}
+  viewer.importXML(XML).then(() => {{ emphasizeSubprocessTitles(); fit(); }}).catch(e => {{
     const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
   }});
   const zoomBy = k => canvas().zoom(canvas().zoom() * k, 'auto');
@@ -290,6 +363,49 @@ def viewer_html(xml: str, height: int) -> str:
 </script></body></html>
 """
 
+
+def svg_export_html(xml: str, file_name: str) -> str:
+    """Мини-страница с кнопкой «Скачать .svg»: bpmn-js в невидимом контейнере → viewer.saveSVG() → файл."""
+    js_tag, css_tag = _bpmn_js_tags()
+    payload = json.dumps(xml).replace("</", "<\\/")
+    name = json.dumps(file_name)
+    return f"""
+<!doctype html><html><head><meta charset="utf-8">{css_tag}
+<style>
+  html,body {{ margin:0; background:transparent; font-family:"Source Sans Pro",-apple-system,Segoe UI,Roboto,Arial,sans-serif; overflow:hidden; }}
+  #host {{ position:absolute; left:-12000px; top:0; width:2600px; height:1600px; }}
+  button {{ width:100%; height:44px; box-sizing:border-box; border:2px solid {BLUE}; color:{BLUE}; background:#fff;
+      border-radius:12px; font-weight:700; font-size:15px; cursor:pointer; transition:background .15s; }}
+  button:hover:not(:disabled) {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
+  button:disabled {{ opacity:.55; cursor:progress; }}
+</style></head>
+<body>
+<button id="dl" disabled>⏳  Готовим .svg…</button>
+<div id="host"></div>
+{js_tag}
+<script>
+  const XML = {payload};
+  const FILE_NAME = {name};
+  const btn = document.getElementById('dl');
+  const viewer = new BpmnJS({{ container: '#host' }});
+  {EMPHASIZE_JS}
+  viewer.importXML(XML).then(() => {{
+    emphasizeSubprocessTitles();
+    btn.disabled = false; btn.textContent = '⬇️  Скачать .svg';
+  }}).catch(e => {{ btn.textContent = 'SVG недоступен'; btn.title = e.message; }});
+  btn.onclick = async () => {{
+    try {{
+      let {{ svg }} = await viewer.saveSVG();
+      svg = svg.replace(/<svg\\b/, '<svg style="background:#fff"');   // белый фон в браузере и просмотрщиках
+      const url = URL.createObjectURL(new Blob([svg], {{ type: 'image/svg+xml;charset=utf-8' }}));
+      const a = document.createElement('a');
+      a.href = url; a.download = FILE_NAME; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }} catch (e) {{ btn.textContent = 'Ошибка экспорта SVG'; btn.title = e.message; }}
+  }};
+</script></body></html>
+"""
+
 # --------------------------------------------------------------------------- #
 # Аудит: визуальные блоки
 # --------------------------------------------------------------------------- #
@@ -298,6 +414,33 @@ def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
         f'<div class="ir-card" style="--c:{color}"><div class="k">{esc(title)}</div>'
         f'<div class="v">{esc(value)}</div><div class="s">{sub}</div>'
         f'<span class="pill">{esc(pill)}</span></div>'
+    )
+
+
+def _landscape_chips(items: List[Dict[str, Any]], css: str, icon: str) -> str:
+    chips = []
+    for it in items:
+        steps = ", ".join(str(n) for n in it.get("steps", []))
+        roles = ", ".join(it.get("roles", []))
+        tip = f"Шаги регламента: {steps}" + (f" · Роли: {roles}" if roles else "")
+        mentions = int(it.get("mentions", 1))
+        count = f"<small>×{mentions}</small>" if mentions > 1 else ""
+        chips.append(f'<span class="{css}" title="{esc(tip)}">{icon} {esc(it["name"])}{count}</span>')
+    return "".join(chips)
+
+
+def render_landscape(audit: Dict[str, Any]) -> None:
+    """ИТ-системы (синие плашки) и документы процесса (зелёные плашки), найденные в тексте регламента."""
+    systems: List[Dict[str, Any]] = audit.get("it_systems") or []
+    artifacts: List[Dict[str, Any]] = audit.get("artifacts") or []
+    st.markdown('<div class="ir-title" style="margin-top:18px">ИТ-ландшафт и документооборот процесса</div>', unsafe_allow_html=True)
+    sys_html = _landscape_chips(systems, "chip-sys", "💻") or '<div class="land-empty">ИТ-системы в регламенте не упомянуты — ' \
+        "процесс не привязан к системам: это риск ручной обработки.</div>"
+    doc_html = _landscape_chips(artifacts, "chip-doc", "📄") or '<div class="land-empty">Документы и артефакты в регламенте не обнаружены.</div>'
+    st.markdown(
+        f'<div class="land-cap">ИТ-системы ({len(systems)})</div>{sys_html}'
+        f'<div class="land-cap">Документы и артефакты ({len(artifacts)})</div>{doc_html}',
+        unsafe_allow_html=True,
     )
 
 
@@ -395,6 +538,8 @@ def render_audit(audit: Dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
 
+    render_landscape(audit)
+
     st.markdown('<div class="ir-title" style="margin-top:18px">Рекомендации по оптимизации</div>', unsafe_allow_html=True)
     risk_messages = [r for r in audit["sla_risks"] if r.get("severity") == "high"]
     recs = "".join(f'<div class="rec bad">{esc(r["message"])}</div>' for r in risk_messages)
@@ -422,6 +567,11 @@ def render_details(audit: Dict[str, Any]) -> None:
         if gen.get("code"):
             st.markdown("**Сгенерированный код для DIAGRAM:**")
             st.code(gen["code"], language="python")
+        for item in gen.get("rejected", []):
+            st.markdown(
+                f"**Отклонённый ответ {item['engine']}, попытка {item['attempt']}:** " + "; ".join(item["problems"][:5])
+            )
+            st.code(item["code"], language="python")
         st.markdown("**JSON аудита:**")
         st.json({k: v for k, v in audit.items() if k != "generation"}, expanded=False)
 
@@ -437,7 +587,9 @@ def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None
             progress.progress(pct, text=label)
             time.sleep(0.25)
     if progress:
-        progress.progress(45, text="Генерация кода DIAGRAM (LLM или встроенный эмулятор)…")
+        progress.progress(
+            45, text="Генерация кода DIAGRAM (LLM или встроенный эмулятор)… Локальной модели может потребоваться до 5 минут."
+        )
     xml, audit, error = generate_bpmn_from_text(text, use_llm=use_llm)
     if progress:
         progress.progress(78, text="Раскладка по слоям, ортогональные стрелки, BPMN in Color…")
@@ -456,6 +608,150 @@ def on_example_change() -> None:
         st.session_state["file_stem"] = examples[choice]["stem"]
     else:
         st.session_state["file_stem"] = "custom_process"
+    st.session_state["chat_messages"] = []
+    st.session_state.pop("diagram_updated_by_assistant", None)
+
+
+def render_downloads(key: str) -> None:
+    """Скачивание результата: BPMN 2.0 (.bpmn) и векторная диаграмма (.svg) — рядом."""
+    result = st.session_state.get("result")
+    ok = bool(result and not result["error"])
+    stem = st.session_state.get("file_stem", "process")
+    col_bpmn, col_svg = st.columns(2, gap="small")
+    with col_bpmn:
+        st.download_button(
+            "⬇️  Скачать .bpmn",
+            data=(result["xml"] if ok else ""),
+            file_name=f"{stem}.bpmn",
+            mime="application/xml",
+            disabled=not ok,
+            key=f"dl_bpmn_{key}",
+        )
+    with col_svg:
+        if ok:
+            page = svg_export_html(result["xml"], f"{stem}.svg")
+            if hasattr(st, "iframe"):
+                st.iframe(page, height=48)
+            else:
+                components.html(page, height=48, scrolling=False)
+        else:
+            st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}")
+
+
+def render_input_panel(labels: List[str], compact: bool = False, show_downloads: bool = True) -> None:
+    """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
+    box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
+    with box_left:
+        st.selectbox(
+            "Готовый отраслевой регламент",
+            [*labels, CUSTOM_LABEL],
+            key="example_choice",
+            on_change=on_example_change,
+            help="Выберите эталонный кейс или введите свой текст ниже.",
+        )
+        st.text_area(
+            "Текст регламента (шаги нумеруются; условия — «Если … — перейти к п.N, иначе …»)",
+            key="reg_text",
+            height=260 if compact else 400,
+        )
+    with box_right:
+        use_llm = st.checkbox(
+            "Использовать LLM (Ollama / OpenAI), если доступна",
+            value=True,
+            help="Если модель недоступна, автоматически включается встроенный семантический эмулятор.",
+        )
+        secrets_note = f" · секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES else ""
+        st.caption(f"Облачная модель: {cloud_engine_status()}{secrets_note}")
+        if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
+            if not st.session_state["reg_text"].strip():
+                st.warning("Введите текст регламента.")
+            else:
+                run_generation(st.session_state["reg_text"], use_llm)
+
+        result = st.session_state.get("result")
+        if result and not result["error"]:
+            gen = result["audit"].get("generation", {})
+            engine = gen.get("engine", "—")
+            note = ""
+            if gen.get("fallback") and engine == "semantic-emulator":
+                reasons = gen.get("trace") or ["LLM недоступна"]
+                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
+            elif gen.get("attempts", 1) > 1:
+                note = f" · исправлено со {gen['attempts']}-й попытки"
+            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
+            st.markdown(
+                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
+                unsafe_allow_html=True,
+            )
+        if show_downloads:
+            render_downloads("left")
+
+
+def render_diagram(canvas_height: int) -> None:
+    result = st.session_state.get("result")
+    if not result:
+        st.info("Выберите регламент и нажмите «Сгенерировать BPMN 2.0».")
+    elif result["error"]:
+        st.error(result["error"])
+    else:
+        page = viewer_html(result["xml"], canvas_height)
+        if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
+            st.iframe(page, height=canvas_height + 16)
+        else:
+            components.html(page, height=canvas_height + 16, scrolling=False)
+
+
+def _send_assistant(prompt: str) -> None:
+    """Отправляет реплику ассистенту и, если он изменил процесс, обновляет холст и аудит."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return
+    messages: List[Dict[str, str]] = st.session_state.setdefault("chat_messages", [])
+    messages.append({"role": "user", "content": prompt})
+    result = st.session_state.get("result") or {}
+    with st.spinner("Ассистент анализирует процесс…"):
+        reply, new_text, new_xml, new_audit = assistant_chat(
+            prompt,
+            messages[:-1],
+            result.get("xml") or "",
+            result.get("audit") or {},
+            st.session_state.get("reg_text") or "",
+            use_llm=True,
+        )
+    messages.append({"role": "assistant", "content": reply})
+    if new_text and new_xml and new_audit:
+        st.session_state["reg_text"] = new_text
+        st.session_state["result"] = {"xml": new_xml, "audit": new_audit, "error": ""}
+        st.session_state["diagram_updated_by_assistant"] = True
+        st.session_state["file_stem"] = st.session_state.get("file_stem") or "custom_process"
+
+
+def render_assistant() -> None:
+    """Сайдбар: «💬 AI-Ассистент Бизнес-Архитектора» — аналитика, правка на лету, реверс-генерация."""
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    with st.sidebar:
+        st.markdown("### 💬 AI-Ассистент Бизнес-Архитектора")
+        st.caption(
+            "Знает текущий процесс: роли, SLA, bus-factor, циклы возврата, ИТ-системы. "
+            "Может объяснить узкие места, изменить схему командой («Добавь согласование с экологами после шага 3») "
+            "или сгенерировать должностную инструкцию по BPMN."
+        )
+        for label, prompt in QUICK_PROMPTS:
+            if st.button(label, key=f"qp_{hash(label)}", use_container_width=True):
+                _send_assistant(prompt)
+                st.rerun()
+        for msg in st.session_state["chat_messages"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        typed = st.chat_input("Спросите про SLA, роли или измените процесс…")
+        if typed:
+            _send_assistant(typed)
+            st.rerun()
+        if st.session_state.get("chat_messages") and st.button("Очистить диалог", use_container_width=True):
+            st.session_state["chat_messages"] = []
+            st.session_state.pop("diagram_updated_by_assistant", None)
+            st.rerun()
 
 
 def render_download(key: str) -> None:
@@ -529,7 +825,8 @@ def render_diagram(canvas_height: int) -> None:
 def main() -> None:
     st.set_page_config(page_title="Архитектор BPMN — Интер РАО", page_icon="⚡", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
-    # Часть виджетов может не рисоваться в отдельных режимах — не даём Streamlit стереть их состояние.
+    render_assistant()
+    # Часть виджетов не рисуется в отдельных режимах — не даём Streamlit стереть их состояние.
     for _k in ("reg_text", "example_choice"):
         if _k in st.session_state:
             st.session_state[_k] = st.session_state[_k]
@@ -539,7 +836,7 @@ def main() -> None:
 <div class="ir-hero">
   <div><h1>⚡ Архитектор BPMN-диаграмм</h1>
   <p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · регламент → BPMN 2.0 → аудит процесса</p></div>
-  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span></div>
+  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span><span>MCP</span></div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -553,9 +850,10 @@ def main() -> None:
         st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
     if "result" not in st.session_state and st.session_state["reg_text"].strip():
         with st.spinner("Готовим эталонный пример…"):
-            run_generation(st.session_state["reg_text"], use_llm=True, show_progress=False)
+            # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
+            run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
 
-    mode_col, _, dl_col = st.columns([5, 3, 3], gap="medium", vertical_alignment="center")
+    mode_col, _, dl_col = st.columns([5, 1, 5], gap="medium", vertical_alignment="center")
     with mode_col:
         view = st.radio(
             "Режим отображения",
@@ -565,13 +863,16 @@ def main() -> None:
             label_visibility="collapsed",
         )
     wide = view == VIEW_WIDE
+    if st.session_state.pop("diagram_updated_by_assistant", False):
+        st.markdown(
+            '<div class="ir-toast">✨ Диаграмма обновлена ассистентом в диалоге</div>',
+            unsafe_allow_html=True,
+        )
     if wide:
         with dl_col:
-            render_download("dl_wide")
-
-    if wide:
+            render_downloads("wide")
         with st.expander("Регламент и настройки", expanded=False):
-            render_input_panel(labels, compact=True, show_download=False)
+            render_input_panel(labels, compact=True, show_downloads=False)
         render_diagram(DIAGRAM_HEIGHT_WIDE)
     else:
         left, right = st.columns([5, 7], gap="large")
@@ -584,6 +885,5 @@ def main() -> None:
     if result and not result["error"]:
         render_audit(result["audit"])
         render_details(result["audit"])
-
 
 main()

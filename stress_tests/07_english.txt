@@ -1,0 +1,5 @@
+Process: Incident management
+1. Dispatcher receives an outage report.
+2. Shift supervisor assesses the damage.
+3. If repair is needed, repair crew performs repair, otherwise close the ticket.
+4. Dispatcher restores normal operation.

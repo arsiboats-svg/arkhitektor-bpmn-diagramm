@@ -35,6 +35,7 @@ TNS = "http://bpmn.io/schema/bpmn"
 # Геометрия
 # --------------------------------------------------------------------------- #
 TASK_W, TASK_H = 140.0, 80.0
+TASK_H_MAX = 150.0             # длинное название — блок выше, но не бесконечно
 GATEWAY_S = 50.0
 EVENT_S = 36.0
 SUBPROCESS_MIN_W, SUBPROCESS_MIN_H = 560.0, 240.0
@@ -52,7 +53,10 @@ POOL_HEADER_W = 30.0
 POOL_X, POOL_Y = 160.0, 80.0
 POOL_GAP_Y = 70.0
 NODE_ROW_GAP_Y = 26.0
-LABEL_LIFT = 12.0              # сдвиг подписей над стрелками (y - 12)
+SUBPROCESS_LABEL_STYLE = "LabelStyle_SubprocessTitle"
+SUBPROCESS_TITLE_PT = 15         # заголовок раскрытого подпроцесса — крупнее подписей задач (12)
+LABEL_LIFT = 12.0
+LABEL_GAP = 6.0                # минимальный зазор между подписями              # сдвиг подписей над стрелками (y - 12)
 CHAR_W = 6.8                   # средняя ширина символа подписи (px)
 LINE_H = 15.0
 
@@ -132,6 +136,31 @@ def _kind_size(kind: str) -> Tuple[float, float]:
     if kind == "subProcess":
         return SUBPROCESS_MIN_W, SUBPROCESS_MIN_H
     return TASK_W, TASK_H
+
+
+def _wrapped_lines(text: str, width: float, char_w: float = 7.2) -> int:
+    """Число строк при переносе по словам, как в bpmn-js (кириллица 12px Arial ≈ 7.2 px/символ)."""
+    lines, cur = 1, 0.0
+    for word in text.split():
+        w = len(word) * char_w
+        if cur and cur + char_w * 0.5 + w > width:
+            lines, cur = lines + 1, w
+        else:
+            cur += (char_w * 0.5 if cur else 0.0) + w
+        while cur > width:  # слово длиннее строки bpmn-js переносит посимвольно
+            lines, cur = lines + 1, cur - width
+    return lines
+
+
+def _task_height(name: str) -> float:
+    """Высота задачи под текст.
+
+    bpmn-js центрирует текст по вертикали, а иконку задачи (человек/скрипт, ~20 px) рисует в левом
+    верхнем углу. Блок выше текста минимум на 2×24 px — первая строка гарантированно ниже иконки
+    и не перекрывает первые буквы; длинное название не выходит за рамку.
+    """
+    lines = _wrapped_lines(name, TASK_W - 10.0) if name else 1
+    return min(TASK_H_MAX, max(TASK_H, 14.5 * lines + 48.0))
 
 
 def _label_box(text: str, min_w: float, max_w: float) -> Tuple[float, float]:
@@ -383,6 +412,8 @@ class BPMNDiagramBuilder:
         owner_id, lane_id, group_id = self._resolve_context(parent_id)
         node_id = self._claim(node_id or "", prefix)
         width, height = _kind_size(kind)
+        if kind in WORK_KINDS:
+            height = _task_height(str(name or ""))
         self._order += 1
         self.nodes[node_id] = FlowNode(
             id=node_id,
@@ -825,6 +856,21 @@ class BPMNDiagramBuilder:
         self._layout_groups()
         self._route_all()
         self._place_labels()
+        self._fit_last_pool_to_labels()
+
+    def _fit_last_pool_to_labels(self) -> None:
+        """Подпись под нижней стрелкой-обходом может выйти за пул — растим нижний пул и его нижнюю дорожку."""
+        if not self.pools:
+            return
+        pool = max(self.pools.values(), key=lambda p: p.y)
+        rects = [l.label_rect for l in self.links if l.label_rect] + [n.label_rect for n in self.nodes.values() if n.label_rect]
+        inside = [r for r in rects if pool.y <= r[1] <= pool.y + pool.height + 60]
+        overflow = max((r[3] for r in inside), default=0.0) + 6.0 - (pool.y + pool.height)
+        if overflow <= 0 or not pool.lane_ids:
+            return
+        pool.height += overflow
+        lowest = max((self.lanes[i] for i in pool.lane_ids), key=lambda lane: lane.y)
+        lowest.height += overflow
 
     # ---------------------------------------------------------------- labels
     def _place_labels(self) -> None:
@@ -839,14 +885,18 @@ class BPMNDiagramBuilder:
         lo_x = min((p.x for p in self.pools.values()), default=0.0) + POOL_HEADER_W
         hi_x = max((p.x + p.width for p in self.pools.values()), default=10_000.0)
 
-        def cost(rect: Rect) -> float:
+        def cost(rect: Rect, home: Set[str]) -> float:
             total = 0.0
             for node, nr in node_rects:
-                if _rects_intersect(rect, nr) and not (node.kind == "subProcess" and _rect_contains(nr, rect)):
+                # Внутри подпроцесса подпись допустима, только если её стрелка/узел сами лежат в нём:
+                # иначе подпись возвратной стрелки «прилипает» к чужой рамке и читается как его часть.
+                if _rects_intersect(rect, nr) and not (node.id in home and _rect_contains(nr, rect)):
                     total += 100.0
             for other in placed:
                 if _rects_intersect(rect, other, 0.0):
                     total += 100.0
+                elif _rects_intersect(rect, (other[0] - LABEL_GAP, other[1] - LABEL_GAP, other[2] + LABEL_GAP, other[3] + LABEL_GAP), 0.0):
+                    total += 40.0  # подписи «слипаются» и читаются как одна
             inflated = (rect[0] - 1.0, rect[1] - 1.0, rect[2] + 1.0, rect[3] + 1.0)
             for a, b in segments:
                 if _hits_rect(a, b, inflated):
@@ -855,10 +905,10 @@ class BPMNDiagramBuilder:
                 total += 30.0
             return total
 
-        def choose(cands: Sequence[Rect]) -> Rect:
+        def choose(cands: Sequence[Rect], home: Set[str]) -> Rect:
             best, best_cost = cands[0], float("inf")
             for idx, rect in enumerate(cands):
-                c = cost(rect) + idx * 0.05
+                c = cost(rect, home) + idx * 0.05
                 if c < best_cost:
                     best, best_cost = rect, c
                 if c < 0.5:
@@ -870,7 +920,13 @@ class BPMNDiagramBuilder:
             if not link.condition_name:
                 continue
             w, h = _label_box(link.condition_name, 40.0, 150.0)
-            link.label_rect = choose(self._edge_label_candidates(link.waypoints, w, h))
+            home = {
+                n.id
+                for n, nr in node_rects
+                if n.kind == "subProcess" and all(nr[0] <= p[0] <= nr[2] and nr[1] <= p[1] <= nr[3] for p in link.waypoints)
+            }
+            from_gateway = self.nodes[link.source_id].kind in GATEWAY_KINDS if link.source_id in self.nodes else False
+            link.label_rect = choose(self._edge_label_candidates(link.waypoints, w, h, near_source=from_gateway), home)
 
         for node in self.nodes.values():
             if not node.name:
@@ -884,6 +940,11 @@ class BPMNDiagramBuilder:
                     (node.x + node.width + 4, top + node.height / 2 - h / 2, node.x + node.width + 4 + w, top + node.height / 2 + h / 2),
                     (node.x - 4 - w, top + node.height / 2 - h / 2, node.x - 4, top + node.height / 2 + h / 2),
                 ]
+                # Запасные места, если рядом уже стоят подписи стрелок: ярусом ниже/выше и со сдвигом.
+                for dy in (0.0, 18.0, 40.0):
+                    for dx in (-w / 2 + 8, w / 2 - 8, 0.0):
+                        cands.append((cx - w / 2 + dx, bottom + 4 + dy, cx + w / 2 + dx, bottom + 4 + dy + h))
+                        cands.append((cx - w / 2 + dx, top - 4 - h - dy, cx + w / 2 + dx, top - 4 - dy))
             elif node.kind in GATEWAY_KINDS:
                 w, h = _label_box(node.name, 60.0, 150.0)
                 cands = []
@@ -900,10 +961,10 @@ class BPMNDiagramBuilder:
                 cands.append((node.x + node.width + 6, mid - h / 2, node.x + node.width + 6 + w, mid + h / 2))
             else:
                 continue
-            node.label_rect = choose(cands)
+            node.label_rect = choose(cands, {node.owner_id})
 
     @staticmethod
-    def _edge_label_candidates(points: Sequence[Point], w: float, h: float) -> List[Rect]:
+    def _edge_label_candidates(points: Sequence[Point], w: float, h: float, near_source: bool = False) -> List[Rect]:
         segs = list(zip(points, points[1:]))
         horizontal = sorted(
             (s for s in segs if abs(s[0][1] - s[1][1]) < 0.01), key=lambda s: -abs(s[0][0] - s[1][0])
@@ -912,20 +973,48 @@ class BPMNDiagramBuilder:
             (s for s in segs if abs(s[0][0] - s[1][0]) < 0.01), key=lambda s: -abs(s[0][1] - s[1][1])
         )
         fractions = (0.5, 0.25, 0.75, 0.1, 0.9)
-        cands: List[Rect] = []
+        above: List[Rect] = []
+        below: List[Rect] = []
         for tier in (0.0, 18.0):  # над линией: нижний край подписи на LABEL_LIFT + 2 выше стрелки
             for a, b in horizontal:
                 x1, x2, y = min(a[0], b[0]), max(a[0], b[0]), a[1]
                 for f in fractions:
                     cx = x1 + (x2 - x1) * f
-                    cands.append((cx - w / 2, y - LABEL_LIFT - 2 - h - tier, cx + w / 2, y - LABEL_LIFT - 2 - tier))
+                    above.append((cx - w / 2, y - LABEL_LIFT - 2 - h - tier, cx + w / 2, y - LABEL_LIFT - 2 - tier))
         for tier in (0.0, 18.0):  # под линией
             for a, b in horizontal:
                 x1, x2, y = min(a[0], b[0]), max(a[0], b[0]), a[1]
                 for f in fractions:
                     cx = x1 + (x2 - x1) * f
                     top = y + LABEL_LIFT - 4 + tier
-                    cands.append((cx - w / 2, top, cx + w / 2, top + h))
+                    below.append((cx - w / 2, top, cx + w / 2, top + h))
+        # Стрелка-обход «понизу» (U-маршрут возврата ниже обоих концов): подпись под линией — над ней
+        # она упирается в блоки, мимо которых идёт обход, и читается как их подпись.
+        goes_under = bool(horizontal) and points and horizontal[0][0][1] > max(points[0][1], points[-1][1]) + 0.01
+        cands: List[Rect] = below + above if goes_under else above + below
+        if near_source and not goes_under and len(points) >= 2:
+            # Условие ветки — у выхода из шлюза (конвенция BPMN), а не у конца стрелки, где его
+            # легко принять за подпись следующего узла.
+            (x0, y0), (x1, y1) = points[0], points[1]
+            start: List[Rect] = []
+            if abs(x0 - x1) < 0.01:  # вертикальный выход: сбоку от линии; узкий вариант — в несколько строк
+                sign = 1.0 if y1 > y0 else -1.0
+                text_w = max(w - 10.0, 1.0) * max(1, round(h / 15.0))
+                for wv in (w, 96.0):
+                    hv = 15.0 * math.ceil(text_w / (wv - 8.0)) if wv < w else h
+                    if abs(y1 - y0) < hv + 24:
+                        continue
+                    y_near, y_far = y0 + sign * 12, y0 + sign * (12 + hv)
+                    top, bottom = min(y_near, y_far), max(y_near, y_far)
+                    start += [(x0 + 8, top, x0 + 8 + wv, bottom), (x0 - 8 - wv, top, x0 - 8, bottom)]
+            elif abs(y0 - y1) < 0.01 and abs(x1 - x0) >= w + 16:  # горизонтальный выход: над/под, не длиннее участка
+                sign = 1.0 if x1 > x0 else -1.0
+                cx = x0 + sign * (8 + w / 2)
+                start += [
+                    (cx - w / 2, y0 - LABEL_LIFT - 2 - h, cx + w / 2, y0 - LABEL_LIFT - 2),
+                    (cx - w / 2, y0 + LABEL_LIFT - 4, cx + w / 2, y0 + LABEL_LIFT - 4 + h),
+                ]
+            cands = start + cands
         for a, b in vertical:  # справа/слева от вертикальных участков
             y1, y2, x = min(a[1], b[1]), max(a[1], b[1]), a[0]
             for f in fractions:
@@ -1470,6 +1559,10 @@ class BPMNDiagramBuilder:
         out.append(f'    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="{self.collaboration_id}">')
         out.extend(self._di_xml())
         out.append("    </bpmndi:BPMNPlane>")
+        # Стиль заголовков подпроцессов (BPMN DI 12.2.3.6 BPMNLabelStyle): крупный жирный шрифт.
+        out.append(f'    <bpmndi:BPMNLabelStyle id="{SUBPROCESS_LABEL_STYLE}">')
+        out.append(f'      <dc:Font name="Arial" size="{SUBPROCESS_TITLE_PT}" isBold="true" />')
+        out.append("    </bpmndi:BPMNLabelStyle>")
         out.append("  </bpmndi:BPMNDiagram>")
         out.append("</bpmn:definitions>")
         return "\n".join(out) + "\n"
@@ -1516,6 +1609,8 @@ class BPMNDiagramBuilder:
                 out.append("        <bpmndi:BPMNLabel>")
                 out.append(bounds(x1, y1, x2 - x1, y2 - y1, 10))
                 out.append("        </bpmndi:BPMNLabel>")
+            elif node.kind == "subProcess":
+                out.append(f'        <bpmndi:BPMNLabel labelStyle="{SUBPROCESS_LABEL_STYLE}" />')
             out.append("      </bpmndi:BPMNShape>")
 
         for link in self.links:

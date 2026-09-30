@@ -221,13 +221,77 @@
     "critical_path_layers": 18,
     "critical_path_hours": 9.7
   },
+  "quality": {
+    "issues": [],
+    "critical": [],
+    "ok": true
+  },
+  "xsd_valid": true,
+  "artifacts": [
+    {
+      "name": "Наряд-допуск",
+      "mentions": 3,
+      "steps": [
+        4,
+        5,
+        15
+      ],
+      "roles": [
+        "Начальник смены",
+        "Служба безопасности"
+      ]
+    },
+    {
+      "name": "Дефектная ведомость",
+      "mentions": 1,
+      "steps": [
+        10
+      ],
+      "roles": [
+        "Ремонтная бригада"
+      ]
+    },
+    {
+      "name": "Заявка",
+      "mentions": 1,
+      "steps": [
+        16
+      ],
+      "roles": [
+        "Диспетчер"
+      ]
+    }
+  ],
+  "it_systems": [
+    {
+      "name": "Оперативный журнал",
+      "mentions": 1,
+      "steps": [
+        2
+      ],
+      "roles": [
+        "Диспетчер"
+      ]
+    },
+    {
+      "name": "Информационная система (ИС / АС)",
+      "mentions": 1,
+      "steps": [
+        2
+      ],
+      "roles": [
+        "Диспетчер"
+      ]
+    }
+  ],
   "generation": {
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
-      "LLM недоступна — включён встроенный эмулятор"
+      "облачный API: OPENAI_API_KEY не задан"
     ],
-    "elapsed_s": 0.01,
+    "rejected": [],
+    "elapsed_s": 0.02,
     "parsed": {
       "title": "Аварийно-восстановительные работы на ПС 110 кВ с оформлением наряда-допуска",
       "steps": 16,
