@@ -1472,7 +1472,8 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
             value=True,
             help="Если модель недоступна, автоматически включается встроенный семантический эмулятор.",
         )
-        secrets_note = f" · секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES else ""
+        # Имена секретов — только если ключа нет (диагностика настройки), иначе строка для жюри лишняя.
+        secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
         st.caption(f"Облачная модель: {cloud_engine_status()}{secrets_note}")
         if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
             if not st.session_state["reg_text"].strip():
