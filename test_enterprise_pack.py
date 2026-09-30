@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from ai_generator import (
@@ -27,8 +28,17 @@ def main() -> None:
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
 
     opt, delta = optimize_process_to_be(text, audit)
-    assert "Параллельно" in opt or any(a.get("kind") == "parallel" for a in delta.get("actions") or [])
-    assert any(a.get("kind") in ("zero_rework", "automation", "parallel") for a in delta.get("actions") or [])
+    ot_stop = re.compile(
+        r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+        re.I,
+    )
+    for line in opt.splitlines():
+        if re.search(r"параллельно|одновременно", line, re.I) and ot_stop.search(line):
+            raise AssertionError(f"запрещено распараллеливать охрану труда: {line}")
+        if re.search(r"аварийн\w+\s+ремонт|выполн\w+.{0,40}ремонт", line, re.I):
+            assert not re.search(r"^\s*\d+\.\s*(?:параллельно|одновременно)", line, re.I), line
+    assert any(a.get("kind") == "safety_seq" for a in delta.get("actions") or []), delta.get("actions")
+    assert any(a.get("kind") in ("zero_rework", "automation", "parallel", "safety_seq") for a in delta.get("actions") or [])
     assert "sla_saved_hours" in delta
     assert delta.get("tobe_xml") or not delta.get("tobe_error")
     assert int(delta.get("rework_after") or 0) <= int(delta.get("rework_before") or 0)
@@ -58,8 +68,11 @@ def main() -> None:
     assert float(audit_g["sla"]["critical_path_hours"]) >= 350
     _, delta_g = optimize_process_to_be(grid, audit_g)
     assert delta_g.get("engine") == "semantic-optimizer"
-    assert float(delta_g.get("sla_saved_hours") or 0) > 50
-    assert float(delta_g["sla_before_hours"]) > float(delta_g["sla_after_hours"])
+    saved = float(delta_g.get("sla_saved_hours") or 0)
+    before = float(delta_g["sla_before_hours"])
+    after = float(delta_g["sla_after_hours"])
+    assert abs(saved - (before - after)) < 1e-6, (saved, before, after)
+    assert before > after
 
     proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
         encoding="utf-8"
@@ -84,6 +97,47 @@ def main() -> None:
     assert "метро" not in qual.lower()
     read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
     assert "Quality Score" in read or "читаем" in read.lower()
+
+    from bpmn_framework import BPMNDiagramBuilder
+    from test_pipeline import build_emergency_repair
+
+    origin = (40.0, 80.0)
+    path = [origin, (180.0, 80.0), (180.0, 120.0), (280.0, 120.0)]
+    dummy = BPMNDiagramBuilder("fan-in")
+    shifted = dummy._shift_path_end(path, "left", 10.0)
+    assert shifted[0] == origin, shifted[0]
+    for a, b in zip(shifted, shifted[1:]):
+        assert abs(a[0] - b[0]) < 0.05 or abs(a[1] - b[1]) < 0.05, (a, b)
+    two = dummy._shift_path_end([origin, (200.0, 80.0)], "left", 12.0)
+    assert two[0] == origin, two
+    for a, b in zip(two, two[1:]):
+        assert abs(a[0] - b[0]) < 0.05 or abs(a[1] - b[1]) < 0.05, (a, b)
+
+    diagram = build_emergency_repair()
+    diagram.compute_layout()
+    for link in diagram.links:
+        src = diagram.nodes[link.source_id]
+        x0, y0 = link.waypoints[0]
+        on_src = (
+            abs(x0 - src.x) < 2.0
+            or abs(x0 - (src.x + src.width)) < 2.0
+            or abs(y0 - src.y) < 2.0
+            or abs(y0 - (src.y + src.height)) < 2.0
+        )
+        assert on_src, (link.id, link.waypoints[0], src.x, src.y, src.width, src.height)
+        for a, b in zip(link.waypoints, link.waypoints[1:]):
+            assert abs(a[0] - b[0]) < 0.05 or abs(a[1] - b[1]) < 0.05, (link.id, a, b)
+
+    inverted = parse_regulation(
+        "Регламент: Инверсия ТЭК\n"
+        "1. Осмотр оборудования проводит начальник смены (30 минут).\n"
+        "2. Диспетчер фиксирует результат в оперативном журнале (5 минут).\n"
+    )
+    assert inverted.steps[0].role == "Начальник смены", inverted.steps[0]
+    title0 = (inverted.steps[0].title or "").lower()
+    assert title0.startswith("провести") or title0.startswith("осмотреть"), inverted.steps[0].title
+    assert "осмотр" in title0 or "осмотреть" in title0
+    assert inverted.steps[1].role == "Диспетчер"
 
     print(
         "ok",

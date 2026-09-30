@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
 import os
 import re
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,10 +58,10 @@ ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
-DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (не менее 700)
-DIAGRAM_HEIGHT_WIDE = 820  # в широком режиме
-VIEW_SPLIT = "🗂  Раздельный вид"
+DIAGRAM_HEIGHT = 580  # ноутбук ~900 px: холст + карточки без бесконечной прокрутки
+DIAGRAM_HEIGHT_WIDE = 640
 VIEW_WIDE = "🖥  Широкий вид"
+VIEW_SPLIT = "🗂  Раздельный вид"
 ASIS_LABEL = "Текущий процесс (As-Is)"
 TOBE_LABEL = "Целевой оптимизированный (To-Be)"
 
@@ -101,6 +101,40 @@ def read_asset(name: str) -> Optional[str]:
     return path.read_text(encoding="utf-8") if path.exists() else None
 
 
+def _reg_hash(text: str, *parts: object) -> str:
+    payload = "\u001f".join(["palette-corporate-v3", text or "", *[str(p) for p in parts]])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _audit_cache_slice(audit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Компактный срез аудита для ключа кэша To-Be (без code/trace)."""
+    data = audit or {}
+    sla = data.get("sla") or {}
+    meth = data.get("methodology") or {}
+    return {
+        "critical_path_hours": sla.get("critical_path_hours"),
+        "with_rework_hours": sla.get("with_rework_hours"),
+        "rework_hours": sla.get("rework_hours"),
+        "breach": sla.get("breach"),
+        "quality": meth.get("score"),
+        "rework_n": len(data.get("rework_loops") or []),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def cached_generate_bpmn(text_hash: str, text: str, use_llm: bool) -> Tuple[str, Dict[str, Any], str]:
+    """Генерация XML + аудит по sha256 текста регламента. Повторный вызов — из кэша Streamlit."""
+    _ = text_hash
+    return generate_bpmn_from_text(text, use_llm=use_llm)
+
+
+@st.cache_data(show_spinner=False)
+def cached_optimize_to_be(text_hash: str, text: str, asis_core: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """To-Be по хешу регламента: вкладки и смена вида не пересчитывают граф."""
+    _ = text_hash
+    return optimize_process_to_be(text, asis_core)
+
+
 def esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
@@ -123,30 +157,46 @@ def fmt_days(hours: float) -> str:
 CSS = f"""
 <style>
 :root {{ --dark:{BLUE_DARK}; --blue:{BLUE}; --ok:{OK}; --warn:{WARN}; --bad:{BAD}; }}
-.stApp {{ background: #F4F8FD; }}
-.block-container {{ padding-top: 1.2rem; max-width: 1500px; }}
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"], button, input, textarea, select {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+}}
+.stApp {{ background: #F4F8FD; color: #0F172A; }}
+.block-container {{ padding-top: 0.85rem; max-width: 1500px; }}
 header[data-testid="stHeader"] {{ background: transparent; }}
 #MainMenu, footer {{ visibility: hidden; }}
-.ir-hero {{
-  background: linear-gradient(105deg, {BLUE_DARK} 0%, {BLUE} 100%);
-  border-radius: 18px; padding: 22px 30px; color: #fff; margin-bottom: 18px;
-  box-shadow: 0 8px 24px rgba(0,51,102,.22); display:flex; justify-content:space-between; align-items:center; gap:24px;
+button, a, [role="button"], [data-baseweb="tab"], [data-baseweb="select"],
+[data-testid="stRadio"] label, .stDownloadButton > button, .stButton > button {{
+  transition: all 0.2s ease;
 }}
-.ir-hero h1 {{ color:#fff; font-size: 1.75rem; margin:0; padding:0; letter-spacing:.2px; }}
-.ir-hero p {{ margin:4px 0 0 0; color:#DCE9FA; font-size:.98rem; }}
-.ir-badges span {{
-  display:inline-block; background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.35);
-  color:#fff; padding:5px 12px; border-radius:999px; font-size:.78rem; margin-left:6px; white-space:nowrap;
+.ir-hero {{
+  background: linear-gradient(115deg, #002244 0%, #003366 55%, #1565C0 100%);
+  border-radius: 16px; padding: 16px 26px; min-height: 86px; color: #fff;
+  box-shadow: 0 8px 24px rgba(0,34,68,0.22);
+  display: flex; justify-content: space-between; align-items: center; gap: 24px;
+  margin-bottom: 10px;
+}}
+.ir-hero h1 {{
+  color:#fff; font-size:1.55rem; font-weight:800; margin:0; padding:0;
+  letter-spacing:.15px; line-height:1.2;
+}}
+.ir-hero p {{ margin:6px 0 0 0; color:#DCE8F8; font-size:.9rem; line-height:1.35; }}
+.ir-hero .ir-badges {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }}
+.ir-hero .ir-badges span {{
+  display:inline-flex; align-items:center;
+  background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.32);
+  color:#fff; padding:6px 12px; border-radius:999px;
+  font-size:.78rem; font-weight:700; white-space:nowrap;
 }}
 .ir-panel {{
   background:#fff; border:1px solid #DCE6F3; border-radius:16px; padding:18px 20px 8px 20px;
   box-shadow:0 2px 10px rgba(0,51,102,.06);
 }}
 [data-testid="stRadio"] div[role="radiogroup"] {{
-  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:999px; padding:3px;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label {{
-  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+  margin:0; padding:5px 14px; border-radius:999px; cursor:pointer; transition: all 0.2s ease;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
 [data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
@@ -158,22 +208,52 @@ header[data-testid="stHeader"] {{ background: transparent; }}
 .ir-title {{ color:{BLUE_DARK}; font-weight:700; font-size:1.05rem; margin:0 0 10px 0; }}
 .ir-section {{ color:{BLUE_DARK}; font-weight:800; font-size:1.35rem; margin:26px 0 12px 0; display:flex; align-items:center; gap:10px; }}
 .ir-section:before {{ content:""; width:6px; height:26px; background:{BLUE}; border-radius:3px; display:inline-block; }}
-.stButton > button, .stDownloadButton > button {{ width:100%; border-radius:12px; font-weight:700; padding:.65rem 1rem; }}
+.stButton > button, .stDownloadButton > button {{
+  width:100%; border-radius:12px; font-weight:700; padding:.5rem .7rem; height:40px;
+  font-size:.82rem; transition: all 0.2s ease; white-space:nowrap;
+}}
+div[data-testid="stDownloadButton"] button, .stDownloadButton > button {{
+  white-space: nowrap !important; font-size: 0.82rem !important;
+}}
 .stButton > button[kind="primary"] {{
   background: linear-gradient(105deg, {BLUE_DARK}, {BLUE}); border:none; color:#fff;
   box-shadow:0 6px 16px rgba(21,101,192,.35);
 }}
-.stButton > button[kind="primary"]:hover {{ filter:brightness(1.08); }}
+.stButton > button[kind="primary"]:hover {{ filter:brightness(1.08); transform: translateY(-1px); }}
 .stDownloadButton > button {{ border:2px solid {BLUE}; color:{BLUE}; background:#fff; }}
 .stDownloadButton > button:hover {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
-textarea {{ font-size:.9rem !important; line-height:1.45 !important; }}
-.ir-card {{
-  background:#fff; border:1px solid #DCE6F3; border-radius:16px; padding:16px 18px; height:100%;
-  border-top:5px solid var(--c); box-shadow:0 2px 10px rgba(0,51,102,.06);
+textarea, [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {{
+  font-size:.9rem !important; line-height:1.45 !important; border-radius:14px !important;
+  transition: all 0.2s ease !important;
 }}
-.ir-card .k {{ color:#607D8B; font-size:.78rem; text-transform:uppercase; letter-spacing:.6px; font-weight:700; }}
-.ir-card .v {{ color:{BLUE_DARK}; font-size:2.05rem; font-weight:800; line-height:1.15; margin:4px 0; }}
-.ir-card .s {{ color:#455A64; font-size:.86rem; }}
+.ir-card {{
+  background: linear-gradient(180deg, #FFFFFF 0%, #F7FAFD 100%);
+  border: 1px solid #E2E8F0; border-radius:18px; padding:16px 18px; height:100%;
+  border-top:5px solid var(--c); box-shadow:0 4px 16px rgba(0, 51, 102, 0.05);
+}}
+.ir-card .k {{
+  color:#64748B; font-size:.75rem; text-transform:uppercase; letter-spacing:.7px; font-weight:700;
+  display:flex; align-items:center; gap:8px;
+}}
+.ir-card .v {{
+  color:{BLUE_DARK}; font-size:2.05rem; font-weight:800; letter-spacing:-0.03em;
+  line-height:1.1; margin:6px 0 4px 0; font-variant-numeric: tabular-nums;
+}}
+.ir-card .s {{ color:#475569; font-size:.86rem; }}
+.ir-dot {{
+  width:8px; height:8px; border-radius:50%; background:var(--c); flex-shrink:0;
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent);
+}}
+.ir-card.tone-ok .ir-dot {{
+  background:{OK}; animation: ir-pulse 1.8s ease-out infinite;
+}}
+.ir-card.tone-warn .ir-dot {{ background:{WARN}; box-shadow:0 0 0 3px rgba(245,127,23,.22); }}
+.ir-card.tone-alert .ir-dot {{ background:{BAD}; box-shadow:0 0 0 3px rgba(198,40,40,.18); }}
+@keyframes ir-pulse {{
+  0% {{ box-shadow: 0 0 0 0 rgba(46,125,50,.45); }}
+  70% {{ box-shadow: 0 0 0 8px rgba(46,125,50,0); }}
+  100% {{ box-shadow: 0 0 0 0 rgba(46,125,50,0); }}
+}}
 .pill {{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:.74rem; font-weight:700; color:#fff; background:var(--c); margin-top:8px; }}
 .bar-row {{ display:grid; grid-template-columns: minmax(72px, 30%) minmax(48px, 1fr) auto; align-items:center; gap:8px 10px; margin:9px 0; font-size:.88rem; color:#37474F; }}
 .bar-row .n {{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
@@ -196,10 +276,10 @@ table.loops {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 table.loops th {{ text-align:left; color:#607D8B; font-weight:700; border-bottom:2px solid #DCE6F3; padding:6px 8px; }}
 table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#263238; }}
 [data-testid="stRadio"] div[role="radiogroup"] {{
-  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:999px; padding:3px;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label {{
-  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+  margin:0; padding:5px 14px; border-radius:999px; cursor:pointer; transition: all 0.2s ease;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
 [data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
@@ -248,6 +328,46 @@ table.raci td.cell {{ text-align:center; white-space:nowrap; }}
 @media (max-width: 900px) {{ .insp-grid {{ grid-template-columns:1fr; }} .tobe-grid {{ grid-template-columns:1fr; }} }}
 section[data-testid="stSidebar"] {{ background:#F7FBFF; }}
 section[data-testid="stSidebar"] .stMarkdown p {{ font-size:.92rem; }}
+.stTabs [data-baseweb="tab-list"],
+div[data-testid="stTabs"] [data-baseweb="tab-list"],
+div[data-testid="stTabs"] [role="tablist"] {{
+  gap: 4px !important; background: #E8EEF7 !important; border-radius: 999px !important;
+  padding: 4px !important; border: 1px solid #D3DFF0; width: fit-content; max-width: 100%;
+}}
+.stTabs [data-baseweb="tab"],
+div[data-testid="stTabs"] button[data-baseweb="tab"],
+div[data-testid="stTab"],
+div[data-testid="stTabs"] [role="tab"] {{
+  height: auto !important; border-radius: 999px !important; padding: 8px 16px !important;
+  background: transparent !important; color: {BLUE_DARK} !important; font-weight: 650 !important;
+  border: 0 !important; letter-spacing: .01em;
+}}
+.stTabs [aria-selected="true"],
+div[data-testid="stTabs"] button[aria-selected="true"],
+div[data-testid="stTab"][aria-selected="true"] {{
+  background: {BLUE_DARK} !important; color: #fff !important;
+  box-shadow: 0 4px 12px rgba(0, 51, 102, .22) !important;
+}}
+div[data-testid="stTab"] p, div[data-testid="stTab"] span,
+div[data-testid="stTabs"] [role="tab"] p {{
+  color: inherit !important;
+}}
+.stTabs [data-baseweb="tab-highlight"],
+.stTabs [data-baseweb="tab-border"],
+div[data-testid="stTabs"] [data-baseweb="tab-highlight"],
+div[data-testid="stTabs"] [data-baseweb="tab-border"],
+div[data-testid="stTabs"] .react-aria-SelectionIndicator {{
+  display: none !important; background: transparent !important; height: 0 !important;
+  visibility: hidden !important;
+}}
+.stTabs [data-baseweb="tab"]:focus, .stTabs [data-baseweb="tab"]:focus-visible,
+div[data-testid="stTab"]:focus {{
+  outline: none !important; box-shadow: none !important;
+}}
+.stTabs [aria-selected="true"]:focus, .stTabs [aria-selected="true"]:focus-visible,
+div[data-testid="stTab"][aria-selected="true"]:focus {{
+  box-shadow: 0 4px 12px rgba(0, 51, 102, .22) !important;
+}}
 </style>
 """
 
@@ -287,52 +407,122 @@ def viewer_html(
     height: int,
     catalog: Optional[Dict[str, Any]] = None,
     copilot: Optional[Dict[str, Any]] = None,
+    xml_tobe: str = "",
+    catalog_tobe: Optional[Dict[str, Any]] = None,
+    canvas_tobe: bool = False,
 ) -> str:
     js_tag, css_tag = _bpmn_js_tags()
-    payload = json.dumps(xml).replace("</", "<\\/")
-    catalog_js = json.dumps(catalog or {}, ensure_ascii=False).replace("</", "<\\/")
+    payload_asis = json.dumps(xml or "").replace("</", "<\\/")
+    payload_tobe = json.dumps(xml_tobe or "").replace("</", "<\\/")
+    catalog_asis_js = json.dumps(catalog or {}, ensure_ascii=False).replace("</", "<\\/")
+    catalog_tobe_js = json.dumps(catalog_tobe or {}, ensure_ascii=False).replace("</", "<\\/")
     copilot_js = json.dumps(copilot or {}, ensure_ascii=False).replace("</", "<\\/")
+    asis_on = " on" if not canvas_tobe else ""
+    tobe_on = " on" if canvas_tobe else ""
+    tobe_disabled = "" if xml_tobe else " disabled"
+    tobe_title = "Целевой оптимизированный" if xml_tobe else "To-Be ещё не готов"
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
-  html,body {{ margin:0; height:100%; font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#fff; }}
-  #wrap {{ position:relative; height:{height}px; border:1px solid #DCE6F3; border-radius:14px; overflow:hidden; background:
-      linear-gradient(#F4F8FD 1px, transparent 1px) 0 0/24px 24px, linear-gradient(90deg,#F4F8FD 1px, transparent 1px) 0 0/24px 24px, #fff; }}
+  html,body {{ margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
+  #wrap {{ position:relative; height:{height}px; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
+      background-color:#fff;
+      background-image: radial-gradient(circle, #D0DCEB 1.5px, transparent 1.5px);
+      background-size: 24px 24px; }}
   #canvas {{ position:absolute; inset:0; cursor:grab; }}
   #canvas:active {{ cursor:grabbing; }}
-  .bar {{ position:absolute; top:10px; right:10px; z-index:5; display:flex; gap:6px; }}
-  .bar button {{ border:1px solid #90CAF9; background:#fff; color:#003366; font-weight:700; border-radius:10px;
-      padding:6px 12px; cursor:pointer; box-shadow:0 2px 6px rgba(0,51,102,.12); font-size:13px; }}
-  .bar button:hover {{ background:#E3F2FD; }}
-  .hint {{ position:absolute; left:12px; bottom:10px; z-index:5; font-size:12px; color:#455A64; background:rgba(255,255,255,.92);
-      border:1px solid #DCE6F3; border-radius:8px; padding:4px 10px; }}
+  .bar {{
+    position:absolute; top:12px; right:12px; z-index:5; display:flex; gap:4px; align-items:center;
+    flex-wrap:wrap; justify-content:flex-end; max-width:calc(100% - 24px);
+    padding:5px 6px 5px 8px;
+    background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-radius: 999px; border: 1px solid rgba(0, 51, 102, 0.12);
+    box-shadow: 0 8px 24px rgba(0, 51, 102, 0.08);
+  }}
+  .bar button {{
+    border:0; background:transparent; color:#003366; font-weight:650; border-radius:999px;
+    padding:7px 12px; cursor:pointer; font-size:13px; letter-spacing:.01em;
+    box-shadow:none; transition: all 0.2s ease;
+  }}
+  .bar button:hover {{ background:rgba(0,51,102,.08); }}
+  .bar button:active {{ transform:scale(0.96); background:rgba(0,51,102,.12); }}
+  .bar .cv-switch {{
+    display:flex; background:rgba(232,238,247,.92); border-radius:999px; padding:2px; margin-right:2px;
+  }}
+  .bar .cv-switch button {{ padding:6px 11px; font-size:12px; font-weight:700; }}
+  .bar .cv-switch button.on {{ background:#003366; color:#fff; }}
+  .bar .cv-switch button.on:hover {{ background:#003366; color:#fff; }}
+  .bar .cv-switch button:disabled {{ opacity:.4; cursor:not-allowed; }}
+  .bar #canvas-search {{
+    width:168px; max-width:28vw; border:0; background:transparent; color:#003366;
+    border-radius:999px; padding:7px 10px; font-size:12.5px; outline:none; box-shadow:none;
+    font-family:inherit; transition: all 0.2s ease;
+  }}
+  .bar #canvas-search:focus {{ background:transparent; box-shadow:none; }}
+  .bar .search-box {{
+    display:flex; align-items:center; gap:0;
+    background:rgba(232,238,247,.72); border-radius:999px; padding-right:4px;
+    flex:0 1 auto; min-width:0;
+  }}
+  .bar .search-box:focus-within {{ background:#fff; box-shadow:0 0 0 3px rgba(21,101,192,.18); }}
+  .bar #search-count {{
+    display:none; font-size:11px; font-weight:700; color:#546E7A; padding:0 6px; white-space:nowrap;
+  }}
+  .bar #search-prev, .bar #search-next {{
+    display:none; padding:3px 7px; font-size:11px; line-height:1; min-width:22px;
+  }}
+  .djs-element.ir-match-all .djs-visual > :nth-child(1) {{
+    stroke: #90CAF9 !important; stroke-width: 2px !important;
+  }}
+  .hint {{ position:absolute; left:12px; bottom:10px; z-index:5; font-size:12px; color:#455A64;
+      background:rgba(255,255,255,.85); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+      border:1px solid rgba(0,51,102,.10); border-radius:999px; padding:5px 12px;
+      box-shadow:0 4px 16px rgba(0,51,102,.06); }}
   #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828; padding:24px; text-align:center; font-weight:600; }}
   .bjs-powered-by {{ opacity:.55; }}
   .djs-element.ir-selected .djs-visual > :nth-child(1) {{
-    stroke:#0D47A1 !important; stroke-width:4px !important;
-    filter:drop-shadow(0 0 7px rgba(13,71,161,.55));
+    stroke:#1565C0 !important; stroke-width:3px !important;
+    filter:drop-shadow(0 0 6px rgba(21,101,192,.35));
+  }}
+  .djs-element.ir-spotlight .djs-visual > :nth-child(1) {{
+    stroke: #FF6D00 !important; stroke-width: 5px !important;
+    filter: drop-shadow(0 0 12px #FF6D00) !important;
+    animation: ir-spot 1.15s ease-in-out infinite;
+  }}
+  @keyframes ir-spot {{
+    0%, 100% {{ filter: drop-shadow(0 0 8px #FF6D00); }}
+    50% {{ filter: drop-shadow(0 0 16px #FF6D00); }}
   }}
   #tip {{
     display:none; position:absolute; z-index:20; width:340px; max-width:calc(100% - 24px);
-    background:#fff; border:1px solid #90CAF9; border-left:6px solid #1565C0;
-    border-radius:14px; box-shadow:0 12px 32px rgba(0,51,102,.22); padding:12px 14px 14px 14px;
+    background:rgba(255,255,255,.94); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    border:1px solid rgba(0,51,102,.12); border-left:6px solid #1565C0;
+    border-radius:16px; box-shadow:0 12px 32px rgba(0,51,102,.16); padding:12px 14px 14px 14px;
     font-size:13px; color:#263238; line-height:1.4;
   }}
   #tip .x {{ position:absolute; top:8px; right:8px; border:0; background:#E3F2FD; color:#003366;
-      width:28px; height:28px; border-radius:8px; font-weight:800; cursor:pointer; }}
+      width:28px; height:28px; border-radius:999px; font-weight:800; cursor:pointer; transition: all 0.2s ease; }}
   #tip .x:hover {{ background:#1565C0; color:#fff; }}
   #tip .kind {{ color:#1565C0; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.4px; padding-right:28px; }}
-  #tip .name {{ color:#003366; font-weight:800; font-size:15px; margin:4px 0 8px 0; }}
+  #tip .name {{ color:#003366; font-weight:800; font-size:15px; margin:4px 0 8px 0; letter-spacing:-.02em; }}
   #tip .meta {{ color:#455A64; margin:3px 0; }}
   #tip .crit {{ display:none; margin:8px 0; background:#FFF3E0; color:#E65100; border-radius:8px; padding:5px 8px; font-weight:700; font-size:12px; }}
   #tip .ai {{ margin-top:8px; background:#E8F1FB; border-radius:10px; padding:8px 10px; color:#0D47A1; }}
-  #close {{ display:none; position:absolute; top:16px; right:16px; z-index:9; border:1px solid rgba(255,255,255,.55);
-      background:rgba(0,51,102,.55); color:#fff; font-weight:700; font-size:14px; border-radius:12px; padding:9px 16px;
-      cursor:pointer; backdrop-filter:blur(4px); opacity:.72; transition:opacity .15s, background .15s; }}
-  #close:hover {{ opacity:1; background:rgba(0,51,102,.9); }}
+  #close {{
+    display:none; position:absolute; top:16px; right:16px; z-index:1000004;
+    border:1px solid rgba(255,255,255,.35); background:rgba(0,51,102,.62); color:#fff;
+    font-weight:700; font-size:13px; letter-spacing:.02em; border-radius:999px; padding:10px 18px;
+    cursor:pointer; backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    box-shadow:0 8px 24px rgba(0,51,102,.22); opacity:.92; transition: all 0.2s ease;
+  }}
+  #close:hover {{ opacity:1; background:rgba(0,51,102,.82); transform:translateY(-1px); }}
+  #close:active {{ transform:scale(0.96); opacity:1; }}
   #wrap.pano {{ position:fixed; top:0; left:0; width:100vw; height:100vh !important; border:0; border-radius:0; z-index:999999; }}
-  #wrap.pano .bar {{ display:none; }}
-  #wrap.pano #close {{ display:block; }}
+  #wrap.pano .bar {{
+    display: flex !important; position: absolute; top: 16px; left: 16px; right: auto;
+    z-index: 1000003; max-width: calc(100vw - 200px); flex-wrap: wrap;
+  }}
+  #wrap.pano #close {{ display:block; top:16px; right:16px; z-index:1000004; }}
   #wrap.pano .hint {{ opacity:.75; left:12px; right:auto; max-width:calc(100% - 100px); }}
   #ai-fab {{
     position:absolute; bottom:24px; right:24px; z-index:1000001;
@@ -340,7 +530,7 @@ def viewer_html(
     background:linear-gradient(135deg,#003366,#1565C0); color:#fff; font-size:22px;
     cursor:pointer; box-shadow:0 8px 22px rgba(0,51,102,.38);
     display:flex; align-items:center; justify-content:center;
-    transition:transform .15s, box-shadow .15s;
+    transition: all 0.2s ease;
   }}
   #ai-fab:hover {{ transform:scale(1.07); box-shadow:0 10px 28px rgba(21,101,192,.45); }}
   #ai-fab span {{ font-size:11px; font-weight:800; display:none; }}
@@ -384,6 +574,16 @@ def viewer_html(
 <body>
 <div id="wrap">
   <div class="bar">
+    <div class="cv-switch" role="group" aria-label="Схема">
+      <button type="button" id="cv-asis" class="{asis_on.strip()}" title="Текущий процесс">As-Is</button>
+      <button type="button" id="cv-tobe" class="{tobe_on.strip()}" title="{tobe_title}"{tobe_disabled}>To-Be</button>
+    </div>
+    <div class="search-box" id="search-box">
+      <input id="canvas-search" placeholder="🔍 Найти узел или роль..." autocomplete="off">
+      <span id="search-count" style="display:none; font-size:11px; font-weight:700; color:#546E7A; padding:0 6px;"></span>
+      <button id="search-prev" type="button" title="Предыдущее совпадение (Shift+Enter)" style="display:none; padding:3px 7px;">▲</button>
+      <button id="search-next" type="button" title="Следующее совпадение (Enter)" style="display:none; padding:3px 7px;">▼</button>
+    </div>
     <button id="zin" title="Приблизить">＋</button><button id="zout" title="Отдалить">－</button>
     <button id="fit" title="Вписать в окно">По размеру</button><button id="one" title="Масштаб 100%">100%</button>
     <button id="full" title="Панорама на весь экран (выход — Esc)">⛶ Панорама на весь экран</button>
@@ -412,9 +612,13 @@ def viewer_html(
 </div>
 {js_tag}
 <script>
-  const XML = {payload};
-  const CATALOG = {catalog_js};
+  const XML_ASIS = {payload_asis};
+  const XML_TOBE = {payload_tobe};
+  const CATALOG_ASIS = {catalog_asis_js};
+  const CATALOG_TOBE = {catalog_tobe_js};
   const COPILOT = {copilot_js};
+  let CATALOG = CATALOG_ASIS;
+  let activeMode = 'asis';
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
   const wrap = document.getElementById('wrap');
@@ -425,10 +629,24 @@ def viewer_html(
   hint.textContent = HINT_NORMAL;
 
   function fit() {{ try {{ canvas().zoom('fit-viewport', 'auto'); }} catch (e) {{}} }}
-  function fitSoon() {{ fit(); requestAnimationFrame(fit); setTimeout(fit, 120); setTimeout(fit, 350); }}
+  function focusStart() {{
+    try {{
+      const registry = viewer.get('elementRegistry');
+      const starts = registry.filter(el => el.type === 'bpmn:StartEvent');
+      const start = starts.find(el => !(el.parent && /SubProcess/i.test((el.parent.type || '')))) || starts[0];
+      if (start && canvas().scrollToElement) canvas().scrollToElement(start);
+    }} catch (e) {{}}
+  }}
+  function fitSoon() {{
+    fit();
+    requestAnimationFrame(fit);
+    setTimeout(fit, 120);
+    setTimeout(focusStart, 380);
+  }}
   {EMPHASIZE_JS}
 
   let selectedId = null;
+  let spotlightId = null;
   const IGNORE = /bpmn:(Process|Participant|Lane|Collaboration|Group|TextAnnotation|Association|SequenceFlow|DataObject|DataStoreReference|label)/i;
   function resolveEl(el) {{
     if (!el) return null;
@@ -437,7 +655,9 @@ def viewer_html(
   }}
   function clearPick() {{
     if (selectedId) {{ try {{ canvas().removeMarker(selectedId, 'ir-selected'); }} catch (e) {{}} }}
+    if (spotlightId) {{ try {{ canvas().removeMarker(spotlightId, 'ir-spotlight'); }} catch (e) {{}} }}
     selectedId = null;
+    spotlightId = null;
     tip.style.display = 'none';
   }}
   function placeTip(evt) {{
@@ -467,17 +687,201 @@ def viewer_html(
     tip.style.display = 'block';
     placeTip(evt);
   }}
-  viewer.importXML(XML).then(() => {{
-    emphasizeSubprocessTitles();
-    fit();
-    viewer.get('eventBus').on('element.click', function(e) {{
-      const el = resolveEl(e.element);
+  let searchMatches = [];
+  let searchIndex = 0;
+  let matchAllIds = [];
+  const searchCountEl = document.getElementById('search-count');
+  const searchPrevBtn = document.getElementById('search-prev');
+  const searchNextBtn = document.getElementById('search-next');
+  function searchables() {{
+    const registry = viewer.get('elementRegistry');
+    return registry.filter(el => {{
       const t = (el && el.type) || '';
-      if (!el || IGNORE.test(t) || t === 'label') {{ clearPick(); return; }}
-      if (!/Task|Gateway|Event|SubProcess/i.test(t)) {{ clearPick(); return; }}
-      showPick(el, e.originalEvent);
+      if (!el || IGNORE.test(t) || t === 'label') return false;
+      return /Task|Gateway|Event|SubProcess/i.test(t);
+    }}).map(el => {{
+      const bo = el.businessObject || {{}};
+      const meta = CATALOG[el.id] || {{}};
+      const lane = (el.parent && /Lane/i.test(el.parent.type || '') && el.parent.businessObject)
+        ? (el.parent.businessObject.name || '') : '';
+      return {{
+        el,
+        name: String(meta.name || bo.name || '').toLowerCase(),
+        role: String(meta.role || lane || '').toLowerCase(),
+      }};
     }});
-  }}).catch(e => {{
+  }}
+  function clearMatchAll() {{
+    matchAllIds.forEach(id => {{
+      try {{ canvas().removeMarker(id, 'ir-match-all'); }} catch (e) {{}}
+    }});
+    matchAllIds = [];
+  }}
+  function resetSearchUi(hideChrome) {{
+    searchMatches = [];
+    searchIndex = 0;
+    clearMatchAll();
+    clearPick();
+    if (searchCountEl) {{
+      searchCountEl.textContent = '';
+      searchCountEl.style.display = hideChrome ? 'none' : 'inline';
+      if (!hideChrome) searchCountEl.textContent = '0 из 0';
+    }}
+    if (searchPrevBtn) searchPrevBtn.style.display = 'none';
+    if (searchNextBtn) searchNextBtn.style.display = 'none';
+  }}
+  function updateSearchChrome() {{
+    if (!searchCountEl) return;
+    if (!searchMatches.length) {{
+      searchCountEl.textContent = '0 из 0';
+      searchCountEl.style.display = 'inline';
+      if (searchPrevBtn) searchPrevBtn.style.display = 'none';
+      if (searchNextBtn) searchNextBtn.style.display = 'none';
+      return;
+    }}
+    searchCountEl.textContent = (searchIndex + 1) + ' из ' + searchMatches.length;
+    searchCountEl.style.display = 'inline';
+    if (searchPrevBtn) searchPrevBtn.style.display = 'inline-block';
+    if (searchNextBtn) searchNextBtn.style.display = 'inline-block';
+  }}
+  function centerOn(el) {{
+    if (!el) return;
+    const c = canvas();
+    try {{
+      if (typeof c.zoom === 'function' && c.zoom() < 0.95) c.zoom(0.95);
+    }} catch (err) {{}}
+    try {{
+      const bbox = el;
+      const midX = bbox.x + (bbox.width || 0) / 2;
+      const midY = bbox.y + (bbox.height || 0) / 2;
+      const vb = c.viewbox();
+      c.viewbox({{
+        x: midX - vb.width / 2,
+        y: midY - vb.height / 2,
+        width: vb.width,
+        height: vb.height,
+      }});
+    }} catch (err) {{
+      try {{ if (c.scrollToElement) c.scrollToElement(el); }} catch (e2) {{}}
+    }}
+  }}
+  function focusMatch() {{
+    if (!searchMatches.length) return;
+    searchIndex = ((searchIndex % searchMatches.length) + searchMatches.length) % searchMatches.length;
+    const item = searchMatches[searchIndex];
+    centerOn(item.el);
+    let evt = {{ clientX: Math.round(wrap.clientWidth * 0.55), clientY: Math.round(wrap.clientHeight * 0.28) }};
+    try {{
+      const gfx = viewer.get('elementRegistry').getGraphics(item.el);
+      if (gfx && gfx.getBoundingClientRect) {{
+        const r = gfx.getBoundingClientRect();
+        evt = {{ clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }};
+      }}
+    }} catch (err) {{}}
+    showPick(item.el, evt);
+    try {{
+      canvas().addMarker(item.el.id, 'ir-spotlight');
+      spotlightId = item.el.id;
+    }} catch (err) {{}}
+    updateSearchChrome();
+  }}
+  function goSearch(delta) {{
+    if (!searchMatches.length) return;
+    searchIndex = (searchIndex + delta + searchMatches.length) % searchMatches.length;
+    focusMatch();
+  }}
+  function runCanvasSearch(query) {{
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) {{
+      resetSearchUi(true);
+      return;
+    }}
+    searchMatches = searchables().filter(it => it.name.indexOf(q) !== -1 || it.role.indexOf(q) !== -1);
+    searchIndex = 0;
+    clearMatchAll();
+    if (!searchMatches.length) {{
+      clearPick();
+      updateSearchChrome();
+      return;
+    }}
+    searchMatches.forEach(it => {{
+      try {{
+        canvas().addMarker(it.el.id, 'ir-match-all');
+        matchAllIds.push(it.el.id);
+      }} catch (err) {{}}
+    }});
+    focusMatch();
+  }}
+  function resetSearch() {{
+    if (searchBox) searchBox.value = '';
+    resetSearchUi(true);
+  }}
+  const searchBox = document.getElementById('canvas-search');
+  const searchCluster = document.getElementById('search-box');
+  if (searchCluster) {{
+    searchCluster.addEventListener('mousedown', ev => ev.stopPropagation());
+    searchCluster.addEventListener('click', ev => ev.stopPropagation());
+  }}
+  if (searchBox) {{
+    searchBox.addEventListener('mousedown', ev => ev.stopPropagation());
+    searchBox.addEventListener('input', () => runCanvasSearch(searchBox.value));
+    searchBox.addEventListener('keydown', ev => {{
+      if (ev.key === 'Enter') {{
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!searchMatches.length) runCanvasSearch(searchBox.value);
+        else goSearch(ev.shiftKey ? -1 : 1);
+      }}
+      if (ev.key === 'Escape') {{
+        ev.preventDefault();
+        ev.stopPropagation();
+        resetSearch();
+        searchBox.blur();
+      }}
+    }});
+  }}
+  if (searchPrevBtn) searchPrevBtn.addEventListener('click', ev => {{ ev.preventDefault(); ev.stopPropagation(); goSearch(-1); }});
+  if (searchNextBtn) searchNextBtn.addEventListener('click', ev => {{ ev.preventDefault(); ev.stopPropagation(); goSearch(1); }});
+  function applyXml(xml) {{
+    resetSearch();
+    const errEl = document.getElementById('err');
+    if (errEl) errEl.style.display = 'none';
+    return viewer.importXML(xml).then(() => {{
+      emphasizeSubprocessTitles();
+      fitSoon();
+    }});
+  }}
+  function setCanvasMode(m) {{
+    if (m === activeMode) return;
+    if (m === 'tobe' && !XML_TOBE) return;
+    activeMode = m;
+    CATALOG = m === 'tobe' ? CATALOG_TOBE : CATALOG_ASIS;
+    if (bAsis) bAsis.classList.toggle('on', m === 'asis');
+    if (bTobe) bTobe.classList.toggle('on', m === 'tobe');
+    applyXml(m === 'tobe' ? XML_TOBE : XML_ASIS).catch(e => {{
+      const el = document.getElementById('err');
+      el.style.display = 'flex';
+      el.textContent = 'Ошибка отображения BPMN: ' + e.message;
+    }});
+  }}
+  const bAsis = document.getElementById('cv-asis');
+  const bTobe = document.getElementById('cv-tobe');
+  if (bAsis) {{
+    bAsis.addEventListener('mousedown', ev => ev.stopPropagation());
+    bAsis.onclick = () => setCanvasMode('asis');
+  }}
+  if (bTobe) {{
+    bTobe.addEventListener('mousedown', ev => ev.stopPropagation());
+    bTobe.onclick = () => setCanvasMode('tobe');
+  }}
+  viewer.get('eventBus').on('element.click', function(e) {{
+    const el = resolveEl(e.element);
+    const t = (el && el.type) || '';
+    if (!el || IGNORE.test(t) || t === 'label') {{ clearPick(); return; }}
+    if (!/Task|Gateway|Event|SubProcess/i.test(t)) {{ clearPick(); return; }}
+    showPick(el, e.originalEvent);
+  }});
+  applyXml(XML_ASIS).catch(e => {{
     const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
   }});
   document.getElementById('tip-x').onclick = ev => {{ ev.stopPropagation(); clearPick(); }};
@@ -546,6 +950,12 @@ def viewer_html(
   document.getElementById('close').onclick = exitPanorama;
   const onKey = e => {{
     if (e.key === 'Escape') {{
+      const box = document.getElementById('canvas-search');
+      if (box && box.value) {{
+        resetSearch();
+        e.stopPropagation();
+        return;
+      }}
       if (wrap.classList.contains('ai-open')) {{ setCopilot(false); e.stopPropagation(); return; }}
       if (tip.style.display === 'block') {{ clearPick(); if (!panoMode) e.stopPropagation(); }}
       if (panoMode) exitPanorama();
@@ -659,10 +1069,10 @@ def svg_export_html(xml: str, file_name: str) -> str:
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
-  html,body {{ margin:0; background:transparent; font-family:"Source Sans Pro",-apple-system,Segoe UI,Roboto,Arial,sans-serif; overflow:hidden; }}
+  html,body {{ margin:0; background:transparent; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; overflow:hidden; }}
   #host {{ position:absolute; left:-12000px; top:0; width:2600px; height:1600px; }}
-  button {{ width:100%; height:44px; box-sizing:border-box; border:2px solid {BLUE}; color:{BLUE}; background:#fff;
-      border-radius:12px; font-weight:700; font-size:15px; cursor:pointer; transition:background .15s; }}
+  button {{ width:100%; height:40px; box-sizing:border-box; border:2px solid {BLUE}; color:{BLUE}; background:#fff;
+      border-radius:12px; font-weight:700; font-size:0.82rem; white-space:nowrap; cursor:pointer; transition: all 0.2s ease; }}
   button:hover:not(:disabled) {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
   button:disabled {{ opacity:.55; cursor:progress; }}
 </style></head>
@@ -678,7 +1088,7 @@ def svg_export_html(xml: str, file_name: str) -> str:
   {EMPHASIZE_JS}
   viewer.importXML(XML).then(() => {{
     emphasizeSubprocessTitles();
-    btn.disabled = false; btn.textContent = '⬇️  Скачать .svg';
+    btn.disabled = false; btn.textContent = '⬇️ SVG вектор';
   }}).catch(e => {{ btn.textContent = 'SVG недоступен'; btn.title = e.message; }});
   btn.onclick = async () => {{
     try {{
@@ -697,8 +1107,17 @@ def svg_export_html(xml: str, file_name: str) -> str:
 # Аудит: визуальные блоки
 # --------------------------------------------------------------------------- #
 def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
+    if color == OK:
+        tone = "tone-ok"
+    elif color == BAD:
+        tone = "tone-alert"
+    elif color == WARN:
+        tone = "tone-warn"
+    else:
+        tone = "tone-ok"
     return (
-        f'<div class="ir-card" style="--c:{color}"><div class="k">{esc(title)}</div>'
+        f'<div class="ir-card {tone}" style="--c:{color}">'
+        f'<div class="k"><span class="ir-dot" aria-hidden="true"></span>{esc(title)}</div>'
         f'<div class="v">{esc(value)}</div><div class="s">{sub}</div>'
         f'<span class="pill">{esc(pill)}</span></div>'
     )
@@ -745,10 +1164,34 @@ def lane_load_html(
     return "".join(rows) or '<div class="land-empty">Нет данных о нагрузке ролей.</div>'
 
 
+_PATH_KEEP_KINDS = {
+    "userTask", "scriptTask", "task", "manualTask", "serviceTask",
+    "sendTask", "receiveTask", "businessRuleTask", "subProcess",
+}
+
+
+def _path_tasks_only(critical_path: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Шлюзы и события с нулевой длительностью не показываем в цепочке КП."""
+    out: List[Dict[str, Any]] = []
+    for item in critical_path or []:
+        kind = str(item.get("kind") or "")
+        if "Gateway" in kind or kind.endswith("Event") or kind in {
+            "exclusiveGateway", "parallelGateway", "inclusiveGateway",
+            "startEvent", "endEvent", "intermediateCatchEvent", "intermediateThrowEvent",
+        }:
+            continue
+        hours = float(item.get("hours") or 0)
+        if kind not in _PATH_KEEP_KINDS and hours < 0.05:
+            continue
+        out.append(item)
+    return out
+
+
 def critical_path_html(critical_path: Optional[List[Dict[str, Any]]]) -> str:
-    """Цепочка чипов критического пути: часы шага и стрелки Беллмана — Форда."""
+    """Цепочка чипов критического пути: только задачи и подпроцессы, без шлюзов/событий с нулевым временем."""
     chips: List[str] = []
-    for i, item in enumerate(critical_path or []):
+    visible = _path_tasks_only(critical_path)
+    for i, item in enumerate(visible):
         arrow = '<span class="arrow">→</span>' if i else ""
         name = str(item.get("name") or "")
         name = name if len(name) <= 42 else name[:41] + "…"
@@ -821,6 +1264,24 @@ def render_landscape(audit: Dict[str, Any]) -> None:
     )
 
 
+_METH_TITLE_RU = {
+    "naming": "Стандарт названий задач (Глагол + Объект)",
+    "gateway": "Корректность развилок и условий",
+    "subway": "Индекс декомпозиции (Анти-метро)",
+    "topology": "Топологическая связность графа",
+    "Naming compliance": "Стандарт названий задач (Глагол + Объект)",
+    "Gateway semantics": "Корректность развилок и условий",
+    "Anti-Subway Index": "Индекс декомпозиции (Анти-метро)",
+    "Topology check": "Топологическая связность графа",
+}
+
+
+def _meth_title(chk: Dict[str, Any]) -> str:
+    key = str(chk.get("key") or "")
+    title = str(chk.get("title") or "")
+    return _METH_TITLE_RU.get(key) or _METH_TITLE_RU.get(title) or title
+
+
 def render_methodology(audit: Dict[str, Any]) -> None:
     """Блок «Методологический контроль BPMN 2.0» — бейджи проверок и балл качества."""
     meth = audit.get("methodology") if isinstance(audit.get("methodology"), dict) else {}
@@ -841,14 +1302,15 @@ def render_methodology(audit: Dict[str, Any]) -> None:
         mark = "✓" if passed else "✗"
         findings = chk.get("findings") or []
         extra = f"<br>{esc(findings[0])}" if findings and not passed else ""
+        title = _meth_title(chk)
         badges.append(
-            f'<div class="meth-badge" style="--c:{c}"><div class="h">{mark} {esc(chk.get("title"))}</div>'
+            f'<div class="meth-badge" style="--c:{c}"><div class="h">{mark} {esc(title)}</div>'
             f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
         )
     st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
     with st.expander("Детали проверок нотации"):
         for chk in meth.get("checks") or []:
-            st.markdown(f"**{chk.get('title')}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
+            st.markdown(f"**{_meth_title(chk)}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
             for fnd in chk.get("findings") or []:
                 st.markdown(f"- {fnd}")
 
@@ -921,15 +1383,15 @@ def render_audit(audit: Dict[str, Any]) -> None:
     sla_sub = f"{stats['critical_path_layers']} слоёв согласования"
     if target:
         sla_sub += f" · цель {fmt_hours(float(target)) if float(target) < 48 else fmt_days(float(target))}"
-    sla_sub += f"<br>с худшим возвратом: {fmt_hours(total_h) if total_h < 48 else fmt_days(total_h)}"
+    rework_value = fmt_hours(total_h) if total_h < 48 else fmt_days(total_h)
+    rework_sub = (
+        "возвратов в модели нет — срок совпадает с базовым КП"
+        if not loops
+        else f"циклов: {len(loops)} · худший: +{fmt_hours(float(sla['rework_hours']))} к КП"
+    )
 
     loop_color = OK if not loops else (BAD if len(loops) >= 3 else WARN)
     loop_pill = "Возвратов нет" if not loops else f"Доля в сроке: {float(sla['rework_share']):.0%}"
-    loop_sub = (
-        "Циклов доработки в модели"
-        if not loops
-        else f"худший: +{fmt_hours(float(sla['rework_hours']))} к критическому пути"
-    )
 
     c1, c2, c3, c4 = st.columns(4, gap="medium")
     c1.markdown(
@@ -942,8 +1404,14 @@ def render_audit(audit: Dict[str, Any]) -> None:
         ),
         unsafe_allow_html=True,
     )
-    c2.markdown(card("Критический путь SLA", sla_value, sla_sub, sla_color, sla_pill), unsafe_allow_html=True)
-    c3.markdown(card("Циклы возврата", str(len(loops)), loop_sub, loop_color, loop_pill), unsafe_allow_html=True)
+    c2.markdown(
+        card("Критический путь (базовый, без возвратов)", sla_value, sla_sub, sla_color, sla_pill),
+        unsafe_allow_html=True,
+    )
+    c3.markdown(
+        card("Срок с худшим возвратом (rework)", rework_value, rework_sub, loop_color, loop_pill),
+        unsafe_allow_html=True,
+    )
     c4.markdown(
         card(
             "Структура процесса",
@@ -1014,24 +1482,21 @@ def render_details(audit: Dict[str, Any]) -> None:
 # Приложение
 # --------------------------------------------------------------------------- #
 def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None:
+    key = _reg_hash(text, bool(use_llm))
+    mem = st.session_state.get("_gen_mem")
+    if isinstance(mem, dict) and mem.get("key") == key and mem.get("result"):
+        st.session_state["result"] = mem["result"]
+        return
     progress = st.progress(0, text="Запуск конвейера…") if show_progress else None
-    stages = [(18, "Семантический разбор регламента: роли, условия, параллельность…")]
-    for pct, label in stages:
-        if progress:
-            progress.progress(pct, text=label)
-            time.sleep(0.25)
     if progress:
-        progress.progress(
-            45, text="Генерация кода DIAGRAM (LLM или встроенный эмулятор)… Локальной модели может потребоваться до 5 минут."
-        )
-    xml, audit, error = generate_bpmn_from_text(text, use_llm=use_llm)
+        progress.progress(45, text="Генерация BPMN 2.0 (кэш по sha256 регламента)…")
+    xml, audit, error = cached_generate_bpmn(key, text, bool(use_llm))
     if progress:
-        progress.progress(78, text="Раскладка по слоям, ортогональные стрелки, BPMN in Color…")
-        time.sleep(0.25)
-        progress.progress(100, text="Аудит узких мест и валидация XML завершены")
-        time.sleep(0.2)
+        progress.progress(100, text="Аудит узких мест готов")
         progress.empty()
-    st.session_state["result"] = {"xml": xml, "audit": audit, "error": error}
+    result = {"xml": xml, "audit": audit, "error": error}
+    st.session_state["result"] = result
+    st.session_state["_gen_mem"] = {"key": key, "result": result}
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
@@ -1045,7 +1510,10 @@ def on_example_change() -> None:
         st.session_state["file_stem"] = examples[choice]["stem"]
         st.session_state.pop("last_uploaded_filename", None)
         st.session_state.pop("upload_badge", None)
+        st.session_state.pop("_keep_custom_text", None)
     else:
+        if choice == CUSTOM_LABEL and not st.session_state.pop("_keep_custom_text", False):
+            st.session_state["reg_text"] = ""
         stem = Path(st.session_state.get("last_uploaded_filename") or "custom_process").stem
         st.session_state["file_stem"] = re.sub(r"[^\w.\-]+", "_", stem, flags=re.U) or "custom_process"
     st.session_state["chat_messages"] = []
@@ -1147,6 +1615,7 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state["reg_text"] = text
     st.session_state["last_uploaded_filename"] = name
     st.session_state["file_stem"] = stem
+    st.session_state["_keep_custom_text"] = True
     st.session_state["example_choice"] = CUSTOM_LABEL
     st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
@@ -1180,42 +1649,46 @@ def render_downloads(key: str) -> None:
             )
         except Exception:  # noqa: BLE001
             docx_bytes = b""
-    col_bpmn, col_svg, col_pass, col_docx = st.columns(4, gap="small")
-    with col_bpmn:
+
+    slots = st.columns(4, gap="small")
+    with slots[0]:
         st.download_button(
-            "⬇️  Скачать .bpmn",
+            "⬇️ BPMN 2.0",
             data=(result["xml"] if ok else ""),
             file_name=f"{stem}.bpmn",
             mime="application/xml",
             disabled=not ok,
             key=f"dl_bpmn_{key}",
+            use_container_width=True,
         )
-    with col_svg:
+    with slots[1]:
         if ok:
             page = svg_export_html(result["xml"], f"{stem}.svg")
             if hasattr(st, "iframe"):
-                st.iframe(page, height=48)
+                st.iframe(page, height=44)
             else:
-                components.html(page, height=48, scrolling=False)
+                components.html(page, height=44, scrolling=False)
         else:
-            st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}")
-    with col_pass:
+            st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
+    with slots[2]:
         st.download_button(
-            "⬇️  Скачать Паспорт (.md)",
+            "⬇️ Паспорт .md",
             data=passport or "",
             file_name=f"{stem}_passport.md",
             mime="text/markdown",
             disabled=not (ok and bool(passport)),
             key=f"dl_passport_{key}",
+            use_container_width=True,
         )
-    with col_docx:
+    with slots[3]:
         st.download_button(
-            "⬇️  Скачать регламент (.docx)",
+            "⬇️ Регламент .docx",
             data=docx_bytes or b"",
             file_name=f"{stem}_reglament.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             disabled=not (ok and bool(docx_bytes)),
             key=f"dl_docx_{key}",
+            use_container_width=True,
         )
 
 
@@ -1229,13 +1702,24 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
     if cached and cached.get("source_xml") == src:
         return cached
     text = st.session_state.get("reg_text") or ""
+    asis_audit = result.get("audit") or {}
+    asis_core = {
+        "sla": asis_audit.get("sla") or {},
+        "methodology": asis_audit.get("methodology") or {},
+        "rework_loops": asis_audit.get("rework_loops") or [],
+    }
+    tobe_key = _reg_hash(text, "tobe", json.dumps(_audit_cache_slice(asis_audit), ensure_ascii=False, sort_keys=True))
+    mem = st.session_state.get("_tobe_mem")
+    if isinstance(mem, dict) and mem.get("key") == tobe_key and mem.get("pack") and mem["pack"].get("source_xml") == src:
+        st.session_state["tobe_pack"] = mem["pack"]
+        return mem["pack"]
     with st.spinner("Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация…"):
-        opt_text, delta = optimize_process_to_be(text, result.get("audit") or {})
+        opt_text, delta = cached_optimize_to_be(tobe_key, text, asis_core)
     xml = str((delta or {}).get("tobe_xml") or "")
     audit = (delta or {}).get("tobe_audit") or {}
     err = str((delta or {}).get("tobe_error") or "")
     if not xml:
-        xml, audit, err = generate_bpmn_from_text(opt_text, use_llm=False)
+        xml, audit, err = cached_generate_bpmn(_reg_hash(opt_text, False), opt_text, False)
     pack = {
         "source_xml": src,
         "text": opt_text,
@@ -1245,6 +1729,7 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
         "error": err,
     }
     st.session_state["tobe_pack"] = pack
+    st.session_state["_tobe_mem"] = {"key": tobe_key, "pack": pack}
     return pack
 
 
@@ -1264,7 +1749,7 @@ def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
 
 def render_tobe_tab() -> None:
     st.markdown('<div class="ir-section">Оптимизация As-Is → To-Be</div>', unsafe_allow_html=True)
-    st.caption("Переключатель над холстом меняет схему: текущий процесс или целевой To-Be. Карточка — эффект реинжиниринга.")
+    st.caption("Переключатель As-Is / To-Be на холсте меняет схему. Карточка — эффект реинжиниринга.")
     pack = ensure_tobe_pack()
     if not pack:
         st.info("Сначала сгенерируйте диаграмму As-Is.")
@@ -1272,20 +1757,27 @@ def render_tobe_tab() -> None:
     delta = pack.get("delta") or {}
     if pack.get("error") and not pack.get("xml"):
         st.warning(f"Целевую диаграмму построить не удалось: {pack['error']}")
-    saved_h = max(0.0, float(delta.get("sla_saved_hours") or 0))
-    before_h = max(0.0, float(delta.get("sla_before_hours") or 0))
-    after_h = max(0.0, float(delta.get("sla_after_hours") or 0))
-    if after_h > before_h:
-        saved_h = 0.0
-    saved_pct = round(100.0 * saved_h / before_h, 1) if before_h and saved_h > 0 else 0.0
+    saved_h = float(delta.get("sla_saved_hours") or 0)
+    before_h = float(delta.get("sla_before_hours") or 0)
+    after_h = float(delta.get("sla_after_hours") or 0)
+    asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
+    tobe_audit = pack.get("audit") or {}
+    asis_cp = before_h or float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
+    tobe_cp = after_h or float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
+    saved_h = asis_cp - tobe_cp
+    saved_pct = round(100.0 * max(0.0, saved_h) / asis_cp, 1) if asis_cp and saved_h > 0 else 0.0
     removed = int(delta.get("rework_removed") or 0)
     q_gain = int(delta.get("quality_gain") or 0)
+    asis_rw = float(delta.get("with_rework_before") or (asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
+    tobe_rw = float(delta.get("with_rework_after") or (tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
     if saved_h >= 1.0 / 60.0:
         eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
-        eco_sub = f"{fmt_hours(before_h)} → {fmt_hours(after_h)}"
     else:
         eco_value = "Без ускорения"
-        eco_sub = f"{fmt_hours(before_h)} → {fmt_hours(after_h)}" if before_h or after_h else "—"
+    eco_sub = (
+        f"КП без возвратов: {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
+        f"rework: {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
+    )
     st.markdown(
         f'<div class="tobe-grid">'
         f'<div class="tobe-card"><div class="k">Экономия SLA</div>'
@@ -1299,6 +1791,10 @@ def render_tobe_tab() -> None:
         f'<div class="s">{int(delta.get("quality_before") or 0)}% → {int(delta.get("quality_after") or 0)}%</div></div>'
         f"</div>",
         unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
+        f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
     )
     engine = delta.get("engine") or "semantic-optimizer"
     st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
@@ -1328,15 +1824,19 @@ def render_tobe_tab() -> None:
             load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
         elif tobe_bus.get("status") == "ok":
             load_bits.append("нагрузка сбалансирована")
-        asis_path = asis_audit.get("critical_path") or []
-        tobe_path = tobe_audit.get("critical_path") or []
+        asis_path = _path_tasks_only(asis_audit.get("critical_path") or [])
+        tobe_path = _path_tasks_only(tobe_audit.get("critical_path") or [])
         asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
         tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
+        asis_rw = float((asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
+        tobe_rw = float((tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
         shortened = len(tobe_path) < len(asis_path) or tobe_cp + 1e-6 < asis_cp
         path_label = "Цепочка спрямилась" if shortened else "Критический путь"
         path_cap = (
             f"{path_label}: {len(asis_path)} шагов / {fmt_hours(asis_cp)}"
-            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}"
+            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}. "
+            f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)}. "
+            f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}."
         )
         render_load_and_path(
             tobe_audit,
@@ -1436,7 +1936,7 @@ def _raci_tip(letter: str, role: str) -> str:
     return titles.get(letter, letter)
 
 
-def render_input_panel(labels: List[str], compact: bool = False, show_downloads: bool = True) -> None:
+def render_input_panel(labels: List[str], compact: bool = False) -> None:
     """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
     box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
     with box_left:
@@ -1462,7 +1962,7 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
             help="Выберите эталонный кейс или введите свой текст ниже.",
         )
         st.text_area(
-            "Текст регламента (шаги нумеруются; условия — «Если … — перейти к п.N, иначе …»)",
+            "Текст регламента (свободный текст или нумерованный список; развилки — «Если ..., иначе ...»)",
             key="reg_text",
             height=220 if compact else 360,
         )
@@ -1476,6 +1976,7 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
         secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
         st.caption(f"Облачная модель: {cloud_engine_status()}{secrets_note}")
         if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
+            st.session_state["quickstart"] = False
             if not st.session_state["reg_text"].strip():
                 st.warning("Введите текст регламента.")
             else:
@@ -1483,21 +1984,84 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
 
         result = st.session_state.get("result")
         if result and not result["error"]:
-            gen = result["audit"].get("generation", {})
-            engine = gen.get("engine", "—")
-            note = ""
-            if gen.get("fallback") and engine == "semantic-emulator":
-                reasons = gen.get("trace") or ["LLM недоступна"]
-                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
-            elif gen.get("attempts", 1) > 1:
-                note = f" · исправлено со {gen['attempts']}-й попытки"
-            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
-            st.markdown(
-                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
-                unsafe_allow_html=True,
-            )
-        if show_downloads:
-            render_downloads("left")
+            if st.session_state.get("quickstart"):
+                st.markdown(
+                    '<div class="engine">Эталонный процесс подготовлен Groq GPT-OSS 120B · режим быстрого старта</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                gen = result["audit"].get("generation", {})
+                engine = gen.get("engine", "—")
+                note = ""
+                if gen.get("fallback") and engine == "semantic-emulator":
+                    reasons = gen.get("trace") or ["LLM недоступна"]
+                    note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
+                elif gen.get("attempts", 1) > 1:
+                    note = f" · исправлено со {gen['attempts']}-й попытки"
+                xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
+                st.markdown(
+                    f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def _diagram_height(wide: bool) -> int:
+    """Автоподгонка высоты холста по числу дорожек и узлов, чтобы схема не сжималась в точку."""
+    result = st.session_state.get("result") or {}
+    audit = result.get("audit") or {}
+    if st.session_state.get("canvas_variant") == TOBE_LABEL:
+        pack = st.session_state.get("tobe_pack") or {}
+        audit = pack.get("audit") or audit
+    stats = audit.get("stats") or {}
+    lanes = int(stats.get("lanes") or 3)
+    nodes = int(stats.get("nodes") or 12)
+    base = DIAGRAM_HEIGHT_WIDE if wide else DIAGRAM_HEIGHT
+    extra = min(140, max(0, (lanes - 3) * 40 + max(0, nodes - 18) * 4))
+    return int(min(720, max(580, base + extra)))
+
+
+def _sync_canvas_from_query() -> None:
+    """As-Is / To-Be с холста приходит query-параметром cv — без отдельного radio над сеткой."""
+    raw = ""
+    try:
+        val = st.query_params.get("cv")
+        if isinstance(val, list):
+            val = val[0] if val else ""
+        raw = str(val or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        raw = ""
+    if raw == "tobe":
+        st.session_state["canvas_variant"] = TOBE_LABEL
+    elif raw == "asis":
+        st.session_state["canvas_variant"] = ASIS_LABEL
+    elif "canvas_variant" not in st.session_state:
+        st.session_state["canvas_variant"] = ASIS_LABEL
+
+
+def _hero_html() -> str:
+    connected = bool(os.getenv("OPENAI_API_KEY"))
+    engine = "🟢 Groq 120B Online" if connected else "LLM офлайн"
+    return (
+        '<div class="ir-hero">'
+        "<div><h1>⚡ Архитектор BPMN-диаграмм</h1>"
+        "<p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · "
+        "Трансформация регламентов в BPMN 2.0.2 и аудит процессов</p></div>"
+        f'<div class="ir-badges"><span>{esc(engine)}</span>'
+        "<span>BPMN 2.0.2</span><span>XSD Valid</span></div></div>"
+    )
+
+
+def _migrate_view_mode() -> None:
+    current = st.session_state.get("view_mode")
+    if current in (VIEW_SPLIT, VIEW_WIDE):
+        return
+    text = str(current or "")
+    if "Широкий" in text:
+        st.session_state["view_mode"] = VIEW_WIDE
+    elif "Раздельн" in text:
+        st.session_state["view_mode"] = VIEW_SPLIT
+    else:
+        st.session_state["view_mode"] = VIEW_WIDE
 
 
 def render_diagram(canvas_height: int) -> None:
@@ -1507,36 +2071,44 @@ def render_diagram(canvas_height: int) -> None:
     elif result["error"]:
         st.error(result["error"])
     else:
-        st.radio(
-            "Схема на холсте",
-            [ASIS_LABEL, TOBE_LABEL],
-            key="canvas_variant",
-            horizontal=True,
+        pack = ensure_tobe_pack()
+        if pack and pack.get("error") and not pack.get("xml"):
+            st.warning("To-Be недоступен — на холсте остаётся As-Is. " + str(pack.get("error") or ""))
+        xml_asis = result.get("xml") or ""
+        audit_asis = result.get("audit") or {}
+        text_asis = st.session_state.get("reg_text") or ""
+        xml_tobe = ""
+        if pack and pack.get("xml") and not pack.get("error"):
+            xml_tobe = str(pack.get("xml") or "")
+        catalog = build_diagram_catalog(xml_asis, audit_asis, text_asis)
+        catalog_tb = (
+            build_diagram_catalog(
+                xml_tobe,
+                pack.get("audit") or audit_asis,
+                pack.get("text") or text_asis,
+            )
+            if xml_tobe
+            else {}
         )
-        if st.session_state.get("canvas_variant") == TOBE_LABEL:
-            pack = ensure_tobe_pack()
-            if pack and pack.get("error") and not pack.get("xml"):
-                st.warning("To-Be недоступен — показан As-Is. " + str(pack.get("error") or ""))
-            elif st.session_state.get("_last_canvas_variant") != TOBE_LABEL:
-                st.session_state.pop("inspector_choice", None)
-        if st.session_state.get("_last_canvas_variant") != st.session_state.get("canvas_variant"):
-            st.session_state["_last_canvas_variant"] = st.session_state.get("canvas_variant")
-            st.session_state.pop("inspector_choice", None)
-        xml, audit, text = _active_canvas()
-        catalog = build_diagram_catalog(xml, audit, text)
-        pack = st.session_state.get("tobe_pack")
-        asis = st.session_state.get("result") or {}
         copilot = build_canvas_copilot(
-            asis.get("xml") or xml,
-            asis.get("audit") or audit,
-            st.session_state.get("reg_text") or text,
+            xml_asis,
+            audit_asis,
+            text_asis,
             (pack or {}).get("delta"),
         )
-        page = viewer_html(xml, canvas_height, catalog, copilot)
+        page = viewer_html(
+            xml_asis,
+            canvas_height,
+            catalog,
+            copilot,
+            xml_tobe=xml_tobe,
+            catalog_tobe=catalog_tb,
+        )
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
             st.iframe(page, height=canvas_height + 16)
         else:
             components.html(page, height=canvas_height + 16, scrolling=False)
+    render_downloads("under_canvas")
 
 
 def _send_assistant(prompt: str) -> None:
@@ -1609,14 +2181,16 @@ def main() -> None:
         if _k in st.session_state:
             st.session_state[_k] = st.session_state[_k]
 
-    st.markdown(
-        """
-<div class="ir-hero">
-  <div><h1>⚡ Архитектор BPMN-диаграмм</h1>
-  <p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · регламент → BPMN 2.0 → аудит процесса</p></div>
-  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span><span>MCP</span></div>
-</div>""",
-        unsafe_allow_html=True,
+    _sync_canvas_from_query()
+    _migrate_view_mode()
+
+    st.markdown(_hero_html(), unsafe_allow_html=True)
+    view = st.radio(
+        "Режим отображения",
+        [VIEW_WIDE, VIEW_SPLIT],
+        key="view_mode",
+        horizontal=True,
+        label_visibility="collapsed",
     )
 
     examples = load_examples()
@@ -1630,34 +2204,25 @@ def main() -> None:
         with st.spinner("Готовим эталонный пример…"):
             # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
             run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
+            st.session_state["quickstart"] = True
 
-    mode_col, _, dl_col = st.columns([5, 1, 5], gap="medium", vertical_alignment="center")
-    with mode_col:
-        view = st.radio(
-            "Режим отображения",
-            [VIEW_SPLIT, VIEW_WIDE],
-            key="view_mode",
-            horizontal=True,
-            label_visibility="collapsed",
-        )
     wide = view == VIEW_WIDE
+    canvas_h = _diagram_height(wide)
     if st.session_state.pop("diagram_updated_by_assistant", False):
         st.markdown(
             '<div class="ir-toast">✨ Диаграмма обновлена ассистентом в диалоге</div>',
             unsafe_allow_html=True,
         )
     if wide:
-        with dl_col:
-            render_downloads("wide")
-        with st.expander("Регламент и настройки", expanded=False):
-            render_input_panel(labels, compact=True, show_downloads=False)
-        render_diagram(DIAGRAM_HEIGHT_WIDE)
+        with st.expander("Параметры регламента", expanded=True):
+            render_input_panel(labels, compact=True)
+        render_diagram(canvas_h)
     else:
         left, right = st.columns([5, 7], gap="large")
         with left:
             render_input_panel(labels)
         with right:
-            render_diagram(DIAGRAM_HEIGHT)
+            render_diagram(canvas_h)
 
     result = st.session_state.get("result")
     if result and not result["error"]:
