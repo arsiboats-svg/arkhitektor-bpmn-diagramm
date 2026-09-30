@@ -458,7 +458,18 @@ def viewer_html(
   const HINT_PANO = 'Перетаскивание — перемещение · колесо — масштаб · Esc — закрыть панораму';
   hint.textContent = HINT_NORMAL;
 
-  function fit() {{ try {{ canvas().zoom('fit-viewport', 'auto'); }} catch (e) {{}} }}
+  // «По размеру» + прижать схему к верху: широкая низкая схема иначе центрируется по вертикали
+  // и при открытии страницы в видимой части холста остаётся пустая сетка (QA B1).
+  function fit() {{
+    try {{
+      const c = canvas();
+      c.zoom('fit-viewport', 'auto');
+      if (wrap.classList.contains('pano')) return;  // в панораме — по центру экрана
+      const vb = c.viewbox();
+      const top = 64 / vb.scale;  // отступ под панель кнопок
+      c.viewbox({{ x: vb.x, y: vb.inner.y - top, width: vb.width, height: vb.height }});
+    }} catch (e) {{}}
+  }}
   function focusStart() {{
     try {{
       const registry = viewer.get('elementRegistry');
