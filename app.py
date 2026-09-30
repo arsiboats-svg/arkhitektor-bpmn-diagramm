@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
-from ai_generator import cloud_engine_status, generate_bpmn_from_text
+from ai_generator import assistant_chat, cloud_engine_status, generate_bpmn_from_text
 
 
 def _secrets_to_env() -> List[str]:
@@ -46,6 +46,13 @@ DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (�
 DIAGRAM_HEIGHT_WIDE = 820  # в широком режиме
 VIEW_SPLIT = "🗂  Раздельный вид"
 VIEW_WIDE = "🖥  Широкий вид"
+
+QUICK_PROMPTS = [
+    ("🔍 Разбор узких мест SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
+    ("⚡ Как ускорить процесс?", "Как ускорить процесс? Что даст наибольший эффект?"),
+    ("📝 Регламент для исполнителя", "Составь должностную инструкцию для самой загруженной роли по текущей схеме."),
+    ("🔮 Предложить следующий шаг", "Предложи следующий шаг процесса: чего не хватает в регламенте?"),
+]
 
 BLUE_DARK, BLUE = "#003366", "#1565C0"
 OK, WARN, BAD = "#2E7D32", "#F57F17", "#C62828"
@@ -171,6 +178,9 @@ table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#26323
 .chip-sys small, .chip-doc small {{ opacity:.7; font-weight:700; margin-left:6px; }}
 .land-empty {{ color:#78909C; font-size:.88rem; font-style:italic; margin:2px 0 6px 0; }}
 .engine {{ font-size:.82rem; color:#455A64; background:#E3F2FD; border-radius:10px; padding:8px 12px; margin:10px 0 6px 0; }}
+.ir-toast {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; border-radius:12px; padding:10px 14px; font-weight:700; margin:8px 0 14px 0; }}
+section[data-testid="stSidebar"] {{ background:#F7FBFF; }}
+section[data-testid="stSidebar"] .stMarkdown p {{ font-size:.92rem; }}
 </style>
 """
 
@@ -586,6 +596,8 @@ def on_example_change() -> None:
         st.session_state["file_stem"] = examples[choice]["stem"]
     else:
         st.session_state["file_stem"] = "custom_process"
+    st.session_state["chat_messages"] = []
+    st.session_state.pop("diagram_updated_by_assistant", None)
 
 
 def render_downloads(key: str) -> None:
@@ -677,9 +689,63 @@ def render_diagram(canvas_height: int) -> None:
             components.html(page, height=canvas_height + 16, scrolling=False)
 
 
+def _send_assistant(prompt: str) -> None:
+    """Отправляет реплику ассистенту и, если он изменил процесс, обновляет холст и аудит."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return
+    messages: List[Dict[str, str]] = st.session_state.setdefault("chat_messages", [])
+    messages.append({"role": "user", "content": prompt})
+    result = st.session_state.get("result") or {}
+    with st.spinner("Ассистент анализирует процесс…"):
+        reply, new_text, new_xml, new_audit = assistant_chat(
+            prompt,
+            messages[:-1],
+            result.get("xml") or "",
+            result.get("audit") or {},
+            st.session_state.get("reg_text") or "",
+            use_llm=True,
+        )
+    messages.append({"role": "assistant", "content": reply})
+    if new_text and new_xml and new_audit:
+        st.session_state["reg_text"] = new_text
+        st.session_state["result"] = {"xml": new_xml, "audit": new_audit, "error": ""}
+        st.session_state["diagram_updated_by_assistant"] = True
+        st.session_state["file_stem"] = st.session_state.get("file_stem") or "custom_process"
+
+
+def render_assistant() -> None:
+    """Сайдбар: «💬 AI-Ассистент Бизнес-Архитектора» — аналитика, правка на лету, реверс-генерация."""
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    with st.sidebar:
+        st.markdown("### 💬 AI-Ассистент Бизнес-Архитектора")
+        st.caption(
+            "Знает текущий процесс: роли, SLA, bus-factor, циклы возврата, ИТ-системы. "
+            "Может объяснить узкие места, изменить схему командой («Добавь согласование с экологами после шага 3») "
+            "или сгенерировать должностную инструкцию по BPMN."
+        )
+        for label, prompt in QUICK_PROMPTS:
+            if st.button(label, key=f"qp_{hash(label)}", use_container_width=True):
+                _send_assistant(prompt)
+                st.rerun()
+        for msg in st.session_state["chat_messages"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        typed = st.chat_input("Спросите про SLA, роли или измените процесс…")
+        if typed:
+            _send_assistant(typed)
+            st.rerun()
+        if st.session_state.get("chat_messages") and st.button("Очистить диалог", use_container_width=True):
+            st.session_state["chat_messages"] = []
+            st.session_state.pop("diagram_updated_by_assistant", None)
+            st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="Архитектор BPMN — Интер РАО", page_icon="⚡", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+    render_assistant()
     # Часть виджетов не рисуется в отдельных режимах — не даём Streamlit стереть их состояние.
     for _k in ("reg_text", "example_choice"):
         if _k in st.session_state:
@@ -690,7 +756,7 @@ def main() -> None:
 <div class="ir-hero">
   <div><h1>⚡ Архитектор BPMN-диаграмм</h1>
   <p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · регламент → BPMN 2.0 → аудит процесса</p></div>
-  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span></div>
+  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span><span>MCP</span></div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -717,6 +783,11 @@ def main() -> None:
             label_visibility="collapsed",
         )
     wide = view == VIEW_WIDE
+    if st.session_state.pop("diagram_updated_by_assistant", False):
+        st.markdown(
+            '<div class="ir-toast">✨ Диаграмма обновлена ассистентом в диалоге</div>',
+            unsafe_allow_html=True,
+        )
     if wide:
         with dl_col:
             render_downloads("wide")
