@@ -40,7 +40,7 @@ import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from bpmn_framework import GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
+from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 from validate_bpmn import xsd_errors_xml
 
 ROOT_PROCESS_ID = "Process_Root"
@@ -69,6 +69,7 @@ API объекта DIAGRAM (строго эти сигнатуры):
 - gw_id = DIAGRAM.add_inclusive_gateway(name, parent_id)   # OR
 - group_id = DIAGRAM.add_group(name, parent_id)
 - DIAGRAM.add_link(source_id, target_id, condition_name="")  # поток; у веток шлюза ОБЯЗАТЕЛЬНА подпись условия
+- DIAGRAM.set_sla(task_id, hours)                           # трудозатраты шага, часы (1 раб. день = 8 ч). ОБЯЗАТЕЛЬНО, если срок есть в регламенте.
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 1. РОЛЕВАЯ МОДЕЛЬ. Выдели всех участников регламента и создай для них дорожки одним вызовом add_pool.
@@ -213,10 +214,77 @@ def _quality_report(structure_issues: List[str], audit: Dict[str, Any]) -> Dict[
     return {"issues": issues, "critical": critical, "ok": not critical}
 
 
+def _sla_stems(text: str) -> set:
+    return {w[:6] for w in re.findall(r"[А-Яа-яЁёA-Za-z]{4,}", (text or "").lower())}
+
+
+def _sla_title_score(left: str, right: str) -> int:
+    a, b = _sla_stems(left), _sla_stems(right)
+    if not a or not b:
+        return 0
+    return len(a & b)
+
+
+def _sla_looks_default(node: Any) -> bool:
+    """True, если трудозатраты не заданы или совпадают с дефолтом вида узла (2 ч для userTask)."""
+    if getattr(node, "sla_hours", None) is None:
+        return True
+    expected = DEFAULT_HOURS.get(getattr(node, "kind", ""), None)
+    if expected is None:
+        return False
+    try:
+        return abs(float(node.sla_hours) - float(expected)) < 1e-6
+    except (TypeError, ValueError):
+        return True
+
+
+def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: str) -> int:
+    """Подставляет часы из текста регламента узлам без явного set_sla (или с дефолтом 2 ч)."""
+    if not regulation_text or not str(regulation_text).strip():
+        return 0
+    try:
+        parsed = parse_regulation(normalize_regulation(regulation_text))
+    except Exception:  # noqa: BLE001
+        return 0
+    steps = [s for s in parsed.steps if s.hours]
+    work = [n for n in diagram.nodes.values() if n.kind in WORK_KINDS]
+    if not steps or not work:
+        return 0
+    applied = 0
+    used_nodes: set = set()
+    used_steps: set = set()
+
+    def _free(node: Any) -> bool:
+        return node.id not in used_nodes and _sla_looks_default(node)
+
+    for idx, step in enumerate(steps):
+        title = step.title or ""
+        best, score = None, 0
+        for node in work:
+            if not _free(node):
+                continue
+            sc = _sla_title_score(title, node.name or "")
+            if sc > score:
+                best, score = node, sc
+        if best is not None and score >= 1:
+            best.sla_hours = float(step.hours)
+            used_nodes.add(best.id)
+            used_steps.add(idx)
+            applied += 1
+
+    leftover_nodes = [n for n in work if _free(n)]
+    leftover_steps = [s for i, s in enumerate(steps) if i not in used_steps]
+    for step, node in zip(leftover_steps, leftover_nodes):
+        node.sla_hours = float(step.hours)
+        applied += 1
+    return applied
+
+
 def execute_generated_code(
     code_str: str,
     process_name: str = "Бизнес-процесс ПАО «Интер РАО»",
     sla_target_hours: Optional[float] = None,
+    regulation_text: str = "",
 ) -> Tuple[str, Dict[str, Any], str]:
     """Безопасно исполняет код для DIAGRAM и возвращает (bpmn_xml, audit_data, error).
 
@@ -256,11 +324,14 @@ def execute_generated_code(
         if len(work_nodes) < 2:
             return "", {}, "Диаграмма содержит меньше двух рабочих узлов — регламент не распознан."
 
+        sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
         structure_issues = _structure_issues(diagram)
         diagram.heal_graph()
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit)
+        if sla_enriched:
+            audit["sla_enriched_nodes"] = sla_enriched
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
         if errors:
             return "", {}, "XML не прошёл проверку по XSD BPMN 2.0: " + "; ".join(errors[:3])
@@ -1089,7 +1160,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{name}: недоступен ({_error_reason(exc)})")
                     break
                 call_s = time.time() - call_started
-                xml, audit, err = execute_generated_code(raw, process_name, sla)
+                xml, audit, err = execute_generated_code(raw, process_name, sla, regulation_text=text)
                 quality = audit.get("quality", {}) if not err else {}
                 if not err and quality.get("ok"):
                     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
@@ -1122,7 +1193,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
         code, info = emulate_generation(text)
     except Exception as exc:  # noqa: BLE001
         return "", {}, f"Не удалось разобрать регламент: {type(exc).__name__}: {exc}"
-    xml, audit, err = execute_generated_code(code, process_name, sla)
+    xml, audit, err = execute_generated_code(code, process_name, sla, regulation_text=text)
     if err:
         return "", {}, f"Не удалось построить диаграмму: {err}"
     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
@@ -1157,6 +1228,10 @@ CHAT_SYSTEM = """Ты — «AI-Ассистент Бизнес-Архитект�
 Правила:
 - Отвечай по-русски, по делу, не более 12 строк, Markdown. Опирайся ТОЛЬКО на данные процесса ниже; числа и названия не выдумывай.
 - Причины и рекомендации подкрепляй конкретными шагами, ролями и цифрами из данных (срок, доля нагрузки, циклы возврата).
+- Если в данных есть блок «СРАВНЕНИЕ AS-IS / TO-BE», на вопросы «сравни», «as-is / to-be», «до и после», «читаемость»
+  отвечай цифрами: дельта SLA (часы и %), петли возврата до/после, замена журналов на scriptTask, Quality Score и
+  декомпозиция в подпроцессы вместо «метро Токио» (длинные цепочки и возвратные стрелки).
+- Не начинай каждый ответ одной и той же заглушкой «N шагов / M узлов». Отвечай на заданный вопрос.
 - Если предлагаешь изменить процесс, заверши ответ ГОТОВОЙ командой в кавычках «…», которую пользователь может отправить
   в чат, например: «Сделай шаги 4 и 5 параллельными» или «Добавь согласование с экологами после шага 3».
 - Если данных для ответа нет — так и скажи.
@@ -1247,8 +1322,13 @@ def _fh(hours: float) -> str:
     return f"{hours:.0f} ч (≈ {hours / 8:.0f} раб. дн.)"
 
 
-def build_process_context(current_text: str, current_xml: str, current_audit: Dict[str, Any]) -> Dict[str, Any]:
-    """Сводка активного процесса: шаги, роли, SLA, критический путь, bus-factor, циклы, ИТ-ландшафт."""
+def build_process_context(
+    current_text: str,
+    current_xml: str,
+    current_audit: Dict[str, Any],
+    tobe_delta: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Сводка активного процесса: шаги, роли, SLA, критический путь, bus-factor, циклы, ИТ-ландшафт, To-Be."""
     audit = current_audit or {}
     title, sla_target, steps = "Бизнес-процесс", None, []
     try:
@@ -1270,7 +1350,7 @@ def build_process_context(current_text: str, current_xml: str, current_audit: Di
     sla = audit.get("sla") or {}
     if sla_target is None:
         sla_target = sla.get("target_hours")
-    return {
+    ctx: Dict[str, Any] = {
         "title": title,
         "sla_target_hours": sla_target,
         "steps": steps,
@@ -1284,8 +1364,72 @@ def build_process_context(current_text: str, current_xml: str, current_audit: Di
         "artifacts": audit.get("artifacts") or [],
         "recommendations": audit.get("recommendations") or [],
         "stats": audit.get("stats") or {},
+        "methodology": audit.get("methodology") or {},
         "xml_available": bool(current_xml),
+        "tobe_ready": False,
+        "sla_hours_as_is": None,
+        "sla_hours_to_be": None,
+        "delta_sla_percent": None,
+        "rework_loops_as_is": None,
+        "rework_loops_to_be": None,
+        "quality_score_as_is": None,
+        "quality_score_to_be": None,
+        "tobe_actions": [],
     }
+    _attach_tobe_compare(ctx, audit, tobe_delta)
+    return ctx
+
+
+def _attach_tobe_compare(ctx: Dict[str, Any], audit: Dict[str, Any], tobe_delta: Optional[dict]) -> None:
+    """Пишет в контекст sla_hours_as_is / sla_hours_to_be и соседние поля, если To-Be уже посчитан."""
+    d = tobe_delta or (audit or {}).get("tobe_compare") or {}
+    if not isinstance(d, dict) or not d:
+        return
+    if d.get("sla_after_hours") is None and d.get("sla_hours_to_be") is None:
+        return
+    sla = (audit or {}).get("sla") or {}
+    meth = (audit or {}).get("methodology") or {}
+    as_is = d.get("sla_hours_as_is")
+    if as_is is None:
+        as_is = d.get("sla_before_hours")
+    if as_is is None:
+        as_is = sla.get("with_rework_hours") or sla.get("critical_path_hours") or 0
+    to_be = d.get("sla_hours_to_be")
+    if to_be is None:
+        to_be = d.get("sla_after_hours") or 0
+    pct = d.get("delta_sla_percent")
+    if pct is None:
+        pct = d.get("sla_saved_pct") or 0
+    q_as = d.get("quality_score_as_is")
+    if q_as is None:
+        q_as = d.get("quality_before")
+    if q_as is None:
+        q_as = int(meth.get("score") or 0)
+    q_to = d.get("quality_score_to_be")
+    if q_to is None:
+        q_to = d.get("quality_after")
+    if q_to is None:
+        q_to = q_as
+    rw_as = d.get("rework_loops_as_is")
+    if rw_as is None:
+        rw_as = d.get("rework_before")
+    if rw_as is None:
+        rw_as = len((audit or {}).get("rework_loops") or [])
+    rw_to = d.get("rework_loops_to_be")
+    if rw_to is None:
+        rw_to = d.get("rework_after")
+    if rw_to is None:
+        rw_to = rw_as
+    ctx["tobe_ready"] = True
+    ctx["sla_hours_as_is"] = round(float(as_is or 0), 3)
+    ctx["sla_hours_to_be"] = round(float(to_be or 0), 3)
+    ctx["delta_sla_percent"] = round(float(pct or 0), 1)
+    ctx["rework_loops_as_is"] = int(rw_as or 0)
+    ctx["rework_loops_to_be"] = int(rw_to or 0)
+    ctx["quality_score_as_is"] = int(q_as or 0)
+    ctx["quality_score_to_be"] = int(q_to or 0)
+    ctx["tobe_actions"] = [a for a in (d.get("actions") or []) if isinstance(a, dict)]
+    ctx["sla_saved_hours"] = round(float(d.get("sla_saved_hours") or max(0.0, float(as_is or 0) - float(to_be or 0))), 3)
 
 
 def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
@@ -1330,6 +1474,25 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
         lines.append("Документы: " + ", ".join(f"{i['name']} (шаги {i['steps']})" for i in ctx["artifacts"]))
     for risk in ctx["sla_risks"][:6]:
         lines.append(f"Риск [{risk.get('severity')}]: {risk.get('message')}")
+    meth = ctx.get("methodology") or {}
+    if meth.get("score") is not None:
+        lines.append(f"Quality Score (линтер нотации): {int(meth.get('score') or 0)}%")
+        for chk in (meth.get("checks") or [])[:4]:
+            mark = "ok" if chk.get("passed") else "fail"
+            lines.append(f"  [{mark}] {chk.get('title')}: {chk.get('detail')}")
+    if ctx.get("tobe_ready"):
+        lines += [
+            "СРАВНЕНИЕ AS-IS / TO-BE:",
+            f"  sla_hours_as_is: {ctx.get('sla_hours_as_is')}",
+            f"  sla_hours_to_be: {ctx.get('sla_hours_to_be')}",
+            f"  delta_sla_percent: {ctx.get('delta_sla_percent')}",
+            f"  rework_loops_as_is: {ctx.get('rework_loops_as_is')}",
+            f"  rework_loops_to_be: {ctx.get('rework_loops_to_be')}",
+            f"  quality_score_as_is: {ctx.get('quality_score_as_is')}",
+            f"  quality_score_to_be: {ctx.get('quality_score_to_be')}",
+        ]
+        for act in (ctx.get("tobe_actions") or [])[:6]:
+            lines.append(f"  действие To-Be [{act.get('kind')}]: {act.get('detail')}")
     return "\n".join(lines)
 
 
@@ -1505,22 +1668,136 @@ def _analysis_summary(ctx: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _analysis_tobe(ctx: Dict[str, Any]) -> str:
+    if not ctx.get("tobe_ready"):
+        sla = ctx.get("sla") or {}
+        loops = ctx.get("rework_loops") or []
+        meth = ctx.get("methodology") or {}
+        return (
+            "**As-Is пока без посчитанного To-Be.** Откройте вкладку «Оптимизация As-Is → To-Be» — "
+            "оптимизатор параллелит независимые роли, снимает петли возврата (Zero-Rework) и переводит журналы в scriptTask.\n"
+            f"Сейчас: путь {_fh(float(sla.get('with_rework_hours') or sla.get('critical_path_hours') or 0))}, "
+            f"петель возврата {len(loops)}, Quality Score {int(meth.get('score') or 0)}%."
+        )
+    as_h = float(ctx.get("sla_hours_as_is") or 0)
+    to_h = float(ctx.get("sla_hours_to_be") or 0)
+    pct = float(ctx.get("delta_sla_percent") or 0)
+    saved = float(ctx.get("sla_saved_hours") or max(0.0, as_h - to_h))
+    rb, ra = int(ctx.get("rework_loops_as_is") or 0), int(ctx.get("rework_loops_to_be") or 0)
+    qb, qa = int(ctx.get("quality_score_as_is") or 0), int(ctx.get("quality_score_to_be") or 0)
+    stats = ctx.get("stats") or {}
+    out = [
+        f"**As-Is → To-Be для «{ctx.get('title')}».**",
+        f"SLA (с учётом возвратов): **{_fh(as_h)} → {_fh(to_h)}** (экономия {_fh(saved)}, **−{pct:g}%**).",
+        f"Петли возврата: **{rb} → {ra}** (ликвидировано {max(0, rb - ra)}).",
+        f"Quality Score нотации: **{qb}% → {qa}%**.",
+    ]
+    kinds = {str(a.get("kind")) for a in (ctx.get("tobe_actions") or [])}
+    if "parallel" in kinds:
+        out.append("Параллелизация: независимые шаги разных ролей идут одновременно, а не цепочкой.")
+    if "zero_rework" in kinds:
+        out.append("Zero-Rework: перед согласованиями входной контроль, возвраты заменены эскалацией.")
+    if "automation" in kinds:
+        out.append("Автоматизация: фиксация в журналах/реестрах переведена в scriptTask, а не ручной userTask.")
+    for act in (ctx.get("tobe_actions") or [])[:4]:
+        if act.get("detail"):
+            out.append(f"- {act['detail']}")
+    subs = int(stats.get("subprocesses") or 0)
+    out.append(
+        f"Читаемость: {'подпроцессы уже режут «метро Токио»' if subs else 'длинные цепочки лучше упаковать в subprocess'}; "
+        "снятие возвратных стрелок убирает пересечения как на карте метро."
+    )
+    return "\n".join(out)
+
+
+def _analysis_readability(ctx: Dict[str, Any]) -> str:
+    meth = ctx.get("methodology") or {}
+    stats = ctx.get("stats") or {}
+    score = int(meth.get("score") or 0)
+    subs = int(stats.get("subprocesses") or 0)
+    layers = int(stats.get("critical_path_layers") or 0)
+    out = [f"**Читаемость BPMN «{ctx.get('title')}».** Quality Score: **{score}%**."]
+    if subs:
+        out.append(f"Декомпозиция: {subs} подпроцесс(а) — это как раз против «метро Токио».")
+    else:
+        out.append("Подпроцессов нет: монотонные цепочки одной роли лучше свернуть в subprocess.")
+    if layers:
+        out.append(f"Слоёв на критическом пути: {layers}.")
+    for chk in meth.get("checks") or []:
+        mark = "✓" if chk.get("passed") else "✗"
+        out.append(f"- {mark} {chk.get('title')}: {chk.get('detail')}")
+    if ctx.get("tobe_ready"):
+        out.append(
+            f"To-Be: Quality {ctx.get('quality_score_as_is')}% → {ctx.get('quality_score_to_be')}%, "
+            f"петли {ctx.get('rework_loops_as_is')} → {ctx.get('rework_loops_to_be')} — меньше возвратных стрелок, схема читается линейнее."
+        )
+    return "\n".join(out)
+
+
+def _analysis_open(message: str, ctx: Dict[str, Any]) -> str:
+    """Развёрнутый ответ по архитектуре процесса — не статичная заглушка с числом шагов."""
+    q = (message or "").strip()
+    sla = ctx.get("sla") or {}
+    bus = ctx.get("bus_factor") or {}
+    meth = ctx.get("methodology") or {}
+    recs: List[str] = []
+    for item in ctx.get("recommendations") or []:
+        recs.append(item if isinstance(item, str) else str((item or {}).get("message") or ""))
+    for item in ctx.get("sla_risks") or []:
+        if isinstance(item, dict) and item.get("message"):
+            recs.append(str(item["message"]))
+    recs = [r for r in recs if r]
+    out: List[str] = []
+    if q:
+        out.append(f"По запросу «{q[:140]}» — факты аудита, не общая заглушка.")
+    else:
+        out.append(f"Архитектурный разбор «{ctx.get('title')}».")
+    if sla:
+        out.append(
+            f"SLA: критический путь {_fh(float(sla.get('critical_path_hours') or 0))}, "
+            f"с худшим возвратом {_fh(float(sla.get('with_rework_hours') or 0))}, "
+            f"срыв: {'да' if sla.get('breach') else 'нет'}."
+        )
+    if bus:
+        out.append(f"Ключевая роль: «{bus.get('top_role')}» ({float(bus.get('max_share') or 0):.0%} шагов).")
+    if meth.get("score") is not None:
+        out.append(f"Линтер нотации: Quality Score {int(meth.get('score') or 0)}%.")
+    loops = ctx.get("rework_loops") or []
+    if loops:
+        l0 = max(loops, key=lambda x: float((x or {}).get("cycle_hours") or 0))
+        out.append(f"Дороже всего цикл «{l0.get('label')}»: {_fh(float(l0.get('cycle_hours') or 0))}.")
+    if ctx.get("tobe_ready"):
+        out.append(
+            f"To-Be уже есть: SLA {_fh(float(ctx.get('sla_hours_as_is') or 0))} → "
+            f"{_fh(float(ctx.get('sla_hours_to_be') or 0))} (−{ctx.get('delta_sla_percent')}%)."
+        )
+    if recs:
+        out.append("Что делать архитектору:")
+        out += [f"- {r}" for r in recs[:3]]
+    out.append("Уточните: сравнение As-Is/To-Be, читаемость (анти-метро), роли или ускорение SLA.")
+    return "\n".join(out)
+
+
 def heuristic_analysis(message: str, ctx: Dict[str, Any]) -> str:
     low = message.lower()
     roles = _roles_in_message(message, _roles_of(ctx))
+    if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|до/после|целев\w+\s+схем|реинжинир", low):
+        return _analysis_tobe(ctx)
+    if re.search(r"читаем|метро|нотаци|подпроцесс|линтер|методолог|quality score|анти-метро|декомпозиц", low):
+        return _analysis_readability(ctx)
     if re.search(r"sla|срок|срыв|задерж|критическ|длительн|долго|почему.*(долго|медлен)", low):
         return _analysis_sla(ctx)
-    if re.search(r"нагрузк|bus|загружен|разгруз|перегруз|исполнител|кто.*(ключев|зависит)", low) or roles:
-        return _analysis_load(ctx, roles)
-    if re.search(r"ускор|оптимиз|сократ|быстрее|повысить эффективн|улучш", low):
-        return _analysis_speedup(ctx)
     if re.search(r"цикл|возврат|доработ|rework|замечани", low):
         return _analysis_loops(ctx)
+    if re.search(r"ускор|оптимиз|сократ|быстрее|повысить эффективн|улучш", low):
+        return _analysis_speedup(ctx)
     if re.search(r"систем|it\b|ит-|scada|документ|артефакт|ландшафт|crm|1с|sap", low):
         return _analysis_landscape(ctx)
+    if re.search(r"нагрузк|bus|загружен|разгруз|перегруз|исполнител|кто.*(ключев|зависит)", low) or roles:
+        return _analysis_load(ctx, roles)
     if re.search(r"риск|узк|проблем|слаб|разбор", low):
         return _analysis_sla(ctx) + "\n\n" + _analysis_load(ctx, [])
-    return _analysis_summary(ctx)
+    return _analysis_open(message, ctx)
 
 
 # --------------------------- «Предложить следующий шаг» --------------------------- #
@@ -1916,7 +2193,7 @@ def _rebuild_process(text: str, engine: str, trace: List[str]) -> Tuple[str, Dic
     norm = normalize_regulation(text)
     header = parse_regulation(norm)
     code, info = emulate_generation(norm)
-    xml, audit, err = execute_generated_code(code, header.title, header.sla_hours)
+    xml, audit, err = execute_generated_code(code, header.title, header.sla_hours, regulation_text=norm)
     if err:
         return "", {}, err
     audit["artifacts"], audit["it_systems"] = header.artifacts, header.it_systems
@@ -2126,6 +2403,7 @@ def assistant_chat(
     current_audit: Dict[str, Any],
     current_text: str,
     use_llm: bool = True,
+    tobe_delta: Optional[dict] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[Dict[str, Any]]]:
     """Диалог с AI-ассистентом над активным процессом.
 
@@ -2138,7 +2416,7 @@ def assistant_chat(
         if not message:
             return "Напишите вопрос о процессе или команду на изменение — например, «Добавь согласование с экологами после шага 3».", None, None, None
         audit = current_audit or {}
-        ctx = build_process_context(current_text, current_xml, audit)
+        ctx = build_process_context(current_text, current_xml, audit, tobe_delta=tobe_delta)
         if not ctx["steps"] and not current_xml:
             return "Активного процесса пока нет: выберите регламент и нажмите «Сгенерировать BPMN 2.0».", None, None, None
         intent = classify_intent(message)
@@ -2727,29 +3005,46 @@ def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) 
     return catalog
 
 
-def build_canvas_copilot(xml_str: str, audit_data: dict, regulation_text: str) -> Dict[str, Any]:
-    """Пакет для плавающего ассистента на холсте: чипы и ответы по аудиту активного процесса."""
-    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {})
+def build_canvas_copilot(
+    xml_str: str,
+    audit_data: dict,
+    regulation_text: str,
+    tobe_delta: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Пакет для плавающего ассистента на холсте: чипы и ответы по аудиту + сравнение As-Is/To-Be."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {}, tobe_delta=tobe_delta)
     title = str(ctx.get("title") or "Бизнес-процесс")
     try:
         sla_a = heuristic_analysis("В чём причина срыва SLA?", ctx)
         speed_a = heuristic_analysis("Как ускорить процесс?", ctx)
         roles_a = _analysis_load(ctx, [])
-        summary = _analysis_summary(ctx)
+        compare_a = heuristic_analysis("Сравни As-Is и To-Be, до и после", ctx)
+        read_a = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx)
+        loops_a = heuristic_analysis("Циклы возврата на доработку", ctx)
+        land_a = heuristic_analysis("ИТ-ландшафт и документы процесса", ctx)
+        fallback = _analysis_open("краткий архитектурный разбор", ctx)
     except Exception:  # noqa: BLE001 — холст не должен падать
-        sla_a = speed_a = roles_a = summary = "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
+        sla_a = speed_a = roles_a = compare_a = read_a = loops_a = land_a = fallback = (
+            "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
+        )
+    chips = [
+        {"id": "speed", "label": "⚡ Как ускорить?", "q": "Как ускорить процесс?", "a": speed_a},
+        {"id": "sla", "label": "🔍 Анализ SLA", "q": "В чём причина срыва SLA?", "a": sla_a},
+        {"id": "roles", "label": "👤 Роли и риски", "q": "Как оптимизировать нагрузку ролей?", "a": roles_a},
+        {"id": "tobe", "label": "🔀 As-Is → To-Be", "q": "Сравни As-Is и To-Be", "a": compare_a},
+    ]
     return {
         "title": title,
         "greeting": (
-            f"Я ассистент процесса «{title}». Вопросы про SLA, роли и ускорение "
-            "отвечаю по цифрам аудита — можно не выходить из панорамы."
+            f"Я ассистент процесса «{title}». Спросите про SLA, сравнение As-Is/To-Be, "
+            "читаемость или роли — отвечаю по цифрам аудита, в том числе в панораме."
         ),
-        "fallback": summary,
-        "chips": [
-            {"id": "speed", "label": "⚡ Как ускорить?", "q": "Как ускорить процесс?", "a": speed_a},
-            {"id": "sla", "label": "🔍 Анализ SLA", "q": "В чём причина срыва SLA?", "a": sla_a},
-            {"id": "roles", "label": "👤 Роли и риски", "q": "Как оптимизировать нагрузку ролей?", "a": roles_a},
-        ],
+        "fallback": fallback,
+        "compare": compare_a,
+        "readability": read_a,
+        "loops": loops_a,
+        "landscape": land_a,
+        "chips": chips,
     }
 
 
@@ -3020,9 +3315,8 @@ def _collect_tobe_actions(old_text: str, new_text: str) -> List[Dict[str, str]]:
 
 
 def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[str]:
-    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
-        return None
-    if not (os.getenv("OPENAI_API_KEY") or os.getenv("FALLBACK_API_KEY")):
+    """Облачная перепись To-Be только при BPMN_TOBE_LLM=1 — иначе 25 с лишней генерации."""
+    if os.getenv("BPMN_TOBE_LLM", "").strip().lower() not in ("1", "true", "yes"):
         return None
     ctx = build_process_context(regulation_text, "", audit_data or {})
     messages = [
@@ -3053,7 +3347,7 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
     before = float(old_sla.get("with_rework_hours") or old_sla.get("critical_path_hours") or 0)
     after = float(new_sla.get("with_rework_hours") or new_sla.get("critical_path_hours") or 0)
     saved = max(0.0, before - after)
-    pct = round(100.0 * saved / before, 1) if before else 0.0
+    pct = round(100.0 * saved / before, 1) if before and saved > 0 else 0.0
     loops_b = len(old_a.get("rework_loops") or [])
     loops_a = len(new_a.get("rework_loops") or [])
     q_b = int((old_a.get("methodology") or {}).get("score") or 0)
@@ -3079,7 +3373,8 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
 def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
     """Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация журналов.
 
-    Сначала облачная LLM (если задан ключ), иначе детерминированный семантический оптимизатор.
+    По умолчанию — детерминированный семантический оптимизатор (~0.05 с).
+    Облачная LLM включается только переменной BPMN_TOBE_LLM=1.
     """
     text = (regulation_text or "").strip()
     empty = {

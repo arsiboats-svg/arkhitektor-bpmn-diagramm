@@ -6,6 +6,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from ai_generator import (
+    emulate_generation,
+    execute_generated_code,
     export_docx_passport,
     generate_bpmn_from_text,
     generate_raci_matrix,
@@ -41,6 +43,22 @@ def main() -> None:
     assert payload[:2] == b"PK", "DOCX должен быть ZIP/OOXML"
     assert len(payload) > 2000
 
+    grid = (Path(__file__).resolve().parent / "examples" / "example_3_grid_connection.txt").read_text(
+        encoding="utf-8"
+    )
+    parsed_g = parse_regulation(grid)
+    code, _ = emulate_generation(grid)
+    code_no_sla = "\n".join(l for l in code.splitlines() if "set_sla" not in l)
+    _, audit_g, err_g = execute_generated_code(
+        code_no_sla, parsed_g.title, parsed_g.sla_hours, regulation_text=grid
+    )
+    assert not err_g
+    assert float(audit_g["sla"]["critical_path_hours"]) >= 350
+    _, delta_g = optimize_process_to_be(grid, audit_g)
+    assert delta_g.get("engine") == "semantic-optimizer"
+    assert float(delta_g.get("sla_saved_hours") or 0) > 50
+    assert float(delta_g["sla_before_hours"]) > float(delta_g["sla_after_hours"])
+
     print(
         "ok",
         f"steps={len(parsed.steps)}",
@@ -49,6 +67,7 @@ def main() -> None:
         f"rework={delta.get('rework_before')}→{delta.get('rework_after')}",
         f"docx={len(payload)}",
         f"engine={delta.get('engine')}",
+        f"grid={delta_g.get('sla_before_hours')}→{delta_g.get('sla_after_hours')}",
     )
 
 
