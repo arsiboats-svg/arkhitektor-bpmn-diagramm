@@ -20,10 +20,19 @@ import streamlit.components.v1 as components
 
 from ai_generator import (
     assistant_chat,
+    build_diagram_catalog,
+    build_canvas_copilot,
+    build_process_context,
     cloud_engine_status,
+    export_docx_passport,
     generate_bpmn_from_text,
     generate_process_passport,
+    generate_raci_matrix,
+    inspect_task_details,
     normalize_regulation,
+    optimize_process_to_be,
+    parse_bpmn_structure,
+    parse_regulation,
 )
 
 
@@ -53,6 +62,8 @@ DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (�
 DIAGRAM_HEIGHT_WIDE = 820  # в широком режиме
 VIEW_SPLIT = "🗂  Раздельный вид"
 VIEW_WIDE = "🖥  Широкий вид"
+ASIS_LABEL = "Текущий процесс (As-Is)"
+TOBE_LABEL = "Целевой оптимизированный (To-Be)"
 
 QUICK_PROMPTS = [
     ("🔍 Разбор узких мест SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
@@ -164,12 +175,18 @@ textarea {{ font-size:.9rem !important; line-height:1.45 !important; }}
 .ir-card .v {{ color:{BLUE_DARK}; font-size:2.05rem; font-weight:800; line-height:1.15; margin:4px 0; }}
 .ir-card .s {{ color:#455A64; font-size:.86rem; }}
 .pill {{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:.74rem; font-weight:700; color:#fff; background:var(--c); margin-top:8px; }}
-.bar-row {{ display:flex; align-items:center; gap:10px; margin:9px 0; font-size:.88rem; color:#37474F; }}
-.bar-row .n {{ width:190px; flex:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.bar-row .t {{ flex:1; background:#E8EEF7; border-radius:8px; height:14px; position:relative; overflow:hidden; }}
+.bar-row {{ display:grid; grid-template-columns: minmax(72px, 30%) minmax(48px, 1fr) auto; align-items:center; gap:8px 10px; margin:9px 0; font-size:.88rem; color:#37474F; }}
+.bar-row .n {{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.bar-row .t {{ background:#E8EEF7; border-radius:8px; height:14px; overflow:hidden; }}
 .bar-row .f {{ height:100%; border-radius:8px; background:linear-gradient(90deg,{BLUE},{BLUE_DARK}); }}
 .bar-row .f.hot {{ background:linear-gradient(90deg,#EF6C00,{BAD}); }}
-.bar-row .p {{ width:96px; text-align:right; flex:none; font-weight:700; color:{BLUE_DARK}; }}
+.bar-row .f.cool {{ background:linear-gradient(90deg,#81C784,{OK}); }}
+.bar-row .p {{ min-width:72px; text-align:right; font-weight:700; color:{BLUE_DARK}; white-space:nowrap; }}
+.bar-ok {{ display:inline-block; margin-left:6px; background:#E8F5E9; color:{OK}; border:1px solid #A5D6A7;
+    border-radius:999px; padding:0 7px; font-size:.68rem; font-weight:800; vertical-align:middle; }}
+.bar-delta {{ display:block; font-size:.72rem; font-weight:600; color:#78909C; }}
+.chip-path-tobe .chip {{ background:#E8F5E9; border-color:#A5D6A7; }}
+.chip-path-tobe .chip b {{ color:{OK}; }}
 .chip {{ display:inline-block; background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; border-radius:10px; padding:4px 10px; margin:3px 4px 3px 0; font-size:.8rem; }}
 .chip b {{ color:{BLUE}; }}
 .arrow {{ color:#90A4AE; margin-right:4px; }}
@@ -201,6 +218,34 @@ table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#26323
 .ir-toast {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; border-radius:12px; padding:10px 14px; font-weight:700; margin:8px 0 14px 0; }}
 .file-badge {{ background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; border-radius:12px; padding:8px 12px; font-size:.86rem; margin:8px 0 4px 0; }}
 .file-badge b {{ color:{BLUE}; }}
+.meth-row {{ display:flex; flex-wrap:wrap; gap:10px; margin:8px 0 14px 0; align-items:stretch; }}
+.meth-badge {{ flex:1; min-width:180px; background:#fff; border:1px solid #DCE6F3; border-radius:14px; padding:12px 14px; border-top:4px solid var(--c); }}
+.meth-badge .h {{ font-weight:800; color:{BLUE_DARK}; font-size:.92rem; }}
+.meth-badge .d {{ color:#546E7A; font-size:.8rem; margin-top:4px; }}
+.meth-score {{ background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); color:#fff; border-radius:16px; padding:16px 20px; min-width:160px; }}
+.meth-score .v {{ font-size:2.2rem; font-weight:800; line-height:1; }}
+.insp-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+.insp-card {{ background:#fff; border:1px solid #DCE6F3; border-radius:14px; padding:14px 16px; }}
+.insp-card h4 {{ margin:0 0 8px 0; color:{BLUE_DARK}; font-size:.92rem; }}
+.insp-card p, .insp-card li {{ color:#37474F; font-size:.9rem; margin:0; }}
+.insp-card ol {{ margin:0; padding-left:1.2rem; }}
+.insp-card li {{ margin:4px 0; }}
+.raci-wrap {{ overflow-x:auto; background:#fff; border:1px solid #DCE6F3; border-radius:16px; padding:8px 10px 12px 10px; }}
+table.raci {{ border-collapse:collapse; font-size:.82rem; width:100%; min-width:520px; }}
+table.raci th {{ background:{BLUE_DARK}; color:#fff; padding:8px 10px; text-align:left; font-weight:700; white-space:nowrap; }}
+table.raci td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#263238; vertical-align:middle; }}
+table.raci td.step {{ min-width:180px; font-weight:600; color:{BLUE_DARK}; }}
+table.raci td.cell {{ text-align:center; white-space:nowrap; }}
+.raci-b {{ display:inline-block; min-width:22px; height:22px; line-height:22px; text-align:center; border-radius:6px; font-weight:800; font-size:.72rem; color:#fff; margin:0 2px; padding:0 5px; }}
+.raci-b.R {{ background:{BLUE}; }} .raci-b.A {{ background:{OK}; }} .raci-b.C {{ background:{WARN}; }} .raci-b.I {{ background:#607D8B; }}
+.raci-legend {{ color:#546E7A; font-size:.82rem; margin:6px 0 10px 0; }}
+.tobe-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:8px 0 14px 0; }}
+.tobe-card {{ background:#E8F5E9; border:1px solid #A5D6A7; border-radius:16px; padding:14px 16px; color:#1B5E20; }}
+.tobe-card .k {{ font-size:.75rem; font-weight:800; letter-spacing:.4px; text-transform:uppercase; opacity:.8; }}
+.tobe-card .v {{ font-size:1.7rem; font-weight:800; line-height:1.15; margin:4px 0; }}
+.tobe-card .s {{ font-size:.84rem; }}
+.tobe-act {{ background:#fff; border:1px solid #DCE6F3; border-left:6px solid {OK}; border-radius:12px; padding:10px 14px; margin:6px 0; font-size:.92rem; color:#263238; }}
+@media (max-width: 900px) {{ .insp-grid {{ grid-template-columns:1fr; }} .tobe-grid {{ grid-template-columns:1fr; }} }}
 section[data-testid="stSidebar"] {{ background:#F7FBFF; }}
 section[data-testid="stSidebar"] .stMarkdown p {{ font-size:.92rem; }}
 </style>
@@ -237,9 +282,16 @@ def _bpmn_js_tags() -> Tuple[str, str]:
     return js_tag, css_tag
 
 
-def viewer_html(xml: str, height: int) -> str:
+def viewer_html(
+    xml: str,
+    height: int,
+    catalog: Optional[Dict[str, Any]] = None,
+    copilot: Optional[Dict[str, Any]] = None,
+) -> str:
     js_tag, css_tag = _bpmn_js_tags()
     payload = json.dumps(xml).replace("</", "<\\/")
+    catalog_js = json.dumps(catalog or {}, ensure_ascii=False).replace("</", "<\\/")
+    copilot_js = json.dumps(copilot or {}, ensure_ascii=False).replace("</", "<\\/")
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
@@ -256,7 +308,24 @@ def viewer_html(xml: str, height: int) -> str:
       border:1px solid #DCE6F3; border-radius:8px; padding:4px 10px; }}
   #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828; padding:24px; text-align:center; font-weight:600; }}
   .bjs-powered-by {{ opacity:.55; }}
-  /* Панорама: на весь монитор виден только холст + плавающая кнопка закрытия */
+  .djs-element.ir-selected .djs-visual > :nth-child(1) {{
+    stroke:#0D47A1 !important; stroke-width:4px !important;
+    filter:drop-shadow(0 0 7px rgba(13,71,161,.55));
+  }}
+  #tip {{
+    display:none; position:absolute; z-index:20; width:340px; max-width:calc(100% - 24px);
+    background:#fff; border:1px solid #90CAF9; border-left:6px solid #1565C0;
+    border-radius:14px; box-shadow:0 12px 32px rgba(0,51,102,.22); padding:12px 14px 14px 14px;
+    font-size:13px; color:#263238; line-height:1.4;
+  }}
+  #tip .x {{ position:absolute; top:8px; right:8px; border:0; background:#E3F2FD; color:#003366;
+      width:28px; height:28px; border-radius:8px; font-weight:800; cursor:pointer; }}
+  #tip .x:hover {{ background:#1565C0; color:#fff; }}
+  #tip .kind {{ color:#1565C0; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.4px; padding-right:28px; }}
+  #tip .name {{ color:#003366; font-weight:800; font-size:15px; margin:4px 0 8px 0; }}
+  #tip .meta {{ color:#455A64; margin:3px 0; }}
+  #tip .crit {{ display:none; margin:8px 0; background:#FFF3E0; color:#E65100; border-radius:8px; padding:5px 8px; font-weight:700; font-size:12px; }}
+  #tip .ai {{ margin-top:8px; background:#E8F1FB; border-radius:10px; padding:8px 10px; color:#0D47A1; }}
   #close {{ display:none; position:absolute; top:16px; right:16px; z-index:9; border:1px solid rgba(255,255,255,.55);
       background:rgba(0,51,102,.55); color:#fff; font-weight:700; font-size:14px; border-radius:12px; padding:9px 16px;
       cursor:pointer; backdrop-filter:blur(4px); opacity:.72; transition:opacity .15s, background .15s; }}
@@ -264,7 +333,53 @@ def viewer_html(xml: str, height: int) -> str:
   #wrap.pano {{ position:fixed; top:0; left:0; width:100vw; height:100vh !important; border:0; border-radius:0; z-index:999999; }}
   #wrap.pano .bar {{ display:none; }}
   #wrap.pano #close {{ display:block; }}
-  #wrap.pano .hint {{ opacity:.75; }}
+  #wrap.pano .hint {{ opacity:.75; left:12px; right:auto; max-width:calc(100% - 100px); }}
+  #ai-fab {{
+    position:absolute; bottom:24px; right:24px; z-index:1000001;
+    width:58px; height:58px; border:0; border-radius:50%;
+    background:linear-gradient(135deg,#003366,#1565C0); color:#fff; font-size:22px;
+    cursor:pointer; box-shadow:0 8px 22px rgba(0,51,102,.38);
+    display:flex; align-items:center; justify-content:center;
+    transition:transform .15s, box-shadow .15s;
+  }}
+  #ai-fab:hover {{ transform:scale(1.07); box-shadow:0 10px 28px rgba(21,101,192,.45); }}
+  #ai-fab span {{ font-size:11px; font-weight:800; display:none; }}
+  #wrap.ai-open #ai-fab {{ display:none; }}
+  #ai-drawer, #copilot-box {{
+    display:none; position:absolute; bottom:24px; right:24px; z-index:1000002;
+    width:380px; height:500px; max-width:calc(100% - 36px); max-height:calc(100% - 48px);
+    flex-direction:column; overflow:hidden;
+    background:rgba(255,255,255,.93); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+    border:1px solid #90CAF9; border-radius:18px;
+    box-shadow:0 16px 40px rgba(0,51,102,.28);
+  }}
+  #wrap.ai-open #ai-drawer, #wrap.ai-open #copilot-box {{ display:flex; }}
+  #ai-drawer .ai-head, #copilot-box .ai-head {{
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:12px 14px; color:#fff; font-weight:800; font-size:14px;
+    background:linear-gradient(105deg,#003366,#1565C0);
+  }}
+  #ai-min {{ border:0; background:rgba(255,255,255,.18); color:#fff; border-radius:10px;
+      padding:5px 10px; font-weight:700; cursor:pointer; font-size:12px; }}
+  #ai-min:hover {{ background:rgba(255,255,255,.32); }}
+  #ai-chips {{ display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px 6px 12px; }}
+  #ai-chips button {{
+    border:1px solid #90CAF9; background:#E3F2FD; color:#003366; border-radius:999px;
+    padding:5px 10px; font-size:12px; font-weight:700; cursor:pointer;
+  }}
+  #ai-chips button:hover {{ background:#1565C0; color:#fff; border-color:#1565C0; }}
+  #ai-log, #copilot-messages, .copilot-messages {{
+    flex:1; min-height:0; overflow-y:auto !important; max-height:380px;
+    padding:4px 12px 10px 12px; font-size:13px; line-height:1.45; overscroll-behavior:contain;
+  }}
+  #ai-log .msg, #copilot-messages .msg {{ margin:8px 0; padding:8px 10px; border-radius:12px; max-width:95%; }}
+  #ai-log .u, #copilot-messages .u {{ background:#E3F2FD; color:#003366; margin-left:18%; }}
+  #ai-log .a, #copilot-messages .a {{ background:#F4F8FD; border:1px solid #DCE6F3; color:#263238; }}
+  #ai-form {{ display:flex; gap:6px; padding:10px 12px 12px 12px; border-top:1px solid #DCE6F3; background:rgba(255,255,255,.7); }}
+  #ai-in {{ flex:1; border:1px solid #90CAF9; border-radius:10px; padding:8px 10px; font-size:13px; outline:none; }}
+  #ai-send {{ border:0; border-radius:10px; width:40px; background:linear-gradient(135deg,#003366,#1565C0);
+      color:#fff; font-weight:800; cursor:pointer; }}
+  .inspector-card {{ overflow-y:auto !important; max-height:min(380px, 70vh); overscroll-behavior:contain; }}
 </style></head>
 <body>
 <div id="wrap">
@@ -275,26 +390,98 @@ def viewer_html(xml: str, height: int) -> str:
   </div>
   <button id="close" title="Закрыть панораму (Esc)">✕ Закрыть панораму</button>
   <div id="canvas"></div><div id="err"></div>
+  <div id="tip" class="inspector-card">
+    <button class="x" id="tip-x" title="Закрыть">✕</button>
+    <div class="kind" id="t-kind"></div>
+    <div class="name" id="t-name"></div>
+    <div class="meta" id="t-role"></div>
+    <div class="crit" id="t-crit">⚡ На критическом пути SLA</div>
+    <div class="ai" id="t-ai"></div>
+  </div>
   <div class="hint" id="hint"></div>
+  <button type="button" id="ai-fab" title="AI-Ассистент процесса">💬</button>
+  <div id="copilot-box" class="copilot-box" aria-hidden="true">
+    <div class="ai-head"><div>💬 AI-Ассистент процесса</div><button type="button" id="ai-min">✕ Свернуть</button></div>
+    <div id="ai-chips"></div>
+    <div id="copilot-messages" class="copilot-messages"></div>
+    <form id="ai-form" autocomplete="off">
+      <input id="ai-in" placeholder="Спросите про SLA, To-Be, роли…" maxlength="400">
+      <button type="submit" id="ai-send" title="Отправить">➤</button>
+    </form>
+  </div>
 </div>
 {js_tag}
 <script>
   const XML = {payload};
+  const CATALOG = {catalog_js};
+  const COPILOT = {copilot_js};
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
   const wrap = document.getElementById('wrap');
   const hint = document.getElementById('hint');
-  const HINT_NORMAL = 'Перетаскивание — панорама · Ctrl + колесо / кнопки ＋ － — масштаб';
+  const tip = document.getElementById('tip');
+  const HINT_NORMAL = 'Клик по блоку — карточка · 💬 AI в углу · Ctrl + колесо — масштаб';
   const HINT_PANO = 'Перетаскивание — перемещение · колесо — масштаб · Esc — закрыть панораму';
   hint.textContent = HINT_NORMAL;
 
   function fit() {{ try {{ canvas().zoom('fit-viewport', 'auto'); }} catch (e) {{}} }}
-  // размеры контейнера меняются не мгновенно: вписываем сразу и после перерисовки/анимации
   function fitSoon() {{ fit(); requestAnimationFrame(fit); setTimeout(fit, 120); setTimeout(fit, 350); }}
   {EMPHASIZE_JS}
-  viewer.importXML(XML).then(() => {{ emphasizeSubprocessTitles(); fit(); }}).catch(e => {{
+
+  let selectedId = null;
+  const IGNORE = /bpmn:(Process|Participant|Lane|Collaboration|Group|TextAnnotation|Association|SequenceFlow|DataObject|DataStoreReference|label)/i;
+  function resolveEl(el) {{
+    if (!el) return null;
+    if (el.type === 'label' || (el.businessObject && el.labelTarget)) return el.labelTarget || el;
+    return el;
+  }}
+  function clearPick() {{
+    if (selectedId) {{ try {{ canvas().removeMarker(selectedId, 'ir-selected'); }} catch (e) {{}} }}
+    selectedId = null;
+    tip.style.display = 'none';
+  }}
+  function placeTip(evt) {{
+    const x = (evt && evt.clientX) || 24;
+    const y = (evt && evt.clientY) || 24;
+    const pad = 12, w = tip.offsetWidth || 340, h = tip.offsetHeight || 180;
+    tip.style.left = Math.max(pad, Math.min(x + 14, wrap.clientWidth - w - pad)) + 'px';
+    tip.style.top = Math.max(pad, Math.min(y + 14, wrap.clientHeight - h - pad)) + 'px';
+  }}
+  function showPick(el, evt) {{
+    const id = el.id;
+    const meta = CATALOG[id] || {{
+      name: (el.businessObject && el.businessObject.name) || id,
+      type: (el.type || '').replace('bpmn:', ''),
+      role: '—',
+      critical: false,
+      comment: 'Нет карточки аудита для этого узла — откройте операционный инспектор под диаграммой.'
+    }};
+    clearPick();
+    selectedId = id;
+    try {{ canvas().addMarker(id, 'ir-selected'); }} catch (e) {{}}
+    document.getElementById('t-kind').textContent = meta.type || '';
+    document.getElementById('t-name').textContent = meta.name || '';
+    document.getElementById('t-role').textContent = 'Роль: ' + (meta.role || '—');
+    document.getElementById('t-crit').style.display = meta.critical ? 'block' : 'none';
+    document.getElementById('t-ai').textContent = meta.comment || '';
+    tip.style.display = 'block';
+    placeTip(evt);
+  }}
+  viewer.importXML(XML).then(() => {{
+    emphasizeSubprocessTitles();
+    fit();
+    viewer.get('eventBus').on('element.click', function(e) {{
+      const el = resolveEl(e.element);
+      const t = (el && el.type) || '';
+      if (!el || IGNORE.test(t) || t === 'label') {{ clearPick(); return; }}
+      if (!/Task|Gateway|Event|SubProcess/i.test(t)) {{ clearPick(); return; }}
+      showPick(el, e.originalEvent);
+    }});
+  }}).catch(e => {{
     const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
   }});
+  document.getElementById('tip-x').onclick = ev => {{ ev.stopPropagation(); clearPick(); }};
+  tip.addEventListener('mousedown', ev => ev.stopPropagation());
   const zoomBy = k => canvas().zoom(canvas().zoom() * k, 'auto');
   document.getElementById('zin').onclick = () => zoomBy(1.25);
   document.getElementById('zout').onclick = () => zoomBy(0.8);
@@ -357,18 +544,105 @@ def viewer_html(xml: str, height: int) -> str:
   document.addEventListener('webkitfullscreenchange', onFsChange);
   document.getElementById('full').onclick = enterPanorama;
   document.getElementById('close').onclick = exitPanorama;
-  const onKey = e => {{ if (e.key === 'Escape' && panoMode) exitPanorama(); }};
+  const onKey = e => {{
+    if (e.key === 'Escape') {{
+      if (wrap.classList.contains('ai-open')) {{ setCopilot(false); e.stopPropagation(); return; }}
+      if (tip.style.display === 'block') {{ clearPick(); if (!panoMode) e.stopPropagation(); }}
+      if (panoMode) exitPanorama();
+    }}
+  }};
   document.addEventListener('keydown', onKey);
   if (parentDoc) parentDoc.addEventListener('keydown', onKey);   // Esc, когда фокус вне iframe (режим оверлея)
 
   // В панораме колесо мышки = зум вокруг курсора (в обычном режиме — как у bpmn-js: Ctrl + колесо)
+  // В панораме колесо = зум, кроме оверлеев (чат, тултип инспектора) — там нативный скролл.
+  const overlaySel = '#copilot-box, #copilot-messages, #ai-drawer, #ai-log, #tip, .copilot-box, .copilot-messages, .inspector-card, #ai-form, #ai-chips, #ai-fab';
   wrap.addEventListener('wheel', e => {{
     if (!wrap.classList.contains('pano')) return;
+    const hit = e.target && e.target.closest && e.target.closest(overlaySel);
+    if (hit) return;
     e.preventDefault(); e.stopPropagation();
     const r = document.getElementById('canvas').getBoundingClientRect();
     const scale = Math.min(6, Math.max(0.03, canvas().zoom() * Math.exp(-e.deltaY * 0.0016)));
     canvas().zoom(scale, {{ x: e.clientX - r.left, y: e.clientY - r.top }});
   }}, {{ capture: true, passive: false }});
+
+  // ---------------- Плавающий AI-ассистент (обычный вид и панорама) ----------------
+  const drawer = document.getElementById('copilot-box') || document.getElementById('ai-drawer');
+  const logEl = document.getElementById('copilot-messages') || document.getElementById('ai-log');
+  const chipsEl = document.getElementById('ai-chips');
+  const inputEl = document.getElementById('ai-in');
+  function mdLite(s) {{
+    return String(s || '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/\\*\\*(.+?)\\*\\*/g,'<b>$1</b>')
+      .replace(/\\n/g,'<br>');
+  }}
+  function addMsg(role, text) {{
+    const d = document.createElement('div');
+    d.className = 'msg ' + (role === 'user' ? 'u' : 'a');
+    d.innerHTML = mdLite(text);
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+  }}
+  function chipBy(id) {{
+    return ((COPILOT.chips || []).find(c => c.id === id) || {{}}).a;
+  }}
+  function copilotAnswer(msg) {{
+    const q = (msg || '').trim();
+    if (!q) return 'Напишите вопрос о процессе — SLA, сравнение As-Is/To-Be, роли или читаемость.';
+    const low = q.toLowerCase();
+    const chips = COPILOT.chips || [];
+    const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
+    if (exact) return exact.a;
+    if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев/.test(low))
+      return chipBy('tobe') || COPILOT.compare || COPILOT.fallback;
+    if (/читаем|метро|нотаци|подпроцесс|линтер|методолог|quality|анти-метро/.test(low))
+      return COPILOT.readability || chipBy('tobe') || COPILOT.fallback;
+    if (/ускор|оптимиз|сократ|быстрее|параллел/.test(low)) return chipBy('speed') || COPILOT.fallback;
+    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) return chipBy('sla') || COPILOT.fallback;
+    if (/цикл|возврат|доработ|rework/.test(low)) return COPILOT.loops || COPILOT.fallback;
+    if (/систем|it\b|ит-|документ|ландшафт/.test(low)) return COPILOT.landscape || COPILOT.fallback;
+    if (/роль|нагруз|bus|риск|исполнител|диспетчер|загруж/.test(low)) return chipBy('roles') || COPILOT.fallback;
+    return COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — тогда отвечу по метрикам.';
+  }}
+  function ask(text) {{
+    const q = (text || '').trim();
+    if (!q) return;
+    addMsg('user', q);
+    addMsg('assistant', copilotAnswer(q));
+    inputEl.value = '';
+  }}
+  function setCopilot(on) {{
+    wrap.classList.toggle('ai-open', on);
+    drawer.setAttribute('aria-hidden', on ? 'false' : 'true');
+    if (on) {{
+      try {{ clearPick(); }} catch (e) {{}}
+      if (!logEl.childElementCount && COPILOT.greeting) addMsg('assistant', COPILOT.greeting);
+      setTimeout(() => inputEl.focus(), 30);
+    }}
+  }}
+  (COPILOT.chips || []).forEach(c => {{
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = c.label;
+    b.onclick = () => {{ setCopilot(true); ask(c.q); }};
+    chipsEl.appendChild(b);
+  }});
+  document.getElementById('ai-fab').onclick = ev => {{ ev.stopPropagation(); setCopilot(true); }};
+  document.getElementById('ai-min').onclick = ev => {{ ev.stopPropagation(); setCopilot(false); }};
+  document.getElementById('ai-form').onsubmit = ev => {{ ev.preventDefault(); ask(inputEl.value); }};
+  drawer.addEventListener('mousedown', ev => ev.stopPropagation());
+  drawer.addEventListener('click', ev => ev.stopPropagation());
+  const stopScroll = e => e.stopPropagation();
+  document.getElementById('copilot-box')?.addEventListener('wheel', stopScroll, {{ capture: true, passive: false }});
+  document.getElementById('copilot-messages')?.addEventListener('wheel', stopScroll, {{ capture: true, passive: false }});
+  document.getElementById('ai-drawer')?.addEventListener('wheel', stopScroll, {{ capture: true, passive: false }});
+  document.getElementById('ai-log')?.addEventListener('wheel', stopScroll, {{ capture: true, passive: false }});
+  document.querySelectorAll('.inspector-card, .copilot-box, .copilot-messages').forEach(el => {{
+    el.addEventListener('wheel', stopScroll, {{ capture: true, passive: false }});
+  }});
+  document.getElementById('ai-fab').addEventListener('mousedown', ev => ev.stopPropagation());
 </script></body></html>
 """
 
@@ -426,6 +700,96 @@ def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
     )
 
 
+def _bus_threshold(bus: Optional[Dict[str, Any]]) -> float:
+    try:
+        return float((bus or {}).get("threshold") or 0.45)
+    except (TypeError, ValueError):
+        return 0.45
+
+
+def _share_by_role(lane_load: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+    return {str(it.get("role") or ""): float(it.get("share") or 0) for it in (lane_load or []) if it.get("role")}
+
+
+def lane_load_html(
+    lane_load: Optional[List[Dict[str, Any]]],
+    bus_factor: Optional[Dict[str, Any]] = None,
+    prev_load: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Прогресс-бары нагрузки ролей. Зелёный — роль вышла из красной зоны > порога bus-factor."""
+    threshold = _bus_threshold(bus_factor)
+    prev = _share_by_role(prev_load)
+    compare = bool(prev)
+    rows: List[str] = []
+    for item in sorted(lane_load or [], key=lambda it: -float(it.get("share") or 0)):
+        share = float(item.get("share") or 0)
+        role = str(item.get("role") or "")
+        was = prev.get(role)
+        relieved = compare and was is not None and was > threshold and share <= threshold
+        klass = "cool" if relieved else ("hot" if share > threshold else "")
+        delta_bits = []
+        if compare and was is not None and abs(was - share) >= 0.005:
+            delta_bits.append(f"было {was:.0%}")
+        if relieved:
+            delta_bits.append('<span class="bar-ok">разгружена</span>')
+        delta = f'<span class="bar-delta">{" · ".join(delta_bits)}</span>' if delta_bits else ""
+        rows.append(
+            f'<div class="bar-row"><div class="n" title="{esc(role)}">{esc(role)}</div>'
+            f'<div class="t"><div class="f {klass}" style="width:{min(share, 1) * 100:.0f}%"></div></div>'
+            f'<div class="p">{share:.0%} · {int(item.get("tasks") or 0)} шаг.{delta}</div></div>'
+        )
+    return "".join(rows) or '<div class="land-empty">Нет данных о нагрузке ролей.</div>'
+
+
+def critical_path_html(critical_path: Optional[List[Dict[str, Any]]]) -> str:
+    """Цепочка чипов критического пути: часы шага и стрелки Беллмана — Форда."""
+    chips: List[str] = []
+    for i, item in enumerate(critical_path or []):
+        arrow = '<span class="arrow">→</span>' if i else ""
+        name = str(item.get("name") or "")
+        name = name if len(name) <= 42 else name[:41] + "…"
+        chips.append(
+            f'{arrow}<span class="chip" title="{esc(item.get("role") or "")}">'
+            f'<b>{fmt_hours(float(item.get("hours") or 0))}</b> · {esc(name)}</span>'
+        )
+    return "".join(chips) or "—"
+
+
+def render_load_and_path(
+    audit: Dict[str, Any],
+    *,
+    load_title: str = "Нагрузка по ролям (доля шагов процесса)",
+    path_title: str = "Критический путь (алгоритм Беллмана — Форда)",
+    prev_audit: Optional[Dict[str, Any]] = None,
+    load_caption: str = "",
+    path_caption: str = "",
+    path_variant: str = "",
+) -> None:
+    """Двухколоночный блок: нагрузка ролей слева, критический путь справа."""
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown(f'<div class="ir-title">{load_title}</div>', unsafe_allow_html=True)
+        if load_caption:
+            st.caption(load_caption)
+        st.markdown(
+            lane_load_html(
+                audit.get("lane_load") or [],
+                audit.get("bus_factor") or {},
+                (prev_audit or {}).get("lane_load") if prev_audit else None,
+            ),
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(f'<div class="ir-title">{path_title}</div>', unsafe_allow_html=True)
+        if path_caption:
+            st.caption(path_caption)
+        wrap = "chip-path-tobe" if path_variant == "tobe" else ""
+        st.markdown(
+            f'<div class="{wrap}">{critical_path_html(audit.get("critical_path") or [])}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 def _landscape_chips(items: List[Dict[str, Any]], css: str, icon: str) -> str:
     chips = []
     for it in items:
@@ -453,8 +817,86 @@ def render_landscape(audit: Dict[str, Any]) -> None:
     )
 
 
+def render_methodology(audit: Dict[str, Any]) -> None:
+    """Блок «Методологический контроль BPMN 2.0» — бейджи проверок и балл качества."""
+    meth = audit.get("methodology") if isinstance(audit.get("methodology"), dict) else {}
+    if not meth:
+        return
+    score = int(meth.get("score") or 0)
+    color = OK if score >= 85 else (WARN if score >= 65 else BAD)
+    st.markdown('<div class="ir-title" style="margin-top:8px">Методологический контроль BPMN 2.0</div>', unsafe_allow_html=True)
+    badges = [
+        f'<div class="meth-score" style="background:linear-gradient(105deg,{color},{BLUE})">'
+        f'<div class="k" style="opacity:.85;font-size:.75rem;letter-spacing:.5px">QUALITY SCORE</div>'
+        f'<div class="v">{score}%</div>'
+        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">интегральная оценка модели</div></div>'
+    ]
+    for chk in meth.get("checks") or []:
+        passed = bool(chk.get("passed"))
+        c = OK if passed else BAD
+        mark = "✓" if passed else "✗"
+        findings = chk.get("findings") or []
+        extra = f"<br>{esc(findings[0])}" if findings and not passed else ""
+        badges.append(
+            f'<div class="meth-badge" style="--c:{c}"><div class="h">{mark} {esc(chk.get("title"))}</div>'
+            f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
+        )
+    st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
+    with st.expander("Детали проверок нотации"):
+        for chk in meth.get("checks") or []:
+            st.markdown(f"**{chk.get('title')}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
+            for fnd in chk.get("findings") or []:
+                st.markdown(f"- {fnd}")
+
+
+def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
+    """🔍 Операционный инспектор задачи — карточка рабочего регламента по выбранному шагу."""
+    st.markdown('<div class="ir-section">🔍 Операционный инспектор задачи</div>', unsafe_allow_html=True)
+    st.caption("Выберите шаг схемы — квалификацию исполнителя, порядок действий, СИЗ и результат.")
+    try:
+        struct = parse_bpmn_structure(xml)
+    except Exception:  # noqa: BLE001
+        st.info("Не удалось разобрать схему для инспектора.")
+        return
+    tasks = sorted(
+        (
+            n
+            for n in (struct.get("nodes") or {}).values()
+            if n.get("type") in ("task", "userTask", "scriptTask") and (n.get("name") or "").strip()
+        ),
+        key=lambda n: (float(n.get("x") or 0), float(n.get("y") or 0)),
+    )
+    if not tasks:
+        st.info("В схеме нет именованных задач.")
+        return
+    labels = [f"{n['name']}  ·  {n.get('lane') or '—'}" for n in tasks]
+    choice = st.selectbox("Задача текущей схемы", labels, key="inspector_choice")
+    if not choice:
+        return
+    node = tasks[labels.index(choice)]
+    ctx = build_process_context(text, xml, audit)
+    cache = st.session_state.setdefault("inspector_cache", {})
+    cache_key = f"{node['name']}|{node.get('lane') or ''}"
+    if cache_key not in cache:
+        with st.spinner("Собираем операционную карточку…"):
+            cache[cache_key] = inspect_task_details(str(node["name"]), str(node.get("lane") or ""), ctx)
+    card_data = cache[cache_key]
+    steps_html = "".join(f"<li>{esc(s)}</li>" for s in (card_data.get("procedure_steps") or []))
+    st.markdown(
+        f'<div class="insp-grid">'
+        f'<div class="insp-card"><h4>Квалификация и допуск</h4><p>{esc(card_data.get("role_requirements"))}</p></div>'
+        f'<div class="insp-card"><h4>СИЗ, приборы и системы</h4><p>{esc(card_data.get("safety_and_tools"))}</p></div>'
+        f'<div class="insp-card"><h4>Порядок действий</h4><ol>{steps_html}</ol></div>'
+        f'<div class="insp-card"><h4>Вход / выход</h4><p><b>Основание:</b> {esc(card_data.get("input_trigger"))}</p>'
+        f'<p style="margin-top:8px"><b>Результат:</b> {esc(card_data.get("output_artifact"))}</p></div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_audit(audit: Dict[str, Any]) -> None:
     st.markdown('<div class="ir-section">Аудит бизнес-архитектуры</div>', unsafe_allow_html=True)
+    render_methodology(audit)
     bus = audit["bus_factor"]
     sla = audit["sla"]
     loops: List[Dict[str, Any]] = audit["rework_loops"]
@@ -510,28 +952,7 @@ def render_audit(audit: Dict[str, Any]) -> None:
     )
 
     st.write("")
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.markdown('<div class="ir-title">Нагрузка по ролям (доля шагов процесса)</div>', unsafe_allow_html=True)
-        rows = []
-        for item in sorted(audit["lane_load"], key=lambda it: -float(it["share"])):
-            share = float(item["share"])
-            hot = "hot" if share > float(bus["threshold"]) else ""
-            rows.append(
-                f'<div class="bar-row"><div class="n" title="{esc(item["role"])}">{esc(item["role"])}</div>'
-                f'<div class="t"><div class="f {hot}" style="width:{min(share, 1) * 100:.0f}%"></div></div>'
-                f'<div class="p">{share:.0%} · {int(item["tasks"])} шаг.</div></div>'
-            )
-        st.markdown("".join(rows), unsafe_allow_html=True)
-    with right:
-        st.markdown('<div class="ir-title">Критический путь (алгоритм Беллмана — Форда)</div>', unsafe_allow_html=True)
-        chips = []
-        for i, item in enumerate(audit["critical_path"]):
-            arrow = '<span class="arrow">→</span>' if i else ""
-            name = str(item["name"])
-            name = name if len(name) <= 42 else name[:41] + "…"
-            chips.append(f'{arrow}<span class="chip" title="{esc(item["role"])}"><b>{fmt_hours(float(item["hours"]))}</b> · {esc(name)}</span>')
-        st.markdown("".join(chips) or "—", unsafe_allow_html=True)
+    render_load_and_path(audit)
 
     if loops:
         st.markdown('<div class="ir-title" style="margin-top:14px">Циклы возврата на доработку</div>', unsafe_allow_html=True)
@@ -607,6 +1028,9 @@ def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None
         time.sleep(0.2)
         progress.empty()
     st.session_state["result"] = {"xml": xml, "audit": audit, "error": error}
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+    st.session_state.pop("tobe_pack", None)
 
 
 def on_example_change() -> None:
@@ -622,6 +1046,9 @@ def on_example_change() -> None:
         st.session_state["file_stem"] = re.sub(r"[^\w.\-]+", "_", stem, flags=re.U) or "custom_process"
     st.session_state["chat_messages"] = []
     st.session_state.pop("diagram_updated_by_assistant", None)
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+    st.session_state.pop("tobe_pack", None)
 
 
 def _read_txt_bytes(data: bytes) -> str:
@@ -720,14 +1147,18 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
     st.session_state.pop("diagram_updated_by_assistant", None)
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+    st.session_state.pop("tobe_pack", None)
 
 
 def render_downloads(key: str) -> None:
-    """Скачивание: BPMN 2.0, SVG-картинка и Паспорт процесса (.md) — три равные колонки."""
+    """Скачивание: BPMN 2.0, SVG, Паспорт (.md) и официальный регламент (.docx)."""
     result = st.session_state.get("result")
     ok = bool(result and not result["error"])
     stem = st.session_state.get("file_stem", "process")
     passport = ""
+    docx_bytes = b""
     if ok:
         try:
             passport = generate_process_passport(
@@ -737,7 +1168,15 @@ def render_downloads(key: str) -> None:
             )
         except Exception:  # noqa: BLE001 — кнопка просто недоступна, UI не падает
             passport = ""
-    col_bpmn, col_svg, col_pass = st.columns(3, gap="small")
+        try:
+            docx_bytes = export_docx_passport(
+                result.get("xml") or "",
+                result.get("audit") or {},
+                st.session_state.get("reg_text") or "",
+            )
+        except Exception:  # noqa: BLE001
+            docx_bytes = b""
+    col_bpmn, col_svg, col_pass, col_docx = st.columns(4, gap="small")
     with col_bpmn:
         st.download_button(
             "⬇️  Скачать .bpmn",
@@ -765,6 +1204,232 @@ def render_downloads(key: str) -> None:
             disabled=not (ok and bool(passport)),
             key=f"dl_passport_{key}",
         )
+    with col_docx:
+        st.download_button(
+            "⬇️  Скачать регламент (.docx)",
+            data=docx_bytes or b"",
+            file_name=f"{stem}_reglament.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            disabled=not (ok and bool(docx_bytes)),
+            key=f"dl_docx_{key}",
+        )
+
+
+def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
+    """Строит (и кэширует) целевой процесс To-Be для активного As-Is."""
+    result = st.session_state.get("result")
+    if not result or result.get("error"):
+        return None
+    src = result.get("xml") or ""
+    cached = st.session_state.get("tobe_pack")
+    if cached and cached.get("source_xml") == src:
+        return cached
+    text = st.session_state.get("reg_text") or ""
+    with st.spinner("Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация…"):
+        opt_text, delta = optimize_process_to_be(text, result.get("audit") or {})
+    xml = str((delta or {}).get("tobe_xml") or "")
+    audit = (delta or {}).get("tobe_audit") or {}
+    err = str((delta or {}).get("tobe_error") or "")
+    if not xml:
+        xml, audit, err = generate_bpmn_from_text(opt_text, use_llm=False)
+    pack = {
+        "source_xml": src,
+        "text": opt_text,
+        "delta": delta or {},
+        "xml": xml,
+        "audit": audit,
+        "error": err,
+    }
+    st.session_state["tobe_pack"] = pack
+    return pack
+
+
+def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
+    """XML / аудит / текст схемы, которая сейчас на холсте."""
+    result = st.session_state.get("result") or {}
+    asis_xml = result.get("xml") or ""
+    asis_audit = result.get("audit") or {}
+    asis_text = st.session_state.get("reg_text") or ""
+    if st.session_state.get("canvas_variant") != TOBE_LABEL:
+        return asis_xml, asis_audit, asis_text
+    pack = st.session_state.get("tobe_pack") or {}
+    if pack.get("xml") and not pack.get("error"):
+        return pack["xml"], pack.get("audit") or asis_audit, pack.get("text") or asis_text
+    return asis_xml, asis_audit, asis_text
+
+
+def render_tobe_tab() -> None:
+    st.markdown('<div class="ir-section">Оптимизация As-Is → To-Be</div>', unsafe_allow_html=True)
+    st.caption("Переключатель над холстом меняет схему: текущий процесс или целевой To-Be. Карточка — эффект реинжиниринга.")
+    pack = ensure_tobe_pack()
+    if not pack:
+        st.info("Сначала сгенерируйте диаграмму As-Is.")
+        return
+    delta = pack.get("delta") or {}
+    if pack.get("error") and not pack.get("xml"):
+        st.warning(f"Целевую диаграмму построить не удалось: {pack['error']}")
+    saved_h = max(0.0, float(delta.get("sla_saved_hours") or 0))
+    before_h = max(0.0, float(delta.get("sla_before_hours") or 0))
+    after_h = max(0.0, float(delta.get("sla_after_hours") or 0))
+    if after_h > before_h:
+        saved_h = 0.0
+    saved_pct = round(100.0 * saved_h / before_h, 1) if before_h and saved_h > 0 else 0.0
+    removed = int(delta.get("rework_removed") or 0)
+    q_gain = int(delta.get("quality_gain") or 0)
+    if saved_h >= 1.0 / 60.0:
+        eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
+        eco_sub = f"{fmt_hours(before_h)} → {fmt_hours(after_h)}"
+    else:
+        eco_value = "Без ускорения"
+        eco_sub = f"{fmt_hours(before_h)} → {fmt_hours(after_h)}" if before_h or after_h else "—"
+    st.markdown(
+        f'<div class="tobe-grid">'
+        f'<div class="tobe-card"><div class="k">Экономия SLA</div>'
+        f'<div class="v">{esc(eco_value)}</div>'
+        f'<div class="s">{esc(eco_sub)}</div></div>'
+        f'<div class="tobe-card"><div class="k">Циклы доработки</div>'
+        f'<div class="v">{int(delta.get("rework_before") or 0)} → {int(delta.get("rework_after") or 0)}</div>'
+        f'<div class="s">устранено петель: {removed}</div></div>'
+        f'<div class="tobe-card"><div class="k">Качество нотации</div>'
+        f'<div class="v">+{q_gain} п.п.</div>'
+        f'<div class="s">{int(delta.get("quality_before") or 0)}% → {int(delta.get("quality_after") or 0)}%</div></div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    engine = delta.get("engine") or "semantic-optimizer"
+    st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
+    st.markdown('<div class="ir-title" style="margin-top:8px">Применённые мероприятия</div>', unsafe_allow_html=True)
+    for act in delta.get("actions") or []:
+        st.markdown(f'<div class="tobe-act">{esc(act.get("detail") or act.get("kind"))}</div>', unsafe_allow_html=True)
+
+    asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
+    tobe_audit = pack.get("audit") or {}
+    if tobe_audit.get("lane_load") or tobe_audit.get("critical_path"):
+        asis_bus = asis_audit.get("bus_factor") or {}
+        tobe_bus = tobe_audit.get("bus_factor") or {}
+        threshold = _bus_threshold(tobe_bus or asis_bus)
+        prev_shares = _share_by_role(asis_audit.get("lane_load") or [])
+        relieved = [
+            str(item.get("role") or "")
+            for item in (tobe_audit.get("lane_load") or [])
+            if prev_shares.get(str(item.get("role") or ""), 0) > threshold
+            and float(item.get("share") or 0) <= threshold
+        ]
+        before_share = float(asis_bus.get("max_share") or 0)
+        after_share = float(tobe_bus.get("max_share") or 0)
+        load_bits = []
+        if before_share or after_share:
+            load_bits.append(f"Bus-factor {before_share:.0%} → {after_share:.0%}")
+        if relieved:
+            load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
+        elif tobe_bus.get("status") == "ok":
+            load_bits.append("нагрузка сбалансирована")
+        asis_path = asis_audit.get("critical_path") or []
+        tobe_path = tobe_audit.get("critical_path") or []
+        asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
+        tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
+        shortened = len(tobe_path) < len(asis_path) or tobe_cp + 1e-6 < asis_cp
+        path_label = "Цепочка спрямилась" if shortened else "Критический путь"
+        path_cap = (
+            f"{path_label}: {len(asis_path)} шагов / {fmt_hours(asis_cp)}"
+            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}"
+        )
+        render_load_and_path(
+            tobe_audit,
+            load_title="Новое распределение нагрузки по ролям в To-Be",
+            path_title="Новый критический путь To-Be (Беллман — Форд)",
+            prev_audit=asis_audit,
+            load_caption=" · ".join(load_bits),
+            path_caption=path_cap,
+            path_variant="tobe",
+        )
+
+    st.write("")
+    stem = st.session_state.get("file_stem", "process")
+    tobe_xml = pack.get("xml") or ""
+    st.download_button(
+        "⬇️  Скачать To-Be .bpmn",
+        data=tobe_xml,
+        file_name=f"{stem}_tobe.bpmn",
+        mime="application/xml",
+        disabled=not bool(tobe_xml),
+        key="dl_tobe_bpmn",
+    )
+    with st.expander("Целевой текст регламента To-Be"):
+        st.code(pack.get("text") or "", language="text")
+
+
+def render_raci_tab(xml: str, audit: Dict[str, Any], text: str) -> None:
+    st.markdown('<div class="ir-section">Матрица ответственности RACI</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="raci-legend">'
+        '<span class="raci-b R" title="Responsible">R</span> исполнитель · '
+        '<span class="raci-b A" title="Accountable">A</span> итоговая ответственность · '
+        '<span class="raci-b C" title="Consulted">C</span> консультирует · '
+        '<span class="raci-b I" title="Informed">I</span> уведомляется'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    try:
+        parsed = parse_regulation(normalize_regulation(text)) if text.strip() else None
+    except Exception:  # noqa: BLE001
+        parsed = None
+    steps = list(parsed.steps) if parsed else []
+    roles = list(parsed.roles) if parsed else [str(x.get("role") or "") for x in (audit.get("lane_load") or [])]
+    if not steps:
+        ctx = build_process_context(text, xml, audit)
+        steps = ctx.get("steps") or []
+        roles = roles or _roles_from_audit(audit, steps)
+    if not steps:
+        st.info("Не удалось собрать шаги процесса для матрицы.")
+        return
+    if not roles:
+        roles = _roles_from_audit(audit, steps)
+    matrix = generate_raci_matrix(steps, roles)
+    head = "".join(f"<th>{esc(r)}</th>" for r in roles)
+    body_rows = []
+    for item in matrix:
+        cells = []
+        for role in roles:
+            letters = (item.get("assignments") or {}).get(role) or []
+            if not letters:
+                cells.append("<td class='cell'>—</td>")
+                continue
+            badges = "".join(
+                f'<span class="raci-b {esc(lt)}" title="{esc(_raci_tip(lt, role))}">{esc(lt)}</span>'
+                for lt in letters
+            )
+            cells.append(f"<td class='cell'>{badges}</td>")
+        body_rows.append(
+            f"<tr><td>{esc(item.get('num'))}</td><td class='step'>{esc(item.get('title'))}</td>{''.join(cells)}</tr>"
+        )
+    st.markdown(
+        "<div class='raci-wrap'><table class='raci'><tr><th>№</th><th>Шаг</th>"
+        + head
+        + "</tr>"
+        + "".join(body_rows)
+        + "</table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _roles_from_audit(audit: Dict[str, Any], steps: List[Any]) -> List[str]:
+    roles = [str(x.get("role") or "") for x in (audit.get("lane_load") or []) if x.get("role")]
+    for s in steps:
+        role = s.role if hasattr(s, "role") else (s.get("role") if isinstance(s, dict) else "")
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def _raci_tip(letter: str, role: str) -> str:
+    titles = {
+        "R": f"Responsible — {role} исполняет шаг",
+        "A": f"Accountable — {role} несёт итоговую ответственность",
+        "C": f"Consulted — {role} консультирует на развилке",
+        "I": f"Informed — {role} получает уведомление",
+    }
+    return titles.get(letter, letter)
 
 
 def render_input_panel(labels: List[str], compact: bool = False, show_downloads: bool = True) -> None:
@@ -837,7 +1502,32 @@ def render_diagram(canvas_height: int) -> None:
     elif result["error"]:
         st.error(result["error"])
     else:
-        page = viewer_html(result["xml"], canvas_height)
+        st.radio(
+            "Схема на холсте",
+            [ASIS_LABEL, TOBE_LABEL],
+            key="canvas_variant",
+            horizontal=True,
+        )
+        if st.session_state.get("canvas_variant") == TOBE_LABEL:
+            pack = ensure_tobe_pack()
+            if pack and pack.get("error") and not pack.get("xml"):
+                st.warning("To-Be недоступен — показан As-Is. " + str(pack.get("error") or ""))
+            elif st.session_state.get("_last_canvas_variant") != TOBE_LABEL:
+                st.session_state.pop("inspector_choice", None)
+        if st.session_state.get("_last_canvas_variant") != st.session_state.get("canvas_variant"):
+            st.session_state["_last_canvas_variant"] = st.session_state.get("canvas_variant")
+            st.session_state.pop("inspector_choice", None)
+        xml, audit, text = _active_canvas()
+        catalog = build_diagram_catalog(xml, audit, text)
+        pack = st.session_state.get("tobe_pack")
+        asis = st.session_state.get("result") or {}
+        copilot = build_canvas_copilot(
+            asis.get("xml") or xml,
+            asis.get("audit") or audit,
+            st.session_state.get("reg_text") or text,
+            (pack or {}).get("delta"),
+        )
+        page = viewer_html(xml, canvas_height, catalog, copilot)
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
             st.iframe(page, height=canvas_height + 16)
         else:
@@ -852,6 +1542,10 @@ def _send_assistant(prompt: str) -> None:
     messages: List[Dict[str, str]] = st.session_state.setdefault("chat_messages", [])
     messages.append({"role": "user", "content": prompt})
     result = st.session_state.get("result") or {}
+    low = prompt.lower()
+    pack = st.session_state.get("tobe_pack")
+    if re.search(r"сравни|as-is|to-be|tobe|до и после|читаем|метро", low):
+        pack = ensure_tobe_pack() or pack
     with st.spinner("Ассистент анализирует процесс…"):
         reply, new_text, new_xml, new_audit = assistant_chat(
             prompt,
@@ -860,6 +1554,7 @@ def _send_assistant(prompt: str) -> None:
             result.get("audit") or {},
             st.session_state.get("reg_text") or "",
             use_llm=True,
+            tobe_delta=(pack or {}).get("delta"),
         )
     messages.append({"role": "assistant", "content": reply})
     if new_text and new_xml and new_audit:
@@ -867,6 +1562,9 @@ def _send_assistant(prompt: str) -> None:
         st.session_state["result"] = {"xml": new_xml, "audit": new_audit, "error": ""}
         st.session_state["diagram_updated_by_assistant"] = True
         st.session_state["file_stem"] = st.session_state.get("file_stem") or "custom_process"
+        st.session_state.pop("inspector_cache", None)
+        st.session_state.pop("inspector_choice", None)
+        st.session_state.pop("tobe_pack", None)
 
 
 def render_assistant() -> None:
@@ -958,7 +1656,27 @@ def main() -> None:
 
     result = st.session_state.get("result")
     if result and not result["error"]:
-        render_audit(result["audit"])
-        render_details(result["audit"])
+        xml, audit, text = _active_canvas()
+        tab_audit, tab_tobe, tab_raci, tab_inspector = st.tabs(
+            [
+                "📊 Аудит и SLA",
+                "⚡ Оптимизация As-Is → To-Be",
+                "👥 Матрица RACI",
+                "🔍 Инспектор задачи",
+            ]
+        )
+        with tab_audit:
+            render_audit(result["audit"])
+            render_details(result["audit"])
+        with tab_tobe:
+            render_tobe_tab()
+        with tab_raci:
+            render_raci_tab(
+                result["xml"],
+                result["audit"],
+                st.session_state.get("reg_text") or "",
+            )
+        with tab_inspector:
+            render_task_inspector(xml, audit, text)
 
 main()

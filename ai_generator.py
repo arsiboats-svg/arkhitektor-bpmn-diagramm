@@ -14,6 +14,12 @@
     execute_generated_code(code_str)         -> (bpmn_xml, audit_data, error)
     assistant_chat(...)                      -> диалог (аналитика / правка / реверс)
     generate_process_passport(xml, audit, text) -> Markdown «Паспорт процесса»
+    inspect_task_details(task_name, task_role, process_context) -> операционная карточка
+    build_diagram_catalog(xml, audit, text) -> метаданные узлов для клика по холсту
+    build_canvas_copilot(xml, audit, text) -> ответы плавающего ассистента на холсте
+    optimize_process_to_be(text, audit) -> целевой регламент To-Be и дельта SLA
+    generate_raci_matrix(steps, roles) -> матрица ответственности R/A/C/I
+    export_docx_passport(xml, audit, text) -> официальный регламент Microsoft Word
     PROMPT_TEMPLATE / build_prompt(text)
 
 Модуль не падает при недоступности моделей: при любом сбое сети, таймауте или
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import io
 import json
 import os
 import re
@@ -33,7 +40,7 @@ import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from bpmn_framework import GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
+from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 from validate_bpmn import xsd_errors_xml
 
 ROOT_PROCESS_ID = "Process_Root"
@@ -62,6 +69,7 @@ API объекта DIAGRAM (строго эти сигнатуры):
 - gw_id = DIAGRAM.add_inclusive_gateway(name, parent_id)   # OR
 - group_id = DIAGRAM.add_group(name, parent_id)
 - DIAGRAM.add_link(source_id, target_id, condition_name="")  # поток; у веток шлюза ОБЯЗАТЕЛЬНА подпись условия
+- DIAGRAM.set_sla(task_id, hours)                           # трудозатраты шага, часы (1 раб. день = 8 ч). ОБЯЗАТЕЛЬНО, если срок есть в регламенте.
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 1. РОЛЕВАЯ МОДЕЛЬ. Выдели всех участников регламента и создай для них дорожки одним вызовом add_pool.
@@ -206,10 +214,77 @@ def _quality_report(structure_issues: List[str], audit: Dict[str, Any]) -> Dict[
     return {"issues": issues, "critical": critical, "ok": not critical}
 
 
+def _sla_stems(text: str) -> set:
+    return {w[:6] for w in re.findall(r"[А-Яа-яЁёA-Za-z]{4,}", (text or "").lower())}
+
+
+def _sla_title_score(left: str, right: str) -> int:
+    a, b = _sla_stems(left), _sla_stems(right)
+    if not a or not b:
+        return 0
+    return len(a & b)
+
+
+def _sla_looks_default(node: Any) -> bool:
+    """True, если трудозатраты не заданы или совпадают с дефолтом вида узла (2 ч для userTask)."""
+    if getattr(node, "sla_hours", None) is None:
+        return True
+    expected = DEFAULT_HOURS.get(getattr(node, "kind", ""), None)
+    if expected is None:
+        return False
+    try:
+        return abs(float(node.sla_hours) - float(expected)) < 1e-6
+    except (TypeError, ValueError):
+        return True
+
+
+def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: str) -> int:
+    """Подставляет часы из текста регламента узлам без явного set_sla (или с дефолтом 2 ч)."""
+    if not regulation_text or not str(regulation_text).strip():
+        return 0
+    try:
+        parsed = parse_regulation(normalize_regulation(regulation_text))
+    except Exception:  # noqa: BLE001
+        return 0
+    steps = [s for s in parsed.steps if s.hours]
+    work = [n for n in diagram.nodes.values() if n.kind in WORK_KINDS]
+    if not steps or not work:
+        return 0
+    applied = 0
+    used_nodes: set = set()
+    used_steps: set = set()
+
+    def _free(node: Any) -> bool:
+        return node.id not in used_nodes and _sla_looks_default(node)
+
+    for idx, step in enumerate(steps):
+        title = step.title or ""
+        best, score = None, 0
+        for node in work:
+            if not _free(node):
+                continue
+            sc = _sla_title_score(title, node.name or "")
+            if sc > score:
+                best, score = node, sc
+        if best is not None and score >= 1:
+            best.sla_hours = float(step.hours)
+            used_nodes.add(best.id)
+            used_steps.add(idx)
+            applied += 1
+
+    leftover_nodes = [n for n in work if _free(n)]
+    leftover_steps = [s for i, s in enumerate(steps) if i not in used_steps]
+    for step, node in zip(leftover_steps, leftover_nodes):
+        node.sla_hours = float(step.hours)
+        applied += 1
+    return applied
+
+
 def execute_generated_code(
     code_str: str,
     process_name: str = "Бизнес-процесс ПАО «Интер РАО»",
     sla_target_hours: Optional[float] = None,
+    regulation_text: str = "",
 ) -> Tuple[str, Dict[str, Any], str]:
     """Безопасно исполняет код для DIAGRAM и возвращает (bpmn_xml, audit_data, error).
 
@@ -249,11 +324,14 @@ def execute_generated_code(
         if len(work_nodes) < 2:
             return "", {}, "Диаграмма содержит меньше двух рабочих узлов — регламент не распознан."
 
+        sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
         structure_issues = _structure_issues(diagram)
         diagram.heal_graph()
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit)
+        if sla_enriched:
+            audit["sla_enriched_nodes"] = sla_enriched
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
         if errors:
             return "", {}, "XML не прошёл проверку по XSD BPMN 2.0: " + "; ".join(errors[:3])
@@ -1082,7 +1160,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{name}: недоступен ({_error_reason(exc)})")
                     break
                 call_s = time.time() - call_started
-                xml, audit, err = execute_generated_code(raw, process_name, sla)
+                xml, audit, err = execute_generated_code(raw, process_name, sla, regulation_text=text)
                 quality = audit.get("quality", {}) if not err else {}
                 if not err and quality.get("ok"):
                     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
@@ -1115,7 +1193,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
         code, info = emulate_generation(text)
     except Exception as exc:  # noqa: BLE001
         return "", {}, f"Не удалось разобрать регламент: {type(exc).__name__}: {exc}"
-    xml, audit, err = execute_generated_code(code, process_name, sla)
+    xml, audit, err = execute_generated_code(code, process_name, sla, regulation_text=text)
     if err:
         return "", {}, f"Не удалось построить диаграмму: {err}"
     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
@@ -1150,6 +1228,10 @@ CHAT_SYSTEM = """Ты — «AI-Ассистент Бизнес-Архитект�
 Правила:
 - Отвечай по-русски, по делу, не более 12 строк, Markdown. Опирайся ТОЛЬКО на данные процесса ниже; числа и названия не выдумывай.
 - Причины и рекомендации подкрепляй конкретными шагами, ролями и цифрами из данных (срок, доля нагрузки, циклы возврата).
+- Если в данных есть блок «СРАВНЕНИЕ AS-IS / TO-BE», на вопросы «сравни», «as-is / to-be», «до и после», «читаемость»
+  отвечай цифрами: дельта SLA (часы и %), петли возврата до/после, замена журналов на scriptTask, Quality Score и
+  декомпозиция в подпроцессы вместо «метро Токио» (длинные цепочки и возвратные стрелки).
+- Не начинай каждый ответ одной и той же заглушкой «N шагов / M узлов». Отвечай на заданный вопрос.
 - Если предлагаешь изменить процесс, заверши ответ ГОТОВОЙ командой в кавычках «…», которую пользователь может отправить
   в чат, например: «Сделай шаги 4 и 5 параллельными» или «Добавь согласование с экологами после шага 3».
 - Если данных для ответа нет — так и скажи.
@@ -1240,8 +1322,13 @@ def _fh(hours: float) -> str:
     return f"{hours:.0f} ч (≈ {hours / 8:.0f} раб. дн.)"
 
 
-def build_process_context(current_text: str, current_xml: str, current_audit: Dict[str, Any]) -> Dict[str, Any]:
-    """Сводка активного процесса: шаги, роли, SLA, критический путь, bus-factor, циклы, ИТ-ландшафт."""
+def build_process_context(
+    current_text: str,
+    current_xml: str,
+    current_audit: Dict[str, Any],
+    tobe_delta: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Сводка активного процесса: шаги, роли, SLA, критический путь, bus-factor, циклы, ИТ-ландшафт, To-Be."""
     audit = current_audit or {}
     title, sla_target, steps = "Бизнес-процесс", None, []
     try:
@@ -1263,7 +1350,7 @@ def build_process_context(current_text: str, current_xml: str, current_audit: Di
     sla = audit.get("sla") or {}
     if sla_target is None:
         sla_target = sla.get("target_hours")
-    return {
+    ctx: Dict[str, Any] = {
         "title": title,
         "sla_target_hours": sla_target,
         "steps": steps,
@@ -1277,8 +1364,72 @@ def build_process_context(current_text: str, current_xml: str, current_audit: Di
         "artifacts": audit.get("artifacts") or [],
         "recommendations": audit.get("recommendations") or [],
         "stats": audit.get("stats") or {},
+        "methodology": audit.get("methodology") or {},
         "xml_available": bool(current_xml),
+        "tobe_ready": False,
+        "sla_hours_as_is": None,
+        "sla_hours_to_be": None,
+        "delta_sla_percent": None,
+        "rework_loops_as_is": None,
+        "rework_loops_to_be": None,
+        "quality_score_as_is": None,
+        "quality_score_to_be": None,
+        "tobe_actions": [],
     }
+    _attach_tobe_compare(ctx, audit, tobe_delta)
+    return ctx
+
+
+def _attach_tobe_compare(ctx: Dict[str, Any], audit: Dict[str, Any], tobe_delta: Optional[dict]) -> None:
+    """Пишет в контекст sla_hours_as_is / sla_hours_to_be и соседние поля, если To-Be уже посчитан."""
+    d = tobe_delta or (audit or {}).get("tobe_compare") or {}
+    if not isinstance(d, dict) or not d:
+        return
+    if d.get("sla_after_hours") is None and d.get("sla_hours_to_be") is None:
+        return
+    sla = (audit or {}).get("sla") or {}
+    meth = (audit or {}).get("methodology") or {}
+    as_is = d.get("sla_hours_as_is")
+    if as_is is None:
+        as_is = d.get("sla_before_hours")
+    if as_is is None:
+        as_is = sla.get("with_rework_hours") or sla.get("critical_path_hours") or 0
+    to_be = d.get("sla_hours_to_be")
+    if to_be is None:
+        to_be = d.get("sla_after_hours") or 0
+    pct = d.get("delta_sla_percent")
+    if pct is None:
+        pct = d.get("sla_saved_pct") or 0
+    q_as = d.get("quality_score_as_is")
+    if q_as is None:
+        q_as = d.get("quality_before")
+    if q_as is None:
+        q_as = int(meth.get("score") or 0)
+    q_to = d.get("quality_score_to_be")
+    if q_to is None:
+        q_to = d.get("quality_after")
+    if q_to is None:
+        q_to = q_as
+    rw_as = d.get("rework_loops_as_is")
+    if rw_as is None:
+        rw_as = d.get("rework_before")
+    if rw_as is None:
+        rw_as = len((audit or {}).get("rework_loops") or [])
+    rw_to = d.get("rework_loops_to_be")
+    if rw_to is None:
+        rw_to = d.get("rework_after")
+    if rw_to is None:
+        rw_to = rw_as
+    ctx["tobe_ready"] = True
+    ctx["sla_hours_as_is"] = round(float(as_is or 0), 3)
+    ctx["sla_hours_to_be"] = round(float(to_be or 0), 3)
+    ctx["delta_sla_percent"] = round(float(pct or 0), 1)
+    ctx["rework_loops_as_is"] = int(rw_as or 0)
+    ctx["rework_loops_to_be"] = int(rw_to or 0)
+    ctx["quality_score_as_is"] = int(q_as or 0)
+    ctx["quality_score_to_be"] = int(q_to or 0)
+    ctx["tobe_actions"] = [a for a in (d.get("actions") or []) if isinstance(a, dict)]
+    ctx["sla_saved_hours"] = round(float(d.get("sla_saved_hours") or max(0.0, float(as_is or 0) - float(to_be or 0))), 3)
 
 
 def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
@@ -1323,6 +1474,25 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
         lines.append("Документы: " + ", ".join(f"{i['name']} (шаги {i['steps']})" for i in ctx["artifacts"]))
     for risk in ctx["sla_risks"][:6]:
         lines.append(f"Риск [{risk.get('severity')}]: {risk.get('message')}")
+    meth = ctx.get("methodology") or {}
+    if meth.get("score") is not None:
+        lines.append(f"Quality Score (линтер нотации): {int(meth.get('score') or 0)}%")
+        for chk in (meth.get("checks") or [])[:4]:
+            mark = "ok" if chk.get("passed") else "fail"
+            lines.append(f"  [{mark}] {chk.get('title')}: {chk.get('detail')}")
+    if ctx.get("tobe_ready"):
+        lines += [
+            "СРАВНЕНИЕ AS-IS / TO-BE:",
+            f"  sla_hours_as_is: {ctx.get('sla_hours_as_is')}",
+            f"  sla_hours_to_be: {ctx.get('sla_hours_to_be')}",
+            f"  delta_sla_percent: {ctx.get('delta_sla_percent')}",
+            f"  rework_loops_as_is: {ctx.get('rework_loops_as_is')}",
+            f"  rework_loops_to_be: {ctx.get('rework_loops_to_be')}",
+            f"  quality_score_as_is: {ctx.get('quality_score_as_is')}",
+            f"  quality_score_to_be: {ctx.get('quality_score_to_be')}",
+        ]
+        for act in (ctx.get("tobe_actions") or [])[:6]:
+            lines.append(f"  действие To-Be [{act.get('kind')}]: {act.get('detail')}")
     return "\n".join(lines)
 
 
@@ -1498,22 +1668,136 @@ def _analysis_summary(ctx: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _analysis_tobe(ctx: Dict[str, Any]) -> str:
+    if not ctx.get("tobe_ready"):
+        sla = ctx.get("sla") or {}
+        loops = ctx.get("rework_loops") or []
+        meth = ctx.get("methodology") or {}
+        return (
+            "**As-Is пока без посчитанного To-Be.** Откройте вкладку «Оптимизация As-Is → To-Be» — "
+            "оптимизатор параллелит независимые роли, снимает петли возврата (Zero-Rework) и переводит журналы в scriptTask.\n"
+            f"Сейчас: путь {_fh(float(sla.get('with_rework_hours') or sla.get('critical_path_hours') or 0))}, "
+            f"петель возврата {len(loops)}, Quality Score {int(meth.get('score') or 0)}%."
+        )
+    as_h = float(ctx.get("sla_hours_as_is") or 0)
+    to_h = float(ctx.get("sla_hours_to_be") or 0)
+    pct = float(ctx.get("delta_sla_percent") or 0)
+    saved = float(ctx.get("sla_saved_hours") or max(0.0, as_h - to_h))
+    rb, ra = int(ctx.get("rework_loops_as_is") or 0), int(ctx.get("rework_loops_to_be") or 0)
+    qb, qa = int(ctx.get("quality_score_as_is") or 0), int(ctx.get("quality_score_to_be") or 0)
+    stats = ctx.get("stats") or {}
+    out = [
+        f"**As-Is → To-Be для «{ctx.get('title')}».**",
+        f"SLA (с учётом возвратов): **{_fh(as_h)} → {_fh(to_h)}** (экономия {_fh(saved)}, **−{pct:g}%**).",
+        f"Петли возврата: **{rb} → {ra}** (ликвидировано {max(0, rb - ra)}).",
+        f"Quality Score нотации: **{qb}% → {qa}%**.",
+    ]
+    kinds = {str(a.get("kind")) for a in (ctx.get("tobe_actions") or [])}
+    if "parallel" in kinds:
+        out.append("Параллелизация: независимые шаги разных ролей идут одновременно, а не цепочкой.")
+    if "zero_rework" in kinds:
+        out.append("Zero-Rework: перед согласованиями входной контроль, возвраты заменены эскалацией.")
+    if "automation" in kinds:
+        out.append("Автоматизация: фиксация в журналах/реестрах переведена в scriptTask, а не ручной userTask.")
+    for act in (ctx.get("tobe_actions") or [])[:4]:
+        if act.get("detail"):
+            out.append(f"- {act['detail']}")
+    subs = int(stats.get("subprocesses") or 0)
+    out.append(
+        f"Читаемость: {'подпроцессы уже режут «метро Токио»' if subs else 'длинные цепочки лучше упаковать в subprocess'}; "
+        "снятие возвратных стрелок убирает пересечения как на карте метро."
+    )
+    return "\n".join(out)
+
+
+def _analysis_readability(ctx: Dict[str, Any]) -> str:
+    meth = ctx.get("methodology") or {}
+    stats = ctx.get("stats") or {}
+    score = int(meth.get("score") or 0)
+    subs = int(stats.get("subprocesses") or 0)
+    layers = int(stats.get("critical_path_layers") or 0)
+    out = [f"**Читаемость BPMN «{ctx.get('title')}».** Quality Score: **{score}%**."]
+    if subs:
+        out.append(f"Декомпозиция: {subs} подпроцесс(а) — это как раз против «метро Токио».")
+    else:
+        out.append("Подпроцессов нет: монотонные цепочки одной роли лучше свернуть в subprocess.")
+    if layers:
+        out.append(f"Слоёв на критическом пути: {layers}.")
+    for chk in meth.get("checks") or []:
+        mark = "✓" if chk.get("passed") else "✗"
+        out.append(f"- {mark} {chk.get('title')}: {chk.get('detail')}")
+    if ctx.get("tobe_ready"):
+        out.append(
+            f"To-Be: Quality {ctx.get('quality_score_as_is')}% → {ctx.get('quality_score_to_be')}%, "
+            f"петли {ctx.get('rework_loops_as_is')} → {ctx.get('rework_loops_to_be')} — меньше возвратных стрелок, схема читается линейнее."
+        )
+    return "\n".join(out)
+
+
+def _analysis_open(message: str, ctx: Dict[str, Any]) -> str:
+    """Развёрнутый ответ по архитектуре процесса — не статичная заглушка с числом шагов."""
+    q = (message or "").strip()
+    sla = ctx.get("sla") or {}
+    bus = ctx.get("bus_factor") or {}
+    meth = ctx.get("methodology") or {}
+    recs: List[str] = []
+    for item in ctx.get("recommendations") or []:
+        recs.append(item if isinstance(item, str) else str((item or {}).get("message") or ""))
+    for item in ctx.get("sla_risks") or []:
+        if isinstance(item, dict) and item.get("message"):
+            recs.append(str(item["message"]))
+    recs = [r for r in recs if r]
+    out: List[str] = []
+    if q:
+        out.append(f"По запросу «{q[:140]}» — факты аудита, не общая заглушка.")
+    else:
+        out.append(f"Архитектурный разбор «{ctx.get('title')}».")
+    if sla:
+        out.append(
+            f"SLA: критический путь {_fh(float(sla.get('critical_path_hours') or 0))}, "
+            f"с худшим возвратом {_fh(float(sla.get('with_rework_hours') or 0))}, "
+            f"срыв: {'да' if sla.get('breach') else 'нет'}."
+        )
+    if bus:
+        out.append(f"Ключевая роль: «{bus.get('top_role')}» ({float(bus.get('max_share') or 0):.0%} шагов).")
+    if meth.get("score") is not None:
+        out.append(f"Линтер нотации: Quality Score {int(meth.get('score') or 0)}%.")
+    loops = ctx.get("rework_loops") or []
+    if loops:
+        l0 = max(loops, key=lambda x: float((x or {}).get("cycle_hours") or 0))
+        out.append(f"Дороже всего цикл «{l0.get('label')}»: {_fh(float(l0.get('cycle_hours') or 0))}.")
+    if ctx.get("tobe_ready"):
+        out.append(
+            f"To-Be уже есть: SLA {_fh(float(ctx.get('sla_hours_as_is') or 0))} → "
+            f"{_fh(float(ctx.get('sla_hours_to_be') or 0))} (−{ctx.get('delta_sla_percent')}%)."
+        )
+    if recs:
+        out.append("Что делать архитектору:")
+        out += [f"- {r}" for r in recs[:3]]
+    out.append("Уточните: сравнение As-Is/To-Be, читаемость (анти-метро), роли или ускорение SLA.")
+    return "\n".join(out)
+
+
 def heuristic_analysis(message: str, ctx: Dict[str, Any]) -> str:
     low = message.lower()
     roles = _roles_in_message(message, _roles_of(ctx))
+    if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|до/после|целев\w+\s+схем|реинжинир", low):
+        return _analysis_tobe(ctx)
+    if re.search(r"читаем|метро|нотаци|подпроцесс|линтер|методолог|quality score|анти-метро|декомпозиц", low):
+        return _analysis_readability(ctx)
     if re.search(r"sla|срок|срыв|задерж|критическ|длительн|долго|почему.*(долго|медлен)", low):
         return _analysis_sla(ctx)
-    if re.search(r"нагрузк|bus|загружен|разгруз|перегруз|исполнител|кто.*(ключев|зависит)", low) or roles:
-        return _analysis_load(ctx, roles)
-    if re.search(r"ускор|оптимиз|сократ|быстрее|повысить эффективн|улучш", low):
-        return _analysis_speedup(ctx)
     if re.search(r"цикл|возврат|доработ|rework|замечани", low):
         return _analysis_loops(ctx)
+    if re.search(r"ускор|оптимиз|сократ|быстрее|повысить эффективн|улучш", low):
+        return _analysis_speedup(ctx)
     if re.search(r"систем|it\b|ит-|scada|документ|артефакт|ландшафт|crm|1с|sap", low):
         return _analysis_landscape(ctx)
+    if re.search(r"нагрузк|bus|загружен|разгруз|перегруз|исполнител|кто.*(ключев|зависит)", low) or roles:
+        return _analysis_load(ctx, roles)
     if re.search(r"риск|узк|проблем|слаб|разбор", low):
         return _analysis_sla(ctx) + "\n\n" + _analysis_load(ctx, [])
-    return _analysis_summary(ctx)
+    return _analysis_open(message, ctx)
 
 
 # --------------------------- «Предложить следующий шаг» --------------------------- #
@@ -1909,7 +2193,7 @@ def _rebuild_process(text: str, engine: str, trace: List[str]) -> Tuple[str, Dic
     norm = normalize_regulation(text)
     header = parse_regulation(norm)
     code, info = emulate_generation(norm)
-    xml, audit, err = execute_generated_code(code, header.title, header.sla_hours)
+    xml, audit, err = execute_generated_code(code, header.title, header.sla_hours, regulation_text=norm)
     if err:
         return "", {}, err
     audit["artifacts"], audit["it_systems"] = header.artifacts, header.it_systems
@@ -2119,6 +2403,7 @@ def assistant_chat(
     current_audit: Dict[str, Any],
     current_text: str,
     use_llm: bool = True,
+    tobe_delta: Optional[dict] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[Dict[str, Any]]]:
     """Диалог с AI-ассистентом над активным процессом.
 
@@ -2131,7 +2416,7 @@ def assistant_chat(
         if not message:
             return "Напишите вопрос о процессе или команду на изменение — например, «Добавь согласование с экологами после шага 3».", None, None, None
         audit = current_audit or {}
-        ctx = build_process_context(current_text, current_xml, audit)
+        ctx = build_process_context(current_text, current_xml, audit, tobe_delta=tobe_delta)
         if not ctx["steps"] and not current_xml:
             return "Активного процесса пока нет: выберите регламент и нажмите «Сгенерировать BPMN 2.0».", None, None, None
         intent = classify_intent(message)
@@ -2469,3 +2754,873 @@ def generate_process_passport(xml_str: str, audit_data: dict, regulation_text: s
         lines += ["", f"_Исходная BPMN-модель: {len(xml_str)} символов XML._"]
     lines.append("")
     return "\n".join(lines)
+
+
+# --------------------------- инспектор задачи и каталог кликов по холсту --------------------------- #
+_KIND_RU = {
+    "userTask": "Пользовательская задача",
+    "scriptTask": "Скриптовая / сервисная задача",
+    "task": "Задача",
+    "exclusiveGateway": "Исключающий шлюз (XOR)",
+    "parallelGateway": "Параллельный шлюз (AND)",
+    "inclusiveGateway": "Включающий шлюз (OR)",
+    "startEvent": "Стартовое событие",
+    "endEvent": "Завершающее событие",
+    "subProcess": "Подпроцесс",
+}
+
+_ROLE_QUAL = (
+    ("диспетчер", "IV–V группа по электробезопасности, право ведения оперативных переговоров и переключений."),
+    ("начальник смены", "V группа по электробезопасности, ответственный руководитель работ в электроустановке."),
+    ("служб безопасн", "V группа, контроль нарядов-допусков, проверка состава бригады и удостоверений."),
+    ("ремонтн", "III–IV группа по электробезопасности, допуск к работам в электроустановках до и выше 1000 В."),
+    ("эколог", "Профильная подготовка по охране окружающей среды; допуск к площадке — по наряду."),
+    ("охран труд", "Специалист по ОТ, группа не ниже III, контроль СИЗ и инструктажа."),
+    ("закуп", "Квалификация закупщика / договорной работы; ЭЦП для электронной площадки."),
+    ("бухгалт", "Квалификация бухгалтера энергосбыта / генерирующей компании, доступ к 1С / ERP."),
+)
+
+INSPECT_SYSTEM = """Ты — старший мастер оперативного персонала ПАО «Интер РАО».
+По задаче BPMN составь операционную карточку исполнителя. Ответь ТОЛЬКО JSON без markdown:
+{
+  "role_requirements": "квалификация, разряд, группа допуска по электробезопасности (II–V)",
+  "procedure_steps": ["шаг 1", "шаг 2", "шаг 3", "шаг 4"],
+  "safety_and_tools": "приборы, СИЗ, заземления, ИТ-системы",
+  "input_trigger": "основание начать работы и входные документы",
+  "output_artifact": "результат: акт, журнал, статус"
+}
+Только факты из контекста процесса; 3–4 конкретных технических действия; по-русски; ничего не выдумывай сверх роли и названия шага."""
+
+
+def _role_requirements(role: str) -> str:
+    low = (role or "").lower()
+    for stem, text in _ROLE_QUAL:
+        if stem in low:
+            return text
+    return (
+        f"Исполнитель роли «{role or 'специалист'}»: профильная подготовка, "
+        "группа по электробезопасности не ниже III, допуск к работам по действующему наряду."
+    )
+
+
+def _match_step(task_name: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    name = (task_name or "").lower()
+    best: Dict[str, Any] = {}
+    score = 0
+    for st in ctx.get("steps") or []:
+        title = str(st.get("title") or "").lower()
+        s = 0
+        if title and (title in name or name in title):
+            s = 3
+        else:
+            stems = {w[:6] for w in re.findall(r"[А-Яа-яЁё]{5,}", name)}
+            s = sum(1 for w in stems if w in title)
+        if s > score:
+            score, best = s, st
+    return best
+
+
+def _heuristic_inspect(task_name: str, task_role: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    name = (task_name or "Выполнить действие").strip()
+    role = (task_role or "Исполнитель").strip()
+    low = name.lower()
+    step = _match_step(name, ctx)
+    systems = list(step.get("systems") or [])
+    artifacts = list(step.get("artifacts") or [])
+    if not systems:
+        systems = [i.get("name") for i in (ctx.get("it_systems") or []) if isinstance(i, dict) and i.get("name")]
+    if not artifacts:
+        artifacts = [i.get("name") for i in (ctx.get("artifacts") or []) if isinstance(i, dict) and i.get("name")]
+    sys_txt = ", ".join(str(s) for s in systems[:4]) or "оперативный журнал, ИС/АС предприятия"
+    doc_txt = ", ".join(str(a) for a in artifacts[:4]) or "задание смены / наряд-допуск"
+
+    steps = [f"Получить задание и подтвердить полномочия роли «{role}»."]
+    action = name[:1].lower() + name[1:] if name else "выполнить операцию по регламенту"
+    steps.append(f"Выполнить: {action}.")
+    if any(k in low for k in ("наряд", "допуск", "безопасн", "инструктаж")):
+        steps.append("Проверить наряд-допуск, состав бригады, удостоверения и наличие СИЗ.")
+        steps.append("Допустить персонал к работе или вернуть пакет документов на устранение замечаний.")
+    elif any(k in low for k in ("журнал", "фиксир", "регистр", "заявк")):
+        steps.append(f"Внести запись в {sys_txt}.")
+        steps.append("Сверить статус заявки со смежной ролью и закрыть шаг в системе.")
+    elif any(k in low for k in ("ремонт", "переключ", "вывест", "восстанов", "схем")):
+        steps.append("Выполнить оперативные переключения / работы по бланку, установить переносные заземления.")
+        steps.append("Подтвердить восстановление схемы и снять наряд после осмотра.")
+    elif any(k in low for k in ("осмотр", "диагност", "измер", "тепловиз", "изоляц")):
+        steps.append("Провести измерения приборами (тепловизор, мегаомметр) и зафиксировать дефекты.")
+        steps.append("Передать дефектную ведомость следующей роли по схеме.")
+    else:
+        steps.append("Сверить результат с нормами ПТЭ и локальными инструкциями предприятия.")
+        steps.append("Передать результат следующей роли и зафиксировать статус в учётной системе.")
+
+    if "script" in low or "автомат" in low:
+        safety = f"Автоматизированная операция. Системы: {sys_txt}. Контроль журнала событий, без работ в электроустановке."
+    else:
+        safety = (
+            f"СИЗ: каска, термостойкий комбинезон, диэлектрические перчатки и боты (по наряду). "
+            f"При работах в электроустановке — переносные заземления и запирание коммутационных аппаратов. "
+            f"Системы: {sys_txt}."
+        )
+    trigger = (
+        f"Основание: поступление шага «{name}» роли «{role}» по схеме процесса"
+        + (f"; входные документы: {doc_txt}." if artifacts or doc_txt else ".")
+    )
+    output = (
+        f"Результат шага «{name}»: статус выполнен; "
+        + (f"оформлены {doc_txt}; " if artifacts else "запись в оперативном журнале; ")
+        + "передача следующей роли по BPMN."
+    )
+    return {
+        "role_requirements": _role_requirements(role),
+        "procedure_steps": steps[:4],
+        "safety_and_tools": safety,
+        "input_trigger": trigger,
+        "output_artifact": output,
+        "source": "heuristic",
+    }
+
+
+def inspect_task_details(task_name: str, task_role: str, process_context: dict) -> dict:
+    """Развёрнутая операционная инструкция исполнителя по шагу BPMN.
+
+    Облачная модель (Groq/OpenAI) → эвристики процесса. Всегда возвращает словарь с ключами
+    role_requirements, procedure_steps, safety_and_tools, input_trigger, output_artifact.
+    """
+    ctx = process_context if isinstance(process_context, dict) else {}
+    fallback = _heuristic_inspect(task_name or "", task_role or "", ctx)
+    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
+        return fallback
+    payload = {
+        "task": task_name,
+        "role": task_role,
+        "process": ctx.get("title"),
+        "sla": ctx.get("sla"),
+        "step_match": _match_step(task_name or "", ctx),
+        "it_systems": ctx.get("it_systems"),
+        "artifacts": ctx.get("artifacts"),
+        "critical_path": [c.get("name") for c in (ctx.get("critical_path") or [])][:12],
+    }
+    trace: List[str] = []
+    got = _chat_llm(
+        [
+            {"role": "system", "content": INSPECT_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:6000]},
+        ],
+        trace,
+    )
+    if not got:
+        return fallback
+    raw = got[1]
+    try:
+        m = re.search(r"\{[\s\S]*\}", raw)
+        data = json.loads(m.group(0) if m else raw)
+    except Exception:  # noqa: BLE001
+        return fallback
+    steps = data.get("procedure_steps") if isinstance(data, dict) else None
+    if isinstance(steps, str):
+        steps = [s.strip(" -•") for s in re.split(r"[\n;]+", steps) if s.strip()]
+    if not isinstance(steps, list) or len(steps) < 2:
+        steps = fallback["procedure_steps"]
+    return {
+        "role_requirements": str(data.get("role_requirements") or fallback["role_requirements"]),
+        "procedure_steps": [str(s).strip() for s in steps[:6] if str(s).strip()],
+        "safety_and_tools": str(data.get("safety_and_tools") or fallback["safety_and_tools"]),
+        "input_trigger": str(data.get("input_trigger") or fallback["input_trigger"]),
+        "output_artifact": str(data.get("output_artifact") or fallback["output_artifact"]),
+        "source": got[0],
+    }
+
+
+def live_node_comment(name: str, role: str, kind: str, ctx: Dict[str, Any]) -> str:
+    """Короткий комментарий ИИ для карточки клика: зачем шаг в энергосистеме и где риск задержки."""
+    low = (name or "").lower()
+    crit = {str(c.get("name") or "") for c in (ctx.get("critical_path") or [])}
+    on_crit = name in crit or any(name and name[:18] in (c or "") for c in crit)
+    bus = ctx.get("bus_factor") or {}
+    top = str(bus.get("top_role") or "")
+    loops = ctx.get("rework_loops") or []
+    loop_hit = any(name and name[:12] in str(l.get("from", "")) + str(l.get("to", "")) for l in loops)
+
+    if kind in _GATE_TAGS:
+        why = "Развилка фиксирует решение, от которого зависит допуск, схема или возврат на доработку."
+        risk = "Неподписанная или спорная ветка здесь даёт ложный маршрут и простой бригады."
+    elif kind == "startEvent":
+        why, risk = "Точка входа аварии или заявки в оперативный контур.", "Поздняя фиксация старта съедает весь запас SLA."
+    elif kind == "endEvent":
+        why, risk = "Подтверждение, что схема и документы закрыты.", "Незакрытый конец оставляет «висящий» наряд и открытый SLA."
+    elif kind == "subProcess":
+        why = "Декомпозиция однотипных шагов одной роли — защита от «карты метро»."
+        risk = "Если внутри длинная цепочка без контроля, узкое место прячется в подпроцессе."
+    elif any(k in low for k in ("наряд", "допуск")):
+        why = "Наряд-допуск — юридический и технический барьер перед работой в электроустановке."
+        risk = "Замечания СБ и возврат наряда — типичный цикл, который раздувает SLA."
+    elif any(k in low for k in ("ремонт", "восстанов", "переключ")):
+        why = "Оперативные переключения и ремонт возвращают оборудование в нормальную схему."
+        risk = "Шаг на критическом пути: каждый час простоя — недоотпуск и риск каскада."
+    elif any(k in low for k in ("журнал", "фиксир")):
+        why = "Оперативный журнал — единый источник правды для диспетчера и смены."
+        risk = "Ошибка или задержка записи ломает трассировку аварии и расследование."
+    else:
+        why = f"Шаг роли «{role or 'исполнитель'}» продвигает процесс по регламенту энергосистемы."
+        risk = "Задержка на исполнителе с высокой долей нагрузки повышает bus-factor."
+    if on_crit:
+        risk = "Узел на критическом пути SLA (Беллман — Форд): задержка сдвигает весь срок восстановления."
+    elif loop_hit:
+        risk = "Узел связан с циклом возврата — повторный проход умножает трудозатраты."
+    elif role and role == top and float(bus.get("max_share") or 0) > 0.4:
+        risk = f"Роль «{role}» держит {float(bus.get('max_share') or 0):.0%} шагов — простой ключевого исполнителя останавливает процесс."
+    return f"{why} {risk}"
+
+
+def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) -> Dict[str, Dict[str, Any]]:
+    """id BPMN-элемента → карточка для клика на холсте (роль, критический путь, комментарий ИИ)."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {})
+    catalog: Dict[str, Dict[str, Any]] = {}
+    if not xml_str:
+        return catalog
+    try:
+        struct = parse_bpmn_structure(xml_str)
+    except Exception:  # noqa: BLE001
+        return catalog
+    clickable = _TASK_TAGS | _GATE_TAGS | {"startEvent", "endEvent", "subProcess"}
+    for nid, node in (struct.get("nodes") or {}).items():
+        kind = str(node.get("type") or "")
+        if kind not in clickable:
+            continue
+        name = str(node.get("name") or "").strip() or kind
+        role = str(node.get("lane") or "").strip()
+        crit = any(
+            name == str(c.get("name") or "") or nid == str(c.get("id") or "")
+            for c in (ctx.get("critical_path") or [])
+        )
+        catalog[nid] = {
+            "id": nid,
+            "name": name,
+            "type": _KIND_RU.get(kind, kind),
+            "kind": kind,
+            "role": role or "—",
+            "critical": bool(crit),
+            "comment": live_node_comment(name, role, kind, ctx),
+        }
+    return catalog
+
+
+def build_canvas_copilot(
+    xml_str: str,
+    audit_data: dict,
+    regulation_text: str,
+    tobe_delta: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Пакет для плавающего ассистента на холсте: чипы и ответы по аудиту + сравнение As-Is/To-Be."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {}, tobe_delta=tobe_delta)
+    title = str(ctx.get("title") or "Бизнес-процесс")
+    try:
+        sla_a = heuristic_analysis("В чём причина срыва SLA?", ctx)
+        speed_a = heuristic_analysis("Как ускорить процесс?", ctx)
+        roles_a = _analysis_load(ctx, [])
+        compare_a = heuristic_analysis("Сравни As-Is и To-Be, до и после", ctx)
+        read_a = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx)
+        loops_a = heuristic_analysis("Циклы возврата на доработку", ctx)
+        land_a = heuristic_analysis("ИТ-ландшафт и документы процесса", ctx)
+        fallback = _analysis_open("краткий архитектурный разбор", ctx)
+    except Exception:  # noqa: BLE001 — холст не должен падать
+        sla_a = speed_a = roles_a = compare_a = read_a = loops_a = land_a = fallback = (
+            "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
+        )
+    chips = [
+        {"id": "speed", "label": "⚡ Как ускорить?", "q": "Как ускорить процесс?", "a": speed_a},
+        {"id": "sla", "label": "🔍 Анализ SLA", "q": "В чём причина срыва SLA?", "a": sla_a},
+        {"id": "roles", "label": "👤 Роли и риски", "q": "Как оптимизировать нагрузку ролей?", "a": roles_a},
+        {"id": "tobe", "label": "🔀 As-Is → To-Be", "q": "Сравни As-Is и To-Be", "a": compare_a},
+    ]
+    return {
+        "title": title,
+        "greeting": (
+            f"Я ассистент процесса «{title}». Спросите про SLA, сравнение As-Is/To-Be, "
+            "читаемость или роли — отвечаю по цифрам аудита, в том числе в панораме."
+        ),
+        "fallback": fallback,
+        "compare": compare_a,
+        "readability": read_a,
+        "loops": loops_a,
+        "landscape": land_a,
+        "chips": chips,
+    }
+
+
+# --------------------------- RACI, To-Be, официальный DOCX --------------------------- #
+_ACCOUNTABLE_RE = re.compile(
+    r"начальник|руководител|директор|владелец|главн\w+\s+инженер|начальник смены|зам[\.\s]",
+    re.I,
+)
+_CONSULTED_RE = re.compile(
+    r"безопасност|юрист|правов|эколог|эксперт|согласующ|охрана труда|служба охраны|нормативн",
+    re.I,
+)
+_INFORMED_RE = re.compile(r"диспетчер|заявител|заказчик|потребител|инициатор", re.I)
+_JOURNAL_RE = re.compile(
+    r"фикс\w+|журнал|реестр|регистр\w+|вносит\s+запис|учётн\w+\s+систем|оперативн\w+\s+журнал",
+    re.I,
+)
+_CONTROL_HINT_RE = re.compile(r"входн\w+\s+контрол|комплектност\w+\s+документ", re.I)
+_RACI_STOP = {"выполн", "провод", "оформ", "провер", "принят", "переда", "состав", "оценк"}
+TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
+Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
+1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
+2) Zero-Rework: перед шлюзами согласования добавь шаг входного контроля комплектности;
+   формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
+3) Автоматизация: фиксацию в журналах и реестрах формулируй как действие информационной системы (автоматически).
+Верни ТОЛЬКО текст регламента с нумерованными шагами, без комментариев и markdown."""
+
+
+def _accountable_role(roles: List[str]) -> str:
+    for role in roles or []:
+        if _ACCOUNTABLE_RE.search(role or ""):
+            return role
+    return (roles[0] if roles else "Руководитель процесса") or "Руководитель процесса"
+
+
+def _consulted_roles(roles: List[str]) -> List[str]:
+    return [r for r in (roles or []) if _CONSULTED_RE.search(r or "")]
+
+
+def _informed_roles(roles: List[str]) -> List[str]:
+    return [r for r in (roles or []) if _INFORMED_RE.search(r or "")]
+
+
+def _step_as_row(item: Any, idx: int) -> Dict[str, Any]:
+    if isinstance(item, Step):
+        return {
+            "num": item.num,
+            "title": item.title or "(шлюз решения)",
+            "role": item.role or "",
+            "decision": bool(item.decision),
+            "hours": item.hours,
+            "artifacts": list(item.artifacts or []),
+            "systems": list(item.systems or []),
+        }
+    if isinstance(item, dict):
+        title = item.get("title") or item.get("name") or item.get("action") or ""
+        decision = item.get("decision")
+        return {
+            "num": item.get("num") if item.get("num") is not None else idx,
+            "title": title or "(шаг)",
+            "role": item.get("role") or item.get("lane") or item.get("executor") or "",
+            "decision": bool(decision) if not isinstance(decision, dict) else True,
+            "hours": item.get("hours"),
+            "artifacts": list(item.get("artifacts") or []),
+            "systems": list(item.get("systems") or []),
+        }
+    return {"num": idx, "title": str(item), "role": "", "decision": False, "hours": None, "artifacts": [], "systems": []}
+
+
+def generate_raci_matrix(steps: list, roles: list) -> List[Dict[str, Any]]:
+    """Матрица RACI: строки — шаги, столбцы — роли, на пересечении буквы R/A/C/I."""
+    role_list = [str(r).strip() for r in (roles or []) if str(r).strip()]
+    rows_in = [_step_as_row(s, i + 1) for i, s in enumerate(steps or [])]
+    for row in rows_in:
+        if row["role"] and row["role"] not in role_list:
+            role_list.append(row["role"])
+    if not role_list:
+        role_list = ["Исполнитель"]
+    owner = _accountable_role(role_list)
+    consulted = _consulted_roles(role_list)
+    informed = _informed_roles(role_list)
+    matrix: List[Dict[str, Any]] = []
+    last_idx = len(rows_in) - 1
+    for i, row in enumerate(rows_in):
+        executor = row["role"] or role_list[0]
+        title = str(row["title"] or "")
+        decision = bool(row["decision"]) or bool(re.search(r"соглас|допуск|утверд|экспертиз", title, re.I))
+        milestone = decision or i >= last_idx - 1
+        accountable = executor if _ACCOUNTABLE_RE.search(executor) else owner
+        if decision:
+            accountable = executor
+        cells: Dict[str, List[str]] = {role: [] for role in role_list}
+
+        def _add(role: str, letter: str) -> None:
+            if role not in cells:
+                cells[role] = []
+            if letter not in cells[role]:
+                cells[role].append(letter)
+
+        _add(executor, "R")
+        _add(accountable, "A")
+        if decision or bool(re.search(r"проверк|допуск|наряд|экспертиз|правов", title, re.I)):
+            for role in consulted:
+                if role not in (executor, accountable):
+                    _add(role, "C")
+        if milestone:
+            for role in informed:
+                if role not in (executor, accountable):
+                    _add(role, "I")
+        matrix.append(
+            {
+                "num": row["num"],
+                "title": title,
+                "executor": executor,
+                "assignments": cells,
+            }
+        )
+    return matrix
+
+
+def _independent_steps(a: Step, b: Step) -> bool:
+    if not a.role or not b.role or a.role == b.role:
+        return False
+    if a.decision or b.decision or b.parallel:
+        return False
+    stems_a = {w[:6].lower() for w in re.findall(r"[А-Яа-яЁё]{5,}", a.title or "")}
+    stems_b = {w[:6].lower() for w in re.findall(r"[А-Яа-яЁё]{5,}", b.title or "")}
+    return not ((stems_a & stems_b) - _RACI_STOP)
+
+
+def _automate_journal_body(body: str) -> str:
+    if re.search(r"информационн\w+\s+систем\w+\s+автоматическ", body, re.I):
+        return body
+    text = body.strip()
+    if _DUR_RE.search(text):
+        text = _DUR_RE.sub("(5 минут)", text, count=1)
+    else:
+        text = text.rstrip(" .") + " (5 минут)."
+    if not text.lower().startswith("информационн"):
+        text = "Информационная система автоматически: " + text[:1].lower() + text[1:]
+    return text
+
+
+def _cut_rework_loop(body: str) -> str:
+    """Убирает петлю «вернуть на п.N / на доработку» без слов верну/возврат/доработ/повтор."""
+    text = re.sub(
+        r"(?:иначе\s+)?(?:«[^»]+»\s*[—–-]\s*)?(?:вернуть|возврат(?:ить)?)\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+",
+        "иначе эскалация руководителю процесса",
+        body,
+        flags=re.I,
+    )
+    return re.sub(
+        r"«[^»]*(?:доработ|замечан|повторн)[^»]*»\s*[—–-]\s*(?:вернуть|возврат)\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+",
+        "иначе эскалация руководителю процесса",
+        text,
+        flags=re.I,
+    )
+
+
+def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
+    raw_text = normalize_regulation(regulation_text or "")
+    header, raw_steps = _split_steps(raw_text)
+    try:
+        parsed = parse_regulation(raw_text)
+    except Exception:  # noqa: BLE001
+        return raw_text, []
+    n = min(len(parsed.steps), len(raw_steps))
+    if n < 2:
+        return raw_text, []
+    actions: List[Dict[str, str]] = []
+    bodies = [raw_steps[i]["body"] for i in range(n)]
+    nums = [parsed.steps[i].num for i in range(n)]
+
+    for i in range(n):
+        body = bodies[i]
+        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+            bodies[i] = _automate_journal_body(body)
+            actions.append(
+                {
+                    "kind": "automation",
+                    "detail": f"Шаг {nums[i]} «{parsed.steps[i].title or 'фиксация'}»: scriptTask, фиксация в журнале выполняется системой.",
+                }
+            )
+
+    i = 0
+    while i < n - 1:
+        a, b = parsed.steps[i], parsed.steps[i + 1]
+        already = bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", bodies[i + 1], re.I))
+        if _independent_steps(a, b) and not already:
+            bodies[i + 1] = "Параллельно: " + bodies[i + 1]
+            b.parallel = True
+            actions.append(
+                {
+                    "kind": "parallel",
+                    "detail": f"Шаги {a.num} ({a.role}) и {b.num} ({b.role}) выполняются параллельно.",
+                }
+            )
+            i += 2
+            continue
+        i += 1
+
+    control_at: Dict[int, str] = {}
+    for i in range(n):
+        st = parsed.steps[i]
+        d = st.decision
+        loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
+        if not loops:
+            continue
+        bodies[i] = _cut_rework_loop(bodies[i])
+        prev = bodies[i - 1] if i else ""
+        if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
+            actions.append(
+                {
+                    "kind": "zero_rework",
+                    "detail": f"Шаг {st.num}: петля возврата снята, входной контроль уже есть.",
+                }
+            )
+            continue
+        control_at[i] = (
+            f"{st.role} выполняет входной контроль комплектности документов и исходных данных "
+            f"перед согласованием (15 минут)."
+        )
+        actions.append(
+            {
+                "kind": "zero_rework",
+                "detail": f"Перед шагом {st.num} «{st.title or 'согласование'}» введён входной контроль, цикл доработки заменён эскалацией.",
+            }
+        )
+
+    assembled: List[Tuple[Optional[int], str]] = []
+    for i in range(n):
+        if i in control_at:
+            assembled.append((None, control_at[i]))
+        assembled.append((nums[i], bodies[i]))
+    old_to_new: Dict[int, int] = {}
+    new_bodies: List[str] = []
+    for old_num, body in assembled:
+        new_bodies.append(body)
+        if old_num is not None:
+            old_to_new[old_num] = len(new_bodies)
+
+    def _fn(ref: int) -> int:
+        return old_to_new.get(ref, ref)
+
+    remapped = [_remap(b, _fn) for b in new_bodies]
+    return _join_steps(header, [{"body": b} for b in remapped]), actions
+
+
+def _collect_tobe_actions(old_text: str, new_text: str) -> List[Dict[str, str]]:
+    actions: List[Dict[str, str]] = []
+    _, old_s = _split_steps(normalize_regulation(old_text))
+    _, new_s = _split_steps(normalize_regulation(new_text))
+    old_par = sum(1 for s in old_s if re.match(r"^(?:параллельно|одновременно)", s["body"], re.I))
+    new_par = sum(1 for s in new_s if re.match(r"^(?:параллельно|одновременно)", s["body"], re.I))
+    if new_par > old_par:
+        actions.append({"kind": "parallel", "detail": f"Добавлено параллельных веток: {new_par - old_par}."})
+    old_ctrl = sum(1 for s in old_s if _CONTROL_HINT_RE.search(s["body"]))
+    new_ctrl = sum(1 for s in new_s if _CONTROL_HINT_RE.search(s["body"]))
+    if new_ctrl > old_ctrl:
+        actions.append({"kind": "zero_rework", "detail": f"Введён входной контроль ({new_ctrl - old_ctrl} шаг.). Петли возврата сокращены."})
+    old_auto = sum(1 for s in old_s if re.search(r"автоматическ", s["body"], re.I))
+    new_auto = sum(1 for s in new_s if re.search(r"автоматическ", s["body"], re.I))
+    if new_auto > old_auto:
+        actions.append({"kind": "automation", "detail": f"Автоматизировано шагов фиксации: {new_auto - old_auto}."})
+    if not actions:
+        actions.append({"kind": "reengine", "detail": "Целевой регламент переписан с сохранением ролей и SLA."})
+    return actions
+
+
+def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[str]:
+    """Облачная перепись To-Be только при BPMN_TOBE_LLM=1 — иначе 25 с лишней генерации."""
+    if os.getenv("BPMN_TOBE_LLM", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    ctx = build_process_context(regulation_text, "", audit_data or {})
+    messages = [
+        {"role": "system", "content": TOBE_SYSTEM},
+        {
+            "role": "user",
+            "content": "АУДИТ AS-IS:\n" + format_context_for_prompt(ctx, max_steps=40)
+            + "\n\nРЕГЛАМЕНТ AS-IS:\n" + (regulation_text or "").strip(),
+        },
+    ]
+    trace: List[str] = []
+    got = _chat_llm(messages, trace)
+    if not got:
+        return None
+    _, raw = got
+    new_text = _strip_markdown(raw).strip()
+    _, old_steps = _split_steps(normalize_regulation(regulation_text))
+    _, new_steps = _split_steps(normalize_regulation(new_text))
+    if len(new_steps) < 2 or abs(len(new_steps) - len(old_steps)) > 8:
+        return None
+    return new_text + ("\n" if not new_text.endswith("\n") else "")
+
+
+def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]], engine: str) -> Dict[str, Any]:
+    old_a, new_a = old_audit or {}, new_audit or {}
+    old_sla = old_a.get("sla") or {}
+    new_sla = new_a.get("sla") or {}
+    before = float(old_sla.get("with_rework_hours") or old_sla.get("critical_path_hours") or 0)
+    after = float(new_sla.get("with_rework_hours") or new_sla.get("critical_path_hours") or 0)
+    saved = max(0.0, before - after)
+    pct = round(100.0 * saved / before, 1) if before and saved > 0 else 0.0
+    loops_b = len(old_a.get("rework_loops") or [])
+    loops_a = len(new_a.get("rework_loops") or [])
+    q_b = int((old_a.get("methodology") or {}).get("score") or 0)
+    q_a = int((new_a.get("methodology") or {}).get("score") or 0)
+    return {
+        "sla_before_hours": round(before, 3),
+        "sla_after_hours": round(after, 3),
+        "sla_saved_hours": round(saved, 3),
+        "sla_saved_pct": pct,
+        "rework_before": loops_b,
+        "rework_after": loops_a,
+        "rework_removed": max(0, loops_b - loops_a),
+        "quality_before": q_b,
+        "quality_after": q_a,
+        "quality_gain": max(0, q_a - q_b),
+        "breach_before": bool(old_sla.get("breach")),
+        "breach_after": bool(new_sla.get("breach")),
+        "actions": actions,
+        "engine": engine,
+    }
+
+
+def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
+    """Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация журналов.
+
+    По умолчанию — детерминированный семантический оптимизатор (~0.05 с).
+    Облачная LLM включается только переменной BPMN_TOBE_LLM=1.
+    """
+    text = (regulation_text or "").strip()
+    empty = {
+        "sla_before_hours": 0.0, "sla_after_hours": 0.0, "sla_saved_hours": 0.0, "sla_saved_pct": 0.0,
+        "rework_before": 0, "rework_after": 0, "rework_removed": 0,
+        "quality_before": 0, "quality_after": 0, "quality_gain": 0,
+        "breach_before": False, "breach_after": False, "actions": [], "engine": "semantic-optimizer",
+        "tobe_xml": "", "tobe_audit": {}, "tobe_error": "",
+    }
+    if len(text) < 20:
+        return text, empty
+    engine = "semantic-optimizer"
+    optimized = None
+    llm_text = None
+    try:
+        llm_text = _try_llm_optimize_to_be(text, audit_data or {})
+    except Exception:  # noqa: BLE001
+        llm_text = None
+    if llm_text:
+        optimized, engine = llm_text, "llm"
+        actions = _collect_tobe_actions(text, optimized)
+    else:
+        optimized, actions = _heuristic_optimize_to_be(text)
+        if not actions:
+            actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+    xml, new_audit, err = "", {}, ""
+    try:
+        xml, new_audit, err = _rebuild_process(optimized, f"to-be · {engine}", [])
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    delta = _tobe_delta(audit_data or {}, new_audit or {}, actions, engine)
+    delta["tobe_xml"] = xml or ""
+    delta["tobe_audit"] = new_audit or {}
+    delta["tobe_error"] = err or ""
+    return optimized, delta
+
+
+def _docx_shade(cell: Any, fill: str) -> None:
+    from docx.oxml.ns import nsdecls
+    from docx.oxml import parse_xml
+
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_pr.append(parse_xml(f'<w:shd {nsdecls("w")} w:fill="{fill}" w:val="clear"/>'))
+
+
+def _docx_set_cell(cell: Any, text: str, *, header: bool = False, center: bool = False) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor
+
+    cell.text = ""
+    p = cell.paragraphs[0]
+    if center or header:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(str(text if text not in (None, "") else "—"))
+    run.font.size = Pt(9 if not header else 9)
+    run.font.name = "Calibri"
+    run.bold = header
+    if header:
+        run.font.color.rgb = RGBColor(255, 255, 255)
+        _docx_shade(cell, "003366")
+
+
+def export_docx_passport(xml_str: str, audit_data: dict, regulation_text: str) -> bytes:
+    """Официальный регламент Microsoft Word: паспорт, RACI, пошаговый порядок, карта рисков."""
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Cm, Pt, RGBColor
+    except ImportError as exc:
+        raise RuntimeError("Для экспорта .docx установите пакет python-docx>=1.0.0") from exc
+
+    audit = audit_data if isinstance(audit_data, dict) else {}
+    text = regulation_text or ""
+    try:
+        parsed = parse_regulation(normalize_regulation(text)) if text.strip() else ParsedRegulation(
+            title="Бизнес-процесс", sla_hours=None
+        )
+    except Exception:  # noqa: BLE001
+        parsed = ParsedRegulation(title="Бизнес-процесс", sla_hours=None)
+
+    sla = audit.get("sla") or {}
+    stats = audit.get("stats") or {}
+    bus = audit.get("bus_factor") or {}
+    loops = audit.get("rework_loops") or []
+    recs = audit.get("recommendations") or []
+    target = sla.get("target_hours") if sla.get("target_hours") is not None else parsed.sla_hours
+    owner = _process_owner(text, parsed, audit)
+    title = parsed.title or "Бизнес-процесс по регламенту"
+    roles = list(parsed.roles or [x.get("role") for x in (audit.get("lane_load") or []) if x.get("role")])
+    raci = generate_raci_matrix(list(parsed.steps), roles)
+
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Cm(2.0)
+    section.bottom_margin = Cm(1.8)
+    section.left_margin = Cm(2.0)
+    section.right_margin = Cm(1.6)
+    hp = section.header.paragraphs[0]
+    hp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    hr = hp.add_run("ПАО «Интер РАО»  ·  Дирекция бизнес-архитектуры  ·  официальный регламент процесса")
+    hr.bold = True
+    hr.font.size = Pt(9)
+    hr.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+    hr.font.name = "Calibri"
+    fp = section.footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    fr = fp.add_run("Архитектор BPMN-диаграмм  ·  документ сформирован автоматически  ·  конфиденциально")
+    fr.font.size = Pt(8)
+    fr.font.color.rgb = RGBColor(0x45, 0x5A, 0x64)
+    fr.font.name = "Calibri"
+
+    h = doc.add_paragraph()
+    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    r = h.add_run("Регламент бизнес-процесса")
+    r.bold = True
+    r.font.size = Pt(18)
+    r.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+    r.font.name = "Calibri"
+    sub = doc.add_paragraph()
+    sr = sub.add_run(title)
+    sr.bold = True
+    sr.font.size = Pt(13)
+    sr.font.color.rgb = RGBColor(0x15, 0x65, 0xC0)
+    sr.font.name = "Calibri"
+
+    def heading(label: str) -> None:
+        p = doc.add_paragraph()
+        run = p.add_run(label)
+        run.bold = True
+        run.font.size = Pt(13)
+        run.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+        run.font.name = "Calibri"
+
+    heading("1. Паспорт процесса")
+    pass_rows = [
+        ("Наименование", title),
+        ("Владелец процесса", owner),
+        ("Целевой SLA", _fh(float(target)) if target else "не задан"),
+        ("Критический путь", _fh(float(sla["critical_path_hours"])) if sla.get("critical_path_hours") is not None else "—"),
+        ("Срок с учётом возврата", _fh(float(sla["with_rework_hours"])) if sla.get("with_rework_hours") is not None else "—"),
+        ("Срыв SLA", "да" if sla.get("breach") else "нет"),
+        ("Bus-factor", f"{float(bus.get('max_share') or 0):.0%} · {bus.get('top_role') or '—'}"),
+        ("Узлов / ролей / подпроцессов", f"{stats.get('nodes', '—')} / {stats.get('lanes', len(roles))} / {stats.get('subprocesses', '—')}"),
+        ("Quality Score", f"{int((audit.get('methodology') or {}).get('score') or 0)}%"),
+    ]
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    _docx_set_cell(table.rows[0].cells[0], "Параметр", header=True)
+    _docx_set_cell(table.rows[0].cells[1], "Значение", header=True)
+    for k, v in pass_rows:
+        row = table.add_row().cells
+        _docx_set_cell(row[0], k)
+        _docx_set_cell(row[1], v)
+
+    heading("2. Матрица ответственности (RACI)")
+    legend = doc.add_paragraph()
+    lg = legend.add_run("R — Responsible (исполнитель) · A — Accountable (итог) · C — Consulted (эксперт) · I — Informed (уведомление)")
+    lg.font.size = Pt(8)
+    lg.font.color.rgb = RGBColor(0x45, 0x5A, 0x64)
+    cols = ["№", "Шаг", *roles] if roles else ["№", "Шаг"]
+    rtable = doc.add_table(rows=1, cols=len(cols))
+    rtable.style = "Table Grid"
+    for i, name in enumerate(cols):
+        _docx_set_cell(rtable.rows[0].cells[i], name, header=True, center=True)
+    for item in raci:
+        cells = rtable.add_row().cells
+        _docx_set_cell(cells[0], str(item.get("num") or ""), center=True)
+        _docx_set_cell(cells[1], str(item.get("title") or "")[:80])
+        assigns = item.get("assignments") or {}
+        for j, role in enumerate(roles):
+            letters = "".join(assigns.get(role) or [])
+            _docx_set_cell(cells[j + 2], letters or "—", center=True)
+
+    heading("3. Пошаговый операционный регламент")
+    ot = doc.add_table(rows=1, cols=6)
+    ot.style = "Table Grid"
+    for i, name in enumerate(["№", "Роль", "Действие", "Срок", "Системы", "Документы"]):
+        _docx_set_cell(ot.rows[0].cells[i], name, header=True)
+    if parsed.steps:
+        for st in parsed.steps:
+            row = ot.add_row().cells
+            _docx_set_cell(row[0], str(st.num), center=True)
+            _docx_set_cell(row[1], st.role)
+            name = st.title or "(шлюз решения)"
+            if st.stage:
+                name = f"{name} (этап «{st.stage}»)"
+            _docx_set_cell(row[2], name)
+            _docx_set_cell(row[3], _fh(float(st.hours)) if st.hours else "—", center=True)
+            _docx_set_cell(row[4], ", ".join(st.systems) or "—")
+            _docx_set_cell(row[5], ", ".join(st.artifacts) or "—")
+    else:
+        row = ot.add_row().cells
+        _docx_set_cell(row[0], "—")
+        _docx_set_cell(row[1], "—")
+        _docx_set_cell(row[2], "Шаги не распознаны")
+        _docx_set_cell(row[3], "—")
+        _docx_set_cell(row[4], "—")
+        _docx_set_cell(row[5], "—")
+
+    heading("4. Карта рисков и план мероприятий по оптимизации")
+    risk_p = doc.add_paragraph()
+    rp = risk_p.add_run(
+        f"Циклов возврата: {len(loops)}. "
+        f"Худший возврат: {_fh(float(sla.get('rework_hours') or 0))}. "
+        f"Рекомендации движка аудита:"
+    )
+    rp.font.size = Pt(10)
+    rp.font.name = "Calibri"
+    if loops:
+        lt = doc.add_table(rows=1, cols=4)
+        lt.style = "Table Grid"
+        for i, name in enumerate(["Цикл", "Откуда", "Куда", "Стоимость"]):
+            _docx_set_cell(lt.rows[0].cells[i], name, header=True)
+        for loop in loops:
+            row = lt.add_row().cells
+            _docx_set_cell(row[0], str(loop.get("label") or ""))
+            _docx_set_cell(row[1], str(loop.get("from") or ""))
+            _docx_set_cell(row[2], str(loop.get("to") or ""))
+            _docx_set_cell(row[3], _fh(float(loop.get("cycle_hours") or 0)))
+    if recs:
+        for rec in recs:
+            p = doc.add_paragraph(style="List Bullet")
+            run = p.add_run(str(rec))
+            run.font.size = Pt(10)
+            run.font.name = "Calibri"
+    else:
+        p = doc.add_paragraph()
+        run = p.add_run("Существенных узких мест не выявлено: процесс сбалансирован по ролям.")
+        run.font.size = Pt(10)
+        run.font.name = "Calibri"
+    note = doc.add_paragraph()
+    nr = note.add_run(
+        "План To-Be: параллелить независимые шаги разных ролей, ввести входной контроль перед согласованиями, "
+        "автоматизировать фиксацию в журналах (scriptTask). Целевая схема строится во вкладке «Оптимизация As-Is → To-Be»."
+    )
+    nr.italic = True
+    nr.font.size = Pt(9)
+    nr.font.color.rgb = RGBColor(0x15, 0x65, 0xC0)
+    nr.font.name = "Calibri"
+    if xml_str:
+        meta = doc.add_paragraph()
+        mr = meta.add_run(f"Исходная BPMN-модель: {len(xml_str)} символов XML.")
+        mr.font.size = Pt(8)
+        mr.font.color.rgb = RGBColor(0x78, 0x90, 0x9C)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
