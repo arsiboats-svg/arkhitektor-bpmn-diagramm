@@ -69,7 +69,8 @@ API объекта DIAGRAM (строго эти сигнатуры):
 - gw_id = DIAGRAM.add_inclusive_gateway(name, parent_id)   # OR
 - group_id = DIAGRAM.add_group(name, parent_id)
 - DIAGRAM.add_link(source_id, target_id, condition_name="")  # поток; у веток шлюза ОБЯЗАТЕЛЬНА подпись условия
-- DIAGRAM.set_sla(task_id, hours)                           # трудозатраты шага, часы (1 раб. день = 8 ч). ОБЯЗАТЕЛЬНО, если срок есть в регламенте.
+- DIAGRAM.set_sla(task_id, hours)                           # трудозатраты шага В ЧАСАХ. ОБЯЗАТЕЛЬНО, если срок есть в регламенте.
+                                                             #   «30 минут» → 0.5; «2 часа» → 2; «5 рабочих дней» → 5 × 8 = 40; «3 календарных дня» → 72
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 1. РОЛЕВАЯ МОДЕЛЬ. Выдели всех участников регламента и создай для них дорожки одним вызовом add_pool.
@@ -1105,6 +1106,26 @@ def _cloud_prefixes() -> List[str]:
     return [p for p in CLOUD_PREFIXES if os.getenv(f"{p}_API_KEY")]
 
 
+_SET_SLA_RE = re.compile(r"(DIAGRAM\.set_sla\(\s*[^,]+,\s*)([\d.]+)(\s*\))")
+
+
+def _fix_sla_units(code: str, text_hours: List[float]) -> Tuple[str, str]:
+    """Модель иногда пишет сроки в днях («5 рабочих дней» → 5), а set_sla ждёт часы (40).
+
+    Сверяем сумму её сроков с суммой сроков, разобранных из текста: расхождение ровно ×8
+    (рабочие дни) или ×24 (сутки) — это перепутанные единицы, пересчитываем. Иначе код не трогаем.
+    """
+    values = [float(m.group(2)) for m in _SET_SLA_RE.finditer(code or "")]
+    if len(text_hours) < 2 or len(values) < 2 or not sum(values):
+        return code, ""
+    ratio = sum(text_hours) / sum(values)
+    factor = next((f for f in (8.0, 24.0) if abs(ratio - f) / f < 0.2), None)
+    if factor is None:
+        return code, ""
+    fixed = _SET_SLA_RE.sub(lambda m: f"{m.group(1)}{round(float(m.group(2)) * factor, 3)}{m.group(3)}", code)
+    return fixed, f"сроки шагов переведены из дней в часы (×{factor:.0f}): модель указала дни вместо часов"
+
+
 def cloud_engine_status() -> str:
     """Строка для интерфейса: подключённые облачные модели по порядку (без раскрытия ключей)."""
     parts = []
@@ -1143,10 +1164,12 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
 
     artifacts: List[Dict[str, Any]] = []
     it_systems: List[Dict[str, Any]] = []
+    text_hours: List[float] = []
     try:
         header = parse_regulation(text)
         process_name, sla = header.title, header.sla_hours
         artifacts, it_systems = header.artifacts, header.it_systems
+        text_hours = [s.hours for s in header.steps if s.hours]
     except Exception:  # noqa: BLE001
         process_name, sla = "Бизнес-процесс по регламенту", None
 
@@ -1167,6 +1190,9 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{name}: недоступен ({_error_reason(exc)})")
                     break
                 call_s = time.time() - call_started
+                raw, unit_note = _fix_sla_units(raw, text_hours)
+                if unit_note:
+                    trace.append(f"{engine_label}: {unit_note}")
                 xml, audit, err = execute_generated_code(raw, process_name, sla, regulation_text=text)
                 quality = audit.get("quality", {}) if not err else {}
                 if not err and quality.get("ok"):
