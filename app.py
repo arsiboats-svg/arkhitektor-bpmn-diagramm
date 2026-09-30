@@ -21,6 +21,7 @@ import streamlit.components.v1 as components
 from ai_generator import (
     assistant_chat,
     build_diagram_catalog,
+    build_canvas_copilot,
     build_process_context,
     cloud_engine_status,
     generate_bpmn_from_text,
@@ -254,10 +255,16 @@ def _bpmn_js_tags() -> Tuple[str, str]:
     return js_tag, css_tag
 
 
-def viewer_html(xml: str, height: int, catalog: Optional[Dict[str, Any]] = None) -> str:
+def viewer_html(
+    xml: str,
+    height: int,
+    catalog: Optional[Dict[str, Any]] = None,
+    copilot: Optional[Dict[str, Any]] = None,
+) -> str:
     js_tag, css_tag = _bpmn_js_tags()
     payload = json.dumps(xml).replace("</", "<\\/")
     catalog_js = json.dumps(catalog or {}, ensure_ascii=False).replace("</", "<\\/")
+    copilot_js = json.dumps(copilot or {}, ensure_ascii=False).replace("</", "<\\/")
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
@@ -299,7 +306,49 @@ def viewer_html(xml: str, height: int, catalog: Optional[Dict[str, Any]] = None)
   #wrap.pano {{ position:fixed; top:0; left:0; width:100vw; height:100vh !important; border:0; border-radius:0; z-index:999999; }}
   #wrap.pano .bar {{ display:none; }}
   #wrap.pano #close {{ display:block; }}
-  #wrap.pano .hint {{ opacity:.75; }}
+  #wrap.pano .hint {{ opacity:.75; left:12px; right:auto; max-width:calc(100% - 100px); }}
+  #ai-fab {{
+    position:absolute; bottom:24px; right:24px; z-index:1000001;
+    width:58px; height:58px; border:0; border-radius:50%;
+    background:linear-gradient(135deg,#003366,#1565C0); color:#fff; font-size:22px;
+    cursor:pointer; box-shadow:0 8px 22px rgba(0,51,102,.38);
+    display:flex; align-items:center; justify-content:center;
+    transition:transform .15s, box-shadow .15s;
+  }}
+  #ai-fab:hover {{ transform:scale(1.07); box-shadow:0 10px 28px rgba(21,101,192,.45); }}
+  #ai-fab span {{ font-size:11px; font-weight:800; display:none; }}
+  #wrap.ai-open #ai-fab {{ display:none; }}
+  #ai-drawer {{
+    display:none; position:absolute; bottom:24px; right:24px; z-index:1000002;
+    width:380px; height:500px; max-width:calc(100% - 36px); max-height:calc(100% - 48px);
+    flex-direction:column; overflow:hidden;
+    background:rgba(255,255,255,.93); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+    border:1px solid #90CAF9; border-radius:18px;
+    box-shadow:0 16px 40px rgba(0,51,102,.28);
+  }}
+  #wrap.ai-open #ai-drawer {{ display:flex; }}
+  #ai-drawer .ai-head {{
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:12px 14px; color:#fff; font-weight:800; font-size:14px;
+    background:linear-gradient(105deg,#003366,#1565C0);
+  }}
+  #ai-min {{ border:0; background:rgba(255,255,255,.18); color:#fff; border-radius:10px;
+      padding:5px 10px; font-weight:700; cursor:pointer; font-size:12px; }}
+  #ai-min:hover {{ background:rgba(255,255,255,.32); }}
+  #ai-chips {{ display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px 6px 12px; }}
+  #ai-chips button {{
+    border:1px solid #90CAF9; background:#E3F2FD; color:#003366; border-radius:999px;
+    padding:5px 10px; font-size:12px; font-weight:700; cursor:pointer;
+  }}
+  #ai-chips button:hover {{ background:#1565C0; color:#fff; border-color:#1565C0; }}
+  #ai-log {{ flex:1; overflow:auto; padding:4px 12px 10px 12px; font-size:13px; line-height:1.45; }}
+  #ai-log .msg {{ margin:8px 0; padding:8px 10px; border-radius:12px; max-width:95%; }}
+  #ai-log .u {{ background:#E3F2FD; color:#003366; margin-left:18%; }}
+  #ai-log .a {{ background:#F4F8FD; border:1px solid #DCE6F3; color:#263238; }}
+  #ai-form {{ display:flex; gap:6px; padding:10px 12px 12px 12px; border-top:1px solid #DCE6F3; background:rgba(255,255,255,.7); }}
+  #ai-in {{ flex:1; border:1px solid #90CAF9; border-radius:10px; padding:8px 10px; font-size:13px; outline:none; }}
+  #ai-send {{ border:0; border-radius:10px; width:40px; background:linear-gradient(135deg,#003366,#1565C0);
+      color:#fff; font-weight:800; cursor:pointer; }}
 </style></head>
 <body>
 <div id="wrap">
@@ -319,17 +368,28 @@ def viewer_html(xml: str, height: int, catalog: Optional[Dict[str, Any]] = None)
     <div class="ai" id="t-ai"></div>
   </div>
   <div class="hint" id="hint"></div>
+  <button type="button" id="ai-fab" title="AI-Ассистент процесса">💬</button>
+  <div id="ai-drawer" aria-hidden="true">
+    <div class="ai-head"><div>💬 AI-Ассистент процесса</div><button type="button" id="ai-min">✕ Свернуть</button></div>
+    <div id="ai-chips"></div>
+    <div id="ai-log"></div>
+    <form id="ai-form" autocomplete="off">
+      <input id="ai-in" placeholder="Спросите про SLA, роли, узкие места…" maxlength="400">
+      <button type="submit" id="ai-send" title="Отправить">➤</button>
+    </form>
+  </div>
 </div>
 {js_tag}
 <script>
   const XML = {payload};
   const CATALOG = {catalog_js};
+  const COPILOT = {copilot_js};
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
   const wrap = document.getElementById('wrap');
   const hint = document.getElementById('hint');
   const tip = document.getElementById('tip');
-  const HINT_NORMAL = 'Клик по блоку — карточка шага · перетаскивание — панорама · Ctrl + колесо — масштаб';
+  const HINT_NORMAL = 'Клик по блоку — карточка · 💬 AI в углу · Ctrl + колесо — масштаб';
   const HINT_PANO = 'Перетаскивание — перемещение · колесо — масштаб · Esc — закрыть панораму';
   hint.textContent = HINT_NORMAL;
 
@@ -455,6 +515,7 @@ def viewer_html(xml: str, height: int, catalog: Optional[Dict[str, Any]] = None)
   document.getElementById('close').onclick = exitPanorama;
   const onKey = e => {{
     if (e.key === 'Escape') {{
+      if (wrap.classList.contains('ai-open')) {{ setCopilot(false); e.stopPropagation(); return; }}
       if (tip.style.display === 'block') {{ clearPick(); if (!panoMode) e.stopPropagation(); }}
       if (panoMode) exitPanorama();
     }}
@@ -470,6 +531,70 @@ def viewer_html(xml: str, height: int, catalog: Optional[Dict[str, Any]] = None)
     const scale = Math.min(6, Math.max(0.03, canvas().zoom() * Math.exp(-e.deltaY * 0.0016)));
     canvas().zoom(scale, {{ x: e.clientX - r.left, y: e.clientY - r.top }});
   }}, {{ capture: true, passive: false }});
+
+  // ---------------- Плавающий AI-ассистент (обычный вид и панорама) ----------------
+  const drawer = document.getElementById('ai-drawer');
+  const logEl = document.getElementById('ai-log');
+  const chipsEl = document.getElementById('ai-chips');
+  const inputEl = document.getElementById('ai-in');
+  function mdLite(s) {{
+    return String(s || '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/\\*\\*(.+?)\\*\\*/g,'<b>$1</b>')
+      .replace(/\\n/g,'<br>');
+  }}
+  function addMsg(role, text) {{
+    const d = document.createElement('div');
+    d.className = 'msg ' + (role === 'user' ? 'u' : 'a');
+    d.innerHTML = mdLite(text);
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+  }}
+  function chipBy(id) {{
+    return ((COPILOT.chips || []).find(c => c.id === id) || {{}}).a;
+  }}
+  function copilotAnswer(msg) {{
+    const q = (msg || '').trim();
+    if (!q) return 'Напишите вопрос о процессе — SLA, роли или как ускорить.';
+    const low = q.toLowerCase();
+    const chips = COPILOT.chips || [];
+    const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
+    if (exact) return exact.a;
+    if (/ускор|оптимиз|сократ|быстрее|параллел/.test(low)) return chipBy('speed') || COPILOT.fallback;
+    if (/sla|срок|срыв|задерж|критич|длительн|узк/.test(low)) return chipBy('sla') || COPILOT.fallback;
+    if (/роль|нагруз|bus|риск|исполнител|диспетчер|загруж/.test(low)) return chipBy('roles') || COPILOT.fallback;
+    return COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — тогда отвечу по метрикам.';
+  }}
+  function ask(text) {{
+    const q = (text || '').trim();
+    if (!q) return;
+    addMsg('user', q);
+    addMsg('assistant', copilotAnswer(q));
+    inputEl.value = '';
+  }}
+  function setCopilot(on) {{
+    wrap.classList.toggle('ai-open', on);
+    drawer.setAttribute('aria-hidden', on ? 'false' : 'true');
+    if (on) {{
+      try {{ clearPick(); }} catch (e) {{}}
+      if (!logEl.childElementCount && COPILOT.greeting) addMsg('assistant', COPILOT.greeting);
+      setTimeout(() => inputEl.focus(), 30);
+    }}
+  }}
+  (COPILOT.chips || []).forEach(c => {{
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = c.label;
+    b.onclick = () => {{ setCopilot(true); ask(c.q); }};
+    chipsEl.appendChild(b);
+  }});
+  document.getElementById('ai-fab').onclick = ev => {{ ev.stopPropagation(); setCopilot(true); }};
+  document.getElementById('ai-min').onclick = ev => {{ ev.stopPropagation(); setCopilot(false); }};
+  document.getElementById('ai-form').onsubmit = ev => {{ ev.preventDefault(); ask(inputEl.value); }};
+  drawer.addEventListener('mousedown', ev => ev.stopPropagation());
+  drawer.addEventListener('click', ev => ev.stopPropagation());
+  drawer.addEventListener('wheel', ev => ev.stopPropagation(), {{ passive: true }});
+  document.getElementById('ai-fab').addEventListener('mousedown', ev => ev.stopPropagation());
 </script></body></html>
 """
 
@@ -1025,7 +1150,10 @@ def render_diagram(canvas_height: int) -> None:
         catalog = build_diagram_catalog(
             result["xml"], result.get("audit") or {}, st.session_state.get("reg_text") or ""
         )
-        page = viewer_html(result["xml"], canvas_height, catalog)
+        copilot = build_canvas_copilot(
+            result["xml"], result.get("audit") or {}, st.session_state.get("reg_text") or ""
+        )
+        page = viewer_html(result["xml"], canvas_height, catalog, copilot)
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
             st.iframe(page, height=canvas_height + 16)
         else:

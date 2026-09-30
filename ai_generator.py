@@ -16,6 +16,7 @@
     generate_process_passport(xml, audit, text) -> Markdown «Паспорт процесса»
     inspect_task_details(task_name, task_role, process_context) -> операционная карточка
     build_diagram_catalog(xml, audit, text) -> метаданные узлов для клика по холсту
+    build_canvas_copilot(xml, audit, text) -> ответы плавающего ассистента на холсте
     PROMPT_TEMPLATE / build_prompt(text)
 
 Модуль не падает при недоступности моделей: при любом сбое сети, таймауте или
@@ -2720,3 +2721,29 @@ def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) 
             "comment": live_node_comment(name, role, kind, ctx),
         }
     return catalog
+
+
+def build_canvas_copilot(xml_str: str, audit_data: dict, regulation_text: str) -> Dict[str, Any]:
+    """Пакет для плавающего ассистента на холсте: чипы и ответы по аудиту активного процесса."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {})
+    title = str(ctx.get("title") or "Бизнес-процесс")
+    try:
+        sla_a = heuristic_analysis("В чём причина срыва SLA?", ctx)
+        speed_a = heuristic_analysis("Как ускорить процесс?", ctx)
+        roles_a = _analysis_load(ctx, [])
+        summary = _analysis_summary(ctx)
+    except Exception:  # noqa: BLE001 — холст не должен падать
+        sla_a = speed_a = roles_a = summary = "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
+    return {
+        "title": title,
+        "greeting": (
+            f"Я ассистент процесса «{title}». Вопросы про SLA, роли и ускорение "
+            "отвечаю по цифрам аудита — можно не выходить из панорамы."
+        ),
+        "fallback": summary,
+        "chips": [
+            {"id": "speed", "label": "⚡ Как ускорить?", "q": "Как ускорить процесс?", "a": speed_a},
+            {"id": "sla", "label": "🔍 Анализ SLA", "q": "В чём причина срыва SLA?", "a": sla_a},
+            {"id": "roles", "label": "👤 Роли и риски", "q": "Как оптимизировать нагрузку ролей?", "a": roles_a},
+        ],
+    }
