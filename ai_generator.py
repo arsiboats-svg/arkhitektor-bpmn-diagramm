@@ -3263,6 +3263,12 @@ _REPAIR_WORK_RE = re.compile(
     re.I,
 )
 _RACI_STOP = {"выполн", "провод", "оформ", "провер", "принят", "переда", "состав", "оценк"}
+_CAUSAL_RE = re.compile(
+    r"на\s+основан|по\s+результат|после\s+(?:чего|этого|шага)|затем|"
+    r"переда[её]т|входн\w+\s+данн|полученн\w+|исходн\w+\s+данн|"
+    r"согласованн\w+\s+документ",
+    re.I,
+)
 TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
 Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
 1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
@@ -3369,10 +3375,32 @@ def generate_raci_matrix(steps: list, roles: list) -> List[Dict[str, Any]]:
     return matrix
 
 
-def _independent_steps(a: Step, b: Step) -> bool:
+def _info_or_causal(a: Step, b: Step, body_a: str = "", body_b: str = "") -> bool:
+    """Информационная или причинная зависимость: общий артефакт, ссылка на выход, каузальные маркеры."""
+    arts_a = {str(x).strip().lower() for x in (a.artifacts or []) if str(x).strip()}
+    arts_b = {str(x).strip().lower() for x in (b.artifacts or []) if str(x).strip()}
+    if arts_a and arts_b and (arts_a & arts_b):
+        return True
+    blob_b = (body_b or "").lower()
+    for art in arts_a:
+        if len(art) >= 4 and art in blob_b:
+            return True
+    if _CAUSAL_RE.search(body_b or "") or _CAUSAL_RE.search(b.title or ""):
+        return True
+    title_a = (a.title or "").strip().lower()
+    if len(title_a) >= 12 and title_a in blob_b:
+        return True
+    _ = body_a
+    return False
+
+
+def _independent_steps(a: Step, b: Step, body_a: str = "", body_b: str = "") -> bool:
+    """Параллелить можно только разные роли без информационной/причинной связи и без стоп-листа ОТ."""
     if not a.role or not b.role or a.role == b.role:
         return False
     if a.decision or b.decision or b.parallel:
+        return False
+    if _info_or_causal(a, b, body_a, body_b):
         return False
     stems_a = {w[:6].lower() for w in re.findall(r"[А-Яа-яЁё]{5,}", a.title or "")}
     stems_b = {w[:6].lower() for w in re.findall(r"[А-Яа-яЁё]{5,}", b.title or "")}
@@ -3474,7 +3502,7 @@ def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str,
         already = bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", bodies[i + 1], re.I))
         if (
             not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
-            and _independent_steps(a, b)
+            and _independent_steps(a, b, bodies[i], bodies[i + 1])
             and not already
         ):
             bodies[i + 1] = "Параллельно: " + bodies[i + 1]
@@ -3606,19 +3634,22 @@ def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[
 
 
 def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]], engine: str) -> Dict[str, Any]:
+    """Эффект To-Be: экономия КП = SLA_AsIs − SLA_ToBe по Беллману-Форду (critical_path_hours)."""
     old_a, new_a = old_audit or {}, new_audit or {}
     old_sla = old_a.get("sla") or {}
     new_sla = new_a.get("sla") or {}
-    before = float(old_sla.get("with_rework_hours") or old_sla.get("critical_path_hours") or 0)
-    after = float(new_sla.get("with_rework_hours") or new_sla.get("critical_path_hours") or 0)
-    saved = max(0.0, before - after)
-    pct = round(100.0 * saved / before, 1) if before and saved > 0 else 0.0
+    before = float(old_sla.get("critical_path_hours") or 0)
+    after = float(new_sla.get("critical_path_hours") or 0)
+    saved = before - after
+    pct = round(100.0 * max(0.0, saved) / before, 1) if before and saved > 0 else 0.0
     loops_b = len(old_a.get("rework_loops") or [])
     loops_a = len(new_a.get("rework_loops") or [])
     q_b = int((old_a.get("methodology") or {}).get("score") or 0)
     q_a = int((new_a.get("methodology") or {}).get("score") or 0)
     rw_h_b = float(old_sla.get("rework_hours") or 0)
     rw_h_a = float(new_sla.get("rework_hours") or 0)
+    before_rw = float(old_sla.get("with_rework_hours") or before)
+    after_rw = float(new_sla.get("with_rework_hours") or after)
     return {
         "sla_before_hours": round(before, 3),
         "sla_after_hours": round(after, 3),
@@ -3629,6 +3660,8 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
         "rework_removed": max(0, loops_b - loops_a),
         "rework_hours_before": round(rw_h_b, 3),
         "rework_hours_after": round(rw_h_a, 3),
+        "with_rework_before": round(before_rw, 3),
+        "with_rework_after": round(after_rw, 3),
         "quality_before": q_b,
         "quality_after": q_a,
         "quality_gain": max(0, q_a - q_b),

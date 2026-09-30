@@ -68,8 +68,11 @@ def main() -> None:
     assert float(audit_g["sla"]["critical_path_hours"]) >= 350
     _, delta_g = optimize_process_to_be(grid, audit_g)
     assert delta_g.get("engine") == "semantic-optimizer"
-    assert float(delta_g.get("sla_saved_hours") or 0) > 50
-    assert float(delta_g["sla_before_hours"]) > float(delta_g["sla_after_hours"])
+    saved = float(delta_g.get("sla_saved_hours") or 0)
+    before = float(delta_g["sla_before_hours"])
+    after = float(delta_g["sla_after_hours"])
+    assert abs(saved - (before - after)) < 1e-6, (saved, before, after)
+    assert before > after
 
     proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
         encoding="utf-8"

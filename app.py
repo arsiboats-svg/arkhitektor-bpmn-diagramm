@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
 import os
 import re
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,6 +99,40 @@ def load_examples() -> Dict[str, Dict[str, str]]:
 def read_asset(name: str) -> Optional[str]:
     path = ASSETS_DIR / name
     return path.read_text(encoding="utf-8") if path.exists() else None
+
+
+def _reg_hash(text: str, *parts: object) -> str:
+    payload = "\u001f".join([text or "", *[str(p) for p in parts]])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _audit_cache_slice(audit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Компактный срез аудита для ключа кэша To-Be (без code/trace)."""
+    data = audit or {}
+    sla = data.get("sla") or {}
+    meth = data.get("methodology") or {}
+    return {
+        "critical_path_hours": sla.get("critical_path_hours"),
+        "with_rework_hours": sla.get("with_rework_hours"),
+        "rework_hours": sla.get("rework_hours"),
+        "breach": sla.get("breach"),
+        "quality": meth.get("score"),
+        "rework_n": len(data.get("rework_loops") or []),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def cached_generate_bpmn(text_hash: str, text: str, use_llm: bool) -> Tuple[str, Dict[str, Any], str]:
+    """Генерация XML + аудит по sha256 текста регламента. Повторный вызов — из кэша Streamlit."""
+    _ = text_hash
+    return generate_bpmn_from_text(text, use_llm=use_llm)
+
+
+@st.cache_data(show_spinner=False)
+def cached_optimize_to_be(text_hash: str, text: str, asis_core: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """To-Be по хешу регламента: вкладки и смена вида не пересчитывают граф."""
+    _ = text_hash
+    return optimize_process_to_be(text, asis_core)
 
 
 def esc(value: Any) -> str:
@@ -1076,24 +1110,21 @@ def render_details(audit: Dict[str, Any]) -> None:
 # Приложение
 # --------------------------------------------------------------------------- #
 def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None:
+    key = _reg_hash(text, bool(use_llm))
+    mem = st.session_state.get("_gen_mem")
+    if isinstance(mem, dict) and mem.get("key") == key and mem.get("result"):
+        st.session_state["result"] = mem["result"]
+        return
     progress = st.progress(0, text="Запуск конвейера…") if show_progress else None
-    stages = [(18, "Семантический разбор регламента: роли, условия, параллельность…")]
-    for pct, label in stages:
-        if progress:
-            progress.progress(pct, text=label)
-            time.sleep(0.25)
     if progress:
-        progress.progress(
-            45, text="Генерация кода DIAGRAM (LLM или встроенный эмулятор)… Локальной модели может потребоваться до 5 минут."
-        )
-    xml, audit, error = generate_bpmn_from_text(text, use_llm=use_llm)
+        progress.progress(45, text="Генерация BPMN 2.0 (кэш по sha256 регламента)…")
+    xml, audit, error = cached_generate_bpmn(key, text, bool(use_llm))
     if progress:
-        progress.progress(78, text="Раскладка по слоям, ортогональные стрелки, BPMN in Color…")
-        time.sleep(0.25)
-        progress.progress(100, text="Аудит узких мест и валидация XML завершены")
-        time.sleep(0.2)
+        progress.progress(100, text="Аудит узких мест готов")
         progress.empty()
-    st.session_state["result"] = {"xml": xml, "audit": audit, "error": error}
+    result = {"xml": xml, "audit": audit, "error": error}
+    st.session_state["result"] = result
+    st.session_state["_gen_mem"] = {"key": key, "result": result}
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
@@ -1303,13 +1334,24 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
     if cached and cached.get("source_xml") == src:
         return cached
     text = st.session_state.get("reg_text") or ""
+    asis_audit = result.get("audit") or {}
+    asis_core = {
+        "sla": asis_audit.get("sla") or {},
+        "methodology": asis_audit.get("methodology") or {},
+        "rework_loops": asis_audit.get("rework_loops") or [],
+    }
+    tobe_key = _reg_hash(text, "tobe", json.dumps(_audit_cache_slice(asis_audit), ensure_ascii=False, sort_keys=True))
+    mem = st.session_state.get("_tobe_mem")
+    if isinstance(mem, dict) and mem.get("key") == tobe_key and mem.get("pack") and mem["pack"].get("source_xml") == src:
+        st.session_state["tobe_pack"] = mem["pack"]
+        return mem["pack"]
     with st.spinner("Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация…"):
-        opt_text, delta = optimize_process_to_be(text, result.get("audit") or {})
+        opt_text, delta = cached_optimize_to_be(tobe_key, text, asis_core)
     xml = str((delta or {}).get("tobe_xml") or "")
     audit = (delta or {}).get("tobe_audit") or {}
     err = str((delta or {}).get("tobe_error") or "")
     if not xml:
-        xml, audit, err = generate_bpmn_from_text(opt_text, use_llm=False)
+        xml, audit, err = cached_generate_bpmn(_reg_hash(opt_text, False), opt_text, False)
     pack = {
         "source_xml": src,
         "text": opt_text,
@@ -1319,6 +1361,7 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
         "error": err,
     }
     st.session_state["tobe_pack"] = pack
+    st.session_state["_tobe_mem"] = {"key": tobe_key, "pack": pack}
     return pack
 
 
@@ -1346,20 +1389,19 @@ def render_tobe_tab() -> None:
     delta = pack.get("delta") or {}
     if pack.get("error") and not pack.get("xml"):
         st.warning(f"Целевую диаграмму построить не удалось: {pack['error']}")
-    saved_h = max(0.0, float(delta.get("sla_saved_hours") or 0))
-    before_h = max(0.0, float(delta.get("sla_before_hours") or 0))
-    after_h = max(0.0, float(delta.get("sla_after_hours") or 0))
-    if after_h > before_h:
-        saved_h = 0.0
-    saved_pct = round(100.0 * saved_h / before_h, 1) if before_h and saved_h > 0 else 0.0
-    removed = int(delta.get("rework_removed") or 0)
-    q_gain = int(delta.get("quality_gain") or 0)
+    saved_h = float(delta.get("sla_saved_hours") or 0)
+    before_h = float(delta.get("sla_before_hours") or 0)
+    after_h = float(delta.get("sla_after_hours") or 0)
     asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_audit = pack.get("audit") or {}
-    asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
-    tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
-    asis_rw = float((asis_audit.get("sla") or {}).get("with_rework_hours") or before_h)
-    tobe_rw = float((tobe_audit.get("sla") or {}).get("with_rework_hours") or after_h)
+    asis_cp = before_h or float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
+    tobe_cp = after_h or float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
+    saved_h = asis_cp - tobe_cp
+    saved_pct = round(100.0 * max(0.0, saved_h) / asis_cp, 1) if asis_cp and saved_h > 0 else 0.0
+    removed = int(delta.get("rework_removed") or 0)
+    q_gain = int(delta.get("quality_gain") or 0)
+    asis_rw = float(delta.get("with_rework_before") or (asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
+    tobe_rw = float(delta.get("with_rework_after") or (tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
     if saved_h >= 1.0 / 60.0:
         eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
     else:

@@ -61,6 +61,9 @@ LABEL_LIFT = 12.0
 LABEL_GAP = 6.0                # минимальный зазор между подписями              # сдвиг подписей над стрелками (y - 12)
 CHAR_W = 6.8                   # средняя ширина символа подписи (px)
 LINE_H = 15.0
+ROUTE_CLEARANCE = 12.0         # клиренс стрелки от чужого прямоугольника / угла
+FAN_IN_GAP = 10.0              # разводка входящих в одну грань (8–12 px)
+REWORK_PAD = 20.0              # запас U-петли возврата за крайним узлом скоупа
 
 BUS_FACTOR_THRESHOLD = 0.45
 
@@ -240,6 +243,14 @@ def _rects_intersect(a: Rect, b: Rect, eps: float = 0.5) -> bool:
 
 def _rect_contains(outer: Rect, inner: Rect) -> bool:
     return outer[0] <= inner[0] and outer[1] <= inner[1] and outer[2] >= inner[2] and outer[3] >= inner[3]
+
+
+def _inflate_rect(rect: Rect, pad: float) -> Rect:
+    return (rect[0] - pad, rect[1] - pad, rect[2] + pad, rect[3] + pad)
+
+
+def _node_rect(node: "FlowNode") -> Rect:
+    return (node.x, node.y, node.x + node.width, node.y + node.height)
 
 
 def _overlap_len(a: Tuple[Point, Point], b: Tuple[Point, Point]) -> float:
@@ -787,7 +798,8 @@ class BPMNDiagramBuilder:
         widths = {c: max(n.width for n in nodes) for c, nodes in columns.items()}
         content_w = sum(widths.values()) + SUB_COLUMN_GAP_X * (len(columns) - 1)
         width = max(SUBPROCESS_MIN_W, content_w + 2 * SUB_PAD_X)
-        height = max(SUBPROCESS_MIN_H, SUB_PAD_TOP + content_h + SUB_PAD_BOTTOM)
+        rework_room = REWORK_PAD + ROUTE_CLEARANCE if back else 0.0
+        height = max(SUBPROCESS_MIN_H, SUB_PAD_TOP + content_h + SUB_PAD_BOTTOM + rework_room)
         x = (width - content_w) / 2.0
         for c in sorted(columns):
             y = SUB_PAD_TOP + (height - SUB_PAD_TOP - SUB_PAD_BOTTOM - heights[c]) / 2.0
@@ -825,10 +837,11 @@ class BPMNDiagramBuilder:
             columns[layers[node.id]].append(node)
             buckets[(layers[node.id], node.lane_id or pool.lane_ids[0])].append(node)
 
+        rework_room = REWORK_PAD + ROUTE_CLEARANCE if back else 0.0
         need: Dict[str, float] = {lane.id: LANE_MIN_H for lane in lanes}
         for (_, lane_id), nodes in buckets.items():
             total = sum(n.height for n in nodes) + NODE_ROW_GAP_Y * (len(nodes) - 1)
-            need[lane_id] = max(need[lane_id], total + 2 * LANE_PAD_Y)
+            need[lane_id] = max(need[lane_id], total + 2 * LANE_PAD_Y + rework_room)
 
         pool.x, pool.y = POOL_X, y_offset
         y = y_offset
@@ -876,6 +889,7 @@ class BPMNDiagramBuilder:
                 self.lanes[lane_id].width = pool.width - POOL_HEADER_W
         self._layout_groups()
         self._route_all()
+        self._fit_pool_to_waypoints()
         self._place_labels()
         self._fit_last_pool_to_labels()
 
@@ -1068,6 +1082,24 @@ class BPMNDiagramBuilder:
             group.x, group.y = x1, y1
             group.width, group.height = max(80.0, x2 - x1), max(40.0, y2 - y1)
 
+    def _fit_pool_to_waypoints(self) -> None:
+        """U-петля возврата не должна упираться в нижнюю/верхнюю границу пула: растим дорожку."""
+        pad = ROUTE_CLEARANCE
+        for pool in self.pools.values():
+            ys: List[float] = []
+            for link in self.links:
+                src = self.nodes.get(link.source_id)
+                if src is None or src.owner_id != pool.process_id:
+                    continue
+                ys.extend(pt[1] for pt in link.waypoints)
+            if not ys or not pool.lane_ids:
+                continue
+            overflow = max(ys) + pad - (pool.y + pool.height)
+            if overflow > 0:
+                pool.height += overflow
+                lowest = max((self.lanes[i] for i in pool.lane_ids), key=lambda lane: lane.y)
+                lowest.height += overflow
+
     # -------------------------------------------------------------- routing
     def _scope_bounds(self, scope_owner: str) -> Tuple[float, float]:
         node = self.nodes.get(scope_owner)
@@ -1078,6 +1110,12 @@ class BPMNDiagramBuilder:
                 return pool.y + 8.0, pool.y + pool.height - 8.0
         return 0.0, 10_000.0
 
+    def _scope_envelope(self, obstacles: Iterable[FlowNode]) -> Tuple[float, float]:
+        nodes = list(obstacles)
+        if not nodes:
+            return 0.0, 0.0
+        return min(n.y for n in nodes), max(n.y + n.height for n in nodes)
+
     def _route_all(self) -> None:
         placed: Dict[str, List[Tuple[Point, Point]]] = defaultdict(list)
         for link in self.links:
@@ -1085,12 +1123,90 @@ class BPMNDiagramBuilder:
             scope = src.owner_id
             obstacles = [n for n in self.nodes.values() if n.owner_id == scope]
             bounds = self._scope_bounds(scope)
-            link.waypoints = self._best_route(src, tgt, obstacles, placed[scope], bounds)
+            envelope = self._scope_envelope(obstacles)
+            link.waypoints = self._best_route(
+                src, tgt, obstacles, placed[scope], bounds, envelope, bool(link.is_back)
+            )
             for a, b in zip(link.waypoints, link.waypoints[1:]):
                 placed[scope].append((a, b))
+        self._fan_in_offsets()
 
-    @staticmethod
-    def _candidates(src: FlowNode, tgt: FlowNode, bounds: Tuple[float, float]) -> List[List[Point]]:
+    def _dock_side(self, path: Sequence[Point], node: FlowNode) -> str:
+        if len(path) < 2:
+            return "left"
+        x, y = path[-1]
+        x1, y1, x2, y2 = node.x, node.y, node.x + node.width, node.y + node.height
+        px, py = path[-2]
+        if abs(px - x) < 0.5:
+            return "top" if y <= (y1 + y2) / 2.0 else "bottom"
+        if abs(py - y) < 0.5:
+            return "left" if x <= (x1 + x2) / 2.0 else "right"
+        dl, dr, dt, db = abs(x - x1), abs(x - x2), abs(y - y1), abs(y - y2)
+        return min(
+            (("left", dl), ("right", dr), ("top", dt), ("bottom", db)),
+            key=lambda item: item[1],
+        )[0]
+
+    def _shift_path_end(self, path: Sequence[Point], side: str, delta: float) -> List[Point]:
+        out = [(p[0], p[1]) for p in path]
+        if len(out) < 2 or abs(delta) < 0.05:
+            return out
+        x, y = out[-1]
+        if side in ("left", "right"):
+            y2 = y + delta
+            out[-1] = (x, y2)
+            i = len(out) - 2
+            while i >= 0 and abs(out[i][1] - y) < 0.05:
+                out[i] = (out[i][0], y2)
+                i -= 1
+        else:
+            x2 = x + delta
+            out[-1] = (x2, y)
+            i = len(out) - 2
+            while i >= 0 and abs(out[i][0] - x) < 0.05:
+                out[i] = (x2, out[i][1])
+                i -= 1
+        return _clean_path(out)
+
+    def _fan_in_offsets(self) -> None:
+        """Входы в одну грань узла разводятся на FAN_IN_GAP, чтобы стрелки не сливались."""
+        groups: Dict[Tuple[str, str], List[SequenceLink]] = defaultdict(list)
+        for link in self.links:
+            tgt = self.nodes.get(link.target_id)
+            if tgt is None or len(link.waypoints) < 2:
+                continue
+            side = self._dock_side(link.waypoints, tgt)
+            groups[(tgt.id, side)].append(link)
+        for (nid, side), bunch in groups.items():
+            if len(bunch) < 2:
+                continue
+            node = self.nodes[nid]
+            if side in ("left", "right"):
+                bunch.sort(key=lambda lk: self.nodes[lk.source_id].y + self.nodes[lk.source_id].height / 2.0)
+                axis = 1
+                lo, hi = node.y + 8.0, node.y + node.height - 8.0
+            else:
+                bunch.sort(key=lambda lk: self.nodes[lk.source_id].x + self.nodes[lk.source_id].width / 2.0)
+                axis = 0
+                lo, hi = node.x + 8.0, node.x + node.width - 8.0
+            count = len(bunch)
+            span = FAN_IN_GAP * (count - 1)
+            start = -span / 2.0
+            for i, link in enumerate(bunch):
+                raw = start + i * FAN_IN_GAP
+                coord = link.waypoints[-1][axis] + raw
+                clamped = max(lo, min(hi, coord))
+                delta = clamped - link.waypoints[-1][axis]
+                link.waypoints = self._shift_path_end(link.waypoints, side, delta)
+
+    def _candidates(
+        self,
+        src: FlowNode,
+        tgt: FlowNode,
+        bounds: Tuple[float, float],
+        envelope: Tuple[float, float],
+        is_back: bool,
+    ) -> List[List[Point]]:
         sx1, sy1, sx2, sy2 = src.x, src.y, src.x + src.width, src.y + src.height
         tx1, ty1, tx2, ty2 = tgt.x, tgt.y, tgt.x + tgt.width, tgt.y + tgt.height
         scx, scy = (sx1 + sx2) / 2.0, (sy1 + sy2) / 2.0
@@ -1098,6 +1214,7 @@ class BPMNDiagramBuilder:
         r_s, t_s, b_s = (sx2, scy), (scx, sy1), (scx, sy2)
         l_t, t_t, b_t = (tx1, tcy), (tcx, ty1), (tcx, ty2)
         lo, hi = bounds
+        top_env, bot_env = envelope
         cands: List[List[Point]] = []
 
         if tx1 >= sx2 + 16.0:
@@ -1123,9 +1240,19 @@ class BPMNDiagramBuilder:
                 mid = (ty2 + sy1) / 2.0
                 cands.append([t_s, (scx, mid), (tcx, mid), b_t])
 
-        for off in (30.0, 54.0, 78.0):
-            y_below = min(max(sy2, ty2) + off, hi - 4.0)
-            y_above = max(min(sy1, ty1) - off, lo + 4.0)
+        go_around = is_back or tx2 < sx1 - 8.0
+        offsets = (REWORK_PAD, REWORK_PAD + 16.0, REWORK_PAD + 36.0, REWORK_PAD + 56.0, 30.0, 54.0, 78.0)
+        if go_around:
+            offsets = (REWORK_PAD, REWORK_PAD + 16.0, REWORK_PAD + 36.0, REWORK_PAD + 56.0, REWORK_PAD + 80.0)
+        for off in offsets:
+            y_below = max(sy2, ty2, bot_env) + max(off, ROUTE_CLEARANCE)
+            y_above = min(sy1, ty1, top_env) - max(off, ROUTE_CLEARANCE)
+            if hi - lo > 2 * ROUTE_CLEARANCE:
+                y_below = min(y_below, hi - ROUTE_CLEARANCE) if y_below > hi - ROUTE_CLEARANCE else y_below
+                y_above = max(y_above, lo + ROUTE_CLEARANCE) if y_above < lo + ROUTE_CLEARANCE else y_above
+                # Петля возврата обязана обогнуть крайний узел: не подрезаем клиренс узлов ради рамки.
+                y_below = max(y_below, max(sy2, ty2, bot_env) + ROUTE_CLEARANCE)
+                y_above = min(y_above, min(sy1, ty1, top_env) - ROUTE_CLEARANCE)
             cands.append([b_s, (scx, y_below), (tcx, y_below), b_t])
             cands.append([t_s, (scx, y_above), (tcx, y_above), t_t])
             for yy in (y_below, y_above):
@@ -1141,17 +1268,20 @@ class BPMNDiagramBuilder:
         obstacles: Iterable[FlowNode],
         placed: Sequence[Tuple[Point, Point]],
         bounds: Tuple[float, float],
+        envelope: Tuple[float, float] = (0.0, 0.0),
+        is_back: bool = False,
     ) -> List[Point]:
-        rects: List[Tuple[float, float, float, float]] = []
+        rects: List[Rect] = []
         for node in obstacles:
+            box = _node_rect(node)
             if node.id in (src.id, tgt.id):
-                rects.append((node.x + 1.0, node.y + 1.0, node.x + node.width - 1.0, node.y + node.height - 1.0))
+                rects.append((box[0] + 1.0, box[1] + 1.0, box[2] - 1.0, box[3] - 1.0))
             else:
-                rects.append((node.x - 4.0, node.y - 4.0, node.x + node.width + 4.0, node.y + node.height + 4.0))
+                rects.append(_inflate_rect(box, ROUTE_CLEARANCE))
 
         best: Optional[List[Point]] = None
         best_cost = float("inf")
-        for raw in self._candidates(src, tgt, bounds):
+        for raw in self._candidates(src, tgt, bounds, envelope, is_back):
             path = _clean_path(raw)
             if len(path) < 2:
                 continue
