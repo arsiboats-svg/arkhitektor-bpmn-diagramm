@@ -339,12 +339,20 @@ def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
     # Рассуждающие модели (gpt-oss на Groq): low — меньше «мыслей», быстрее и в пределах лимита токенов/мин.
     if os.getenv(f"{prefix}_REASONING_EFFORT"):
         payload["reasoning_effort"] = os.getenv(f"{prefix}_REASONING_EFFORT")
-    data = _http_json(
-        f"{base}/chat/completions",
-        payload,
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=float(os.getenv("OPENAI_TIMEOUT", "90")),
-    )
+    for attempt in range(2):
+        try:
+            data = _http_json(
+                f"{base}/chat/completions",
+                payload,
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=float(os.getenv("OPENAI_TIMEOUT", "90")),
+            )
+            break
+        except Exception as exc:  # noqa: BLE001
+            wait = _rate_limit_wait(exc)
+            if attempt or wait is None:
+                raise
+            time.sleep(wait)  # бесплатный тариф Groq: 8K токенов/мин — ждём, сколько просит провайдер
     label = "openai" if prefix == "OPENAI" else prefix.lower()
     return f"{label}:{model}", str(data["choices"][0]["message"]["content"])
 
@@ -859,6 +867,22 @@ def emulate_generation(regulation_text: str) -> Tuple[str, Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Главная точка входа
 # --------------------------------------------------------------------------- #
+def _rate_limit_wait(exc: Exception) -> Optional[float]:
+    """HTTP 429 → сколько секунд подождать (Retry-After или «try again in 7.5s»), не больше 20; иначе None."""
+    response = getattr(exc, "response", None)
+    if response is None or getattr(response, "status_code", None) != 429:
+        return None
+    header = (getattr(response, "headers", None) or {}).get("retry-after")
+    try:
+        seconds = float(header) if header else None
+    except ValueError:
+        seconds = None
+    if seconds is None:
+        m = re.search(r"try again in ([\d.]+)s", getattr(response, "text", "") or "")
+        seconds = float(m.group(1)) if m else 6.0
+    return min(20.0, seconds + 0.5)
+
+
 def _error_reason(exc: Exception) -> str:
     """Короткая причина сбоя LLM: для HTTP-ошибок — код и сообщение провайдера («401: Invalid API Key»)."""
     if "Timeout" in type(exc).__name__:
@@ -956,6 +980,10 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     }
                     return xml, audit, ""
                 problems = [err] if err else quality["critical"]
+                if err and "не распознан" in err:
+                    # Модель сама не нашла процесс в тексте: «исправлять» — значит заставить её выдумывать.
+                    trace.append(f"{engine_label}: регламент не распознан — повтор не делаем")
+                    return "", {}, "Регламент не распознан: в тексте не найдено шагов процесса и исполнителей."
                 rejected.append({"engine": engine_label, "attempt": attempt, "problems": problems, "code": _strip_markdown(raw)})
                 trace.append(
                     f"{engine_label}, попытка {attempt} ({call_s:.0f} с): результат отклонён — "
