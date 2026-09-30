@@ -124,6 +124,19 @@ header[data-testid="stHeader"] {{ background: transparent; }}
   background:#fff; border:1px solid #DCE6F3; border-radius:16px; padding:18px 20px 8px 20px;
   box-shadow:0 2px 10px rgba(0,51,102,.06);
 }}
+[data-testid="stRadio"] div[role="radiogroup"] {{
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label {{
+  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
+[data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
+[data-testid="stRadio"] div[role="radiogroup"] > label:hover {{ background:rgba(21,101,192,.10); }}
+[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) {{
+  background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); box-shadow:0 4px 12px rgba(21,101,192,.35);
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) p {{ color:#fff; }}
 .ir-title {{ color:{BLUE_DARK}; font-weight:700; font-size:1.05rem; margin:0 0 10px 0; }}
 .ir-section {{ color:{BLUE_DARK}; font-weight:800; font-size:1.35rem; margin:26px 0 12px 0; display:flex; align-items:center; gap:10px; }}
 .ir-section:before {{ content:""; width:6px; height:26px; background:{BLUE}; border-radius:3px; display:inline-block; }}
@@ -392,7 +405,6 @@ def svg_export_html(xml: str, file_name: str) -> str:
   }};
 </script></body></html>
 """
-
 
 # --------------------------------------------------------------------------- #
 # Аудит: визуальные блоки
@@ -740,6 +752,74 @@ def render_assistant() -> None:
             st.session_state["chat_messages"] = []
             st.session_state.pop("diagram_updated_by_assistant", None)
             st.rerun()
+
+
+def render_download(key: str) -> None:
+    result = st.session_state.get("result")
+    ok = bool(result and not result["error"])
+    st.download_button(
+        "⬇️  Скачать .bpmn",
+        data=(result["xml"] if ok else ""),
+        file_name=f"{st.session_state.get('file_stem', 'process')}.bpmn",
+        mime="application/xml",
+        disabled=not ok,
+        key=key,
+    )
+
+
+def render_input_panel(labels: List[str], compact: bool = False, show_download: bool = True) -> None:
+    """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
+    box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
+    with box_left:
+        st.selectbox(
+            "Готовый отраслевой регламент",
+            [*labels, CUSTOM_LABEL],
+            key="example_choice",
+            on_change=on_example_change,
+            help="Выберите эталонный кейс или введите свой текст ниже.",
+        )
+        st.text_area(
+            "Текст регламента (шаги нумеруются; условия — «Если … — перейти к п.N, иначе …»)",
+            key="reg_text",
+            height=260 if compact else 400,
+        )
+    with box_right:
+        use_llm = st.checkbox(
+            "Использовать LLM (Ollama / OpenAI), если доступна",
+            value=True,
+            help="Если модель недоступна, автоматически включается встроенный семантический эмулятор.",
+        )
+        if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
+            if not st.session_state["reg_text"].strip():
+                st.warning("Введите текст регламента.")
+            else:
+                run_generation(st.session_state["reg_text"], use_llm)
+
+        result = st.session_state.get("result")
+        if result and not result["error"]:
+            gen = result["audit"].get("generation", {})
+            engine = gen.get("engine", "—")
+            fallback = " (fail-safe: LLM недоступна)" if gen.get("fallback") and engine == "semantic-emulator" else ""
+            st.markdown(
+                f'<div class="engine">Движок: <b>{esc(engine)}</b>{fallback} · {gen.get("elapsed_s", 0)} с</div>',
+                unsafe_allow_html=True,
+            )
+        if show_download:
+            render_download("dl_left")
+
+
+def render_diagram(canvas_height: int) -> None:
+    result = st.session_state.get("result")
+    if not result:
+        st.info("Выберите регламент и нажмите «Сгенерировать BPMN 2.0».")
+    elif result["error"]:
+        st.error(result["error"])
+    else:
+        page = viewer_html(result["xml"], canvas_height)
+        if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
+            st.iframe(page, height=canvas_height + 16)
+        else:
+            components.html(page, height=canvas_height + 16, scrolling=False)
 
 
 def main() -> None:
