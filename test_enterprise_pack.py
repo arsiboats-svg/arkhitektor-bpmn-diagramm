@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from ai_generator import (
@@ -27,8 +28,17 @@ def main() -> None:
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
 
     opt, delta = optimize_process_to_be(text, audit)
-    assert "Параллельно" in opt or any(a.get("kind") == "parallel" for a in delta.get("actions") or [])
-    assert any(a.get("kind") in ("zero_rework", "automation", "parallel") for a in delta.get("actions") or [])
+    ot_stop = re.compile(
+        r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+        re.I,
+    )
+    for line in opt.splitlines():
+        if re.search(r"параллельно|одновременно", line, re.I) and ot_stop.search(line):
+            raise AssertionError(f"запрещено распараллеливать охрану труда: {line}")
+        if re.search(r"аварийн\w+\s+ремонт|выполн\w+.{0,40}ремонт", line, re.I):
+            assert not re.search(r"^\s*\d+\.\s*(?:параллельно|одновременно)", line, re.I), line
+    assert any(a.get("kind") == "safety_seq" for a in delta.get("actions") or []), delta.get("actions")
+    assert any(a.get("kind") in ("zero_rework", "automation", "parallel", "safety_seq") for a in delta.get("actions") or [])
     assert "sla_saved_hours" in delta
     assert delta.get("tobe_xml") or not delta.get("tobe_error")
     assert int(delta.get("rework_after") or 0) <= int(delta.get("rework_before") or 0)
@@ -58,8 +68,11 @@ def main() -> None:
     assert float(audit_g["sla"]["critical_path_hours"]) >= 350
     _, delta_g = optimize_process_to_be(grid, audit_g)
     assert delta_g.get("engine") == "semantic-optimizer"
-    assert float(delta_g.get("sla_saved_hours") or 0) > 50
-    assert float(delta_g["sla_before_hours"]) > float(delta_g["sla_after_hours"])
+    saved = float(delta_g.get("sla_saved_hours") or 0)
+    before = float(delta_g["sla_before_hours"])
+    after = float(delta_g["sla_after_hours"])
+    assert abs(saved - (before - after)) < 1e-6, (saved, before, after)
+    assert before > after
 
     proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
         encoding="utf-8"
