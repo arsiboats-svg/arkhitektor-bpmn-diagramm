@@ -69,7 +69,8 @@ API объекта DIAGRAM (строго эти сигнатуры):
 - gw_id = DIAGRAM.add_inclusive_gateway(name, parent_id)   # OR
 - group_id = DIAGRAM.add_group(name, parent_id)
 - DIAGRAM.add_link(source_id, target_id, condition_name="")  # поток; у веток шлюза ОБЯЗАТЕЛЬНА подпись условия
-- DIAGRAM.set_sla(task_id, hours)                           # трудозатраты шага, часы (1 раб. день = 8 ч). ОБЯЗАТЕЛЬНО, если срок есть в регламенте.
+- DIAGRAM.set_sla(task_id, hours)                           # трудозатраты шага В ЧАСАХ. ОБЯЗАТЕЛЬНО, если срок есть в регламенте.
+                                                             #   «30 минут» → 0.5; «2 часа» → 2; «5 рабочих дней» → 5 × 8 = 40; «3 календарных дня» → 72
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 1. РОЛЕВАЯ МОДЕЛЬ. Выдели всех участников регламента и создай для них дорожки одним вызовом add_pool.
@@ -1095,29 +1096,56 @@ def _error_reason(exc: Exception) -> str:
     return f"HTTP {status}: {message}" if message else f"HTTP {status}"
 
 
+# Облачные провайдеры по порядку: OPENAI_* (основной) → FALLBACK_* → FALLBACK2_* …
+# Бесплатные тарифы по отдельности ненадёжны: Groq отвечает 403 с части IP Streamlit Cloud,
+# бесплатный канал OpenRouter бывает перегружен (429) — поэтому цепочка из нескольких.
+CLOUD_PREFIXES = ("OPENAI", "FALLBACK", "FALLBACK2", "FALLBACK3")
+
+
+def _cloud_prefixes() -> List[str]:
+    return [p for p in CLOUD_PREFIXES if os.getenv(f"{p}_API_KEY")]
+
+
+_SET_SLA_RE = re.compile(r"(DIAGRAM\.set_sla\(\s*[^,]+,\s*)([\d.]+)(\s*\))")
+
+
+def _fix_sla_units(code: str, text_hours: List[float]) -> Tuple[str, str]:
+    """Модель иногда пишет сроки в днях («5 рабочих дней» → 5), а set_sla ждёт часы (40).
+
+    Сверяем сумму её сроков с суммой сроков, разобранных из текста: расхождение ровно ×8
+    (рабочие дни) или ×24 (сутки) — это перепутанные единицы, пересчитываем. Иначе код не трогаем.
+    """
+    values = [float(m.group(2)) for m in _SET_SLA_RE.finditer(code or "")]
+    if len(text_hours) < 2 or len(values) < 2 or not sum(values):
+        return code, ""
+    ratio = sum(text_hours) / sum(values)
+    factor = next((f for f in (8.0, 24.0) if abs(ratio - f) / f < 0.2), None)
+    if factor is None:
+        return code, ""
+    fixed = _SET_SLA_RE.sub(lambda m: f"{m.group(1)}{round(float(m.group(2)) * factor, 3)}{m.group(3)}", code)
+    return fixed, f"сроки шагов переведены из дней в часы (×{factor:.0f}): модель указала дни вместо часов"
+
+
 def cloud_engine_status() -> str:
-    """Строка для интерфейса: подключена ли облачная модель (без раскрытия ключа)."""
+    """Строка для интерфейса: подключённые облачные модели по порядку (без раскрытия ключей)."""
     parts = []
-    for prefix in ("OPENAI", "FALLBACK"):
-        if os.getenv(f"{prefix}_API_KEY"):
-            host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE))
-            parts.append(f"{os.getenv(f'{prefix}_MODEL', 'gpt-4o-mini')} · {host}")
+    for prefix in _cloud_prefixes():
+        host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE))
+        parts.append(f"{os.getenv(f'{prefix}_MODEL', 'gpt-4o-mini')} · {host}")
     if not parts:
         return "не подключена (OPENAI_API_KEY не задан)"
-    return parts[0] + (f" · запасная: {parts[1]}" if len(parts) > 1 else "")
+    return parts[0] + "".join(f" · запасная: {p}" for p in parts[1:])
 
 
 def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
     mode = os.getenv("BPMN_AI_MODE", "auto").lower()
     if mode == "emulator":
         return []
-    engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [("ollama", _call_ollama)]
     # Облачные модели отвечают за секунды — они первые; Ollama — офлайн-резерв.
-    # FALLBACK_* — запасной провайдер: Groq бывает недоступен с отдельных IP (HTTP 403).
-    if os.getenv("FALLBACK_API_KEY"):
-        engines.insert(0, ("fallback", lambda prompt: _call_openai(prompt, "FALLBACK")))
-    if os.getenv("OPENAI_API_KEY"):
-        engines.insert(0, ("openai", _call_openai))
+    engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [
+        (prefix.lower(), (lambda prompt, _p=prefix: _call_openai(prompt, _p))) for prefix in _cloud_prefixes()
+    ]
+    engines.append(("ollama", _call_ollama))
     return engines
 
 
@@ -1136,10 +1164,12 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
 
     artifacts: List[Dict[str, Any]] = []
     it_systems: List[Dict[str, Any]] = []
+    text_hours: List[float] = []
     try:
         header = parse_regulation(text)
         process_name, sla = header.title, header.sla_hours
         artifacts, it_systems = header.artifacts, header.it_systems
+        text_hours = [s.hours for s in header.steps if s.hours]
     except Exception:  # noqa: BLE001
         process_name, sla = "Бизнес-процесс по регламенту", None
 
@@ -1160,6 +1190,9 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{name}: недоступен ({_error_reason(exc)})")
                     break
                 call_s = time.time() - call_started
+                raw, unit_note = _fix_sla_units(raw, text_hours)
+                if unit_note:
+                    trace.append(f"{engine_label}: {unit_note}")
                 xml, audit, err = execute_generated_code(raw, process_name, sla, regulation_text=text)
                 quality = audit.get("quality", {}) if not err else {}
                 if not err and quality.get("ok"):
@@ -1263,8 +1296,11 @@ def _chat_openai(messages: List[Dict[str, str]], prefix: str) -> Tuple[str, str]
     base = os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
     model = os.getenv(f"{prefix}_MODEL", "gpt-4o-mini")
     payload: Dict[str, Any] = {"model": model, "temperature": 0.2, "messages": messages}
-    if os.getenv(f"{prefix}_REASONING_EFFORT"):
-        payload["reasoning_effort"] = os.getenv(f"{prefix}_REASONING_EFFORT")
+    effort = os.getenv(f"{prefix}_REASONING_EFFORT", "")
+    if effort == "none" and "openrouter.ai" in base:
+        payload["reasoning"] = {"enabled": False}
+    elif effort:
+        payload["reasoning_effort"] = effort
     data = _http_json(
         f"{base}/chat/completions",
         payload,
@@ -1303,10 +1339,8 @@ def _chat_llm(messages: List[Dict[str, str]], trace: List[str]) -> Optional[Tupl
     if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return None
     attempts: List[Tuple[str, Callable[[], Tuple[str, str]]]] = []
-    if os.getenv("OPENAI_API_KEY"):
-        attempts.append(("openai", lambda: _chat_openai(messages, "OPENAI")))
-    if os.getenv("FALLBACK_API_KEY"):
-        attempts.append(("fallback", lambda: _chat_openai(messages, "FALLBACK")))
+    for prefix in _cloud_prefixes():
+        attempts.append((prefix.lower(), lambda _p=prefix: _chat_openai(messages, _p)))
     attempts.append(("ollama", lambda: _chat_ollama(messages)))
     for name, call in attempts:
         try:
