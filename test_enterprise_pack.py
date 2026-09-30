@@ -11,6 +11,8 @@ from ai_generator import (
     export_docx_passport,
     generate_bpmn_from_text,
     generate_raci_matrix,
+    heuristic_analysis,
+    build_process_context,
     optimize_process_to_be,
     parse_regulation,
 )
@@ -59,6 +61,30 @@ def main() -> None:
     assert float(delta_g.get("sla_saved_hours") or 0) > 50
     assert float(delta_g["sla_before_hours"]) > float(delta_g["sla_after_hours"])
 
+    proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
+        encoding="utf-8"
+    )
+    xml_p, audit_p, err_p = generate_bpmn_from_text(proc, use_llm=False)
+    assert not err_p
+    opt_p, delta_p = optimize_process_to_be(proc, audit_p)
+    q_after = int(delta_p.get("quality_after") or 0)
+    q_before = int(delta_p.get("quality_before") or 0)
+    assert q_before == 100, q_before
+    assert q_after == 100, (q_after, (delta_p.get("tobe_audit") or {}).get("methodology"))
+    assert "автоматически:" not in opt_p.lower()
+    assert "проводит предварительный входной контроль" in opt_p or "входной контроль" in opt_p.lower()
+    ctx_p = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
+    why = heuristic_analysis("Как мы сократили время? Объясни подробнее", ctx_p)
+    assert "Декомпозиция" in why
+    assert "петл" in why.lower() or "возврат" in why.lower()
+    assert "Параллелизац" in why or "параллел" in why.lower()
+    assert "scriptTask" in why or "Автоматизац" in why
+    qual = heuristic_analysis("Почему упал Quality Score?", ctx_p)
+    assert "100%" in qual
+    assert "метро" not in qual.lower()
+    read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
+    assert "Quality Score" in read or "читаем" in read.lower()
+
     print(
         "ok",
         f"steps={len(parsed.steps)}",
@@ -68,6 +94,7 @@ def main() -> None:
         f"docx={len(payload)}",
         f"engine={delta.get('engine')}",
         f"grid={delta_g.get('sla_before_hours')}→{delta_g.get('sla_after_hours')}",
+        f"proc_q={q_before}→{q_after}",
     )
 
 

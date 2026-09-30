@@ -595,11 +595,15 @@ def viewer_html(
     const chips = COPILOT.chips || [];
     const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
     if (exact) return exact.a;
+    if (/quality|качеств|почему.*(?:score|балл|нотац|линтер)|(?:упал|изменил).*quality/.test(low))
+      return COPILOT.quality || COPILOT.readability || COPILOT.fallback;
+    if (/как\\s+(?:мы\\s+)?сократ|за сч[её]т|за счет чего|объясни подробн|почему.*(?:сократ|ускор|экономи)|в ч[её]м причина.*(?:сократ|экономи)/.test(low))
+      return COPILOT.why || chipBy('tobe') || COPILOT.fallback;
     if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев/.test(low))
       return chipBy('tobe') || COPILOT.compare || COPILOT.fallback;
-    if (/читаем|метро|нотаци|подпроцесс|линтер|методолог|quality|анти-метро/.test(low))
+    if (/читаем|метро|анти-метро|подпроцесс|методолог/.test(low))
       return COPILOT.readability || chipBy('tobe') || COPILOT.fallback;
-    if (/ускор|оптимиз|сократ|быстрее|параллел/.test(low)) return chipBy('speed') || COPILOT.fallback;
+    if (/ускор|оптимиз|быстрее|параллел/.test(low)) return chipBy('speed') || COPILOT.fallback;
     if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) return chipBy('sla') || COPILOT.fallback;
     if (/цикл|возврат|доработ|rework/.test(low)) return COPILOT.loops || COPILOT.fallback;
     if (/систем|it\b|ит-|документ|ландшафт/.test(low)) return COPILOT.landscape || COPILOT.fallback;
@@ -1544,7 +1548,7 @@ def _send_assistant(prompt: str) -> None:
     result = st.session_state.get("result") or {}
     low = prompt.lower()
     pack = st.session_state.get("tobe_pack")
-    if re.search(r"сравни|as-is|to-be|tobe|до и после|читаем|метро", low):
+    if re.search(r"сравни|as-is|to-be|tobe|до и после|читаем|метро|сократ|почему|за сч[её]т|за счет|quality|объясни", low):
         pack = ensure_tobe_pack() or pack
     with st.spinner("Ассистент анализирует процесс…"):
         reply, new_text, new_xml, new_audit = assistant_chat(

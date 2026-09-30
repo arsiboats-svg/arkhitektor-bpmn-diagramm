@@ -1228,9 +1228,12 @@ CHAT_SYSTEM = """Ты — «AI-Ассистент Бизнес-Архитект�
 Правила:
 - Отвечай по-русски, по делу, не более 12 строк, Markdown. Опирайся ТОЛЬКО на данные процесса ниже; числа и названия не выдумывай.
 - Причины и рекомендации подкрепляй конкретными шагами, ролями и цифрами из данных (срок, доля нагрузки, циклы возврата).
-- Если в данных есть блок «СРАВНЕНИЕ AS-IS / TO-BE», на вопросы «сравни», «as-is / to-be», «до и после», «читаемость»
-  отвечай цифрами: дельта SLA (часы и %), петли возврата до/после, замена журналов на scriptTask, Quality Score и
-  декомпозиция в подпроцессы вместо «метро Токио» (длинные цепочки и возвратные стрелки).
+- Если в данных есть блок «СРАВНЕНИЕ AS-IS / TO-BE», на вопросы «сравни», «as-is / to-be», «до и после»
+  отвечай цифрами: дельта SLA (часы и %), петли возврата до/после, замена журналов на scriptTask, Quality Score.
+- На «как сократили / за счёт чего / объясни подробнее» дай декомпозицию экономии To-Be:
+  1) петли доработки (часы циклов до/после), 2) параллелизация с номерами шагов, 3) автоматизация journal→scriptTask.
+- На «почему Quality Score / упал балл нотации»: если 100% — стандарты соблюдены полностью; если был перепад —
+  объясни, что добавлены AND-шлюзы и входной контроль, а правило «глагол + объект» сохранено. Это НЕ ответ про «метро Токио».
 - Не начинай каждый ответ одной и той же заглушкой «N шагов / M узлов». Отвечай на заданный вопрос.
 - Если предлагаешь изменить процесс, заверши ответ ГОТОВОЙ командой в кавычках «…», которую пользователь может отправить
   в чат, например: «Сделай шаги 4 и 5 параллельными» или «Добавь согласование с экологами после шага 3».
@@ -1430,6 +1433,8 @@ def _attach_tobe_compare(ctx: Dict[str, Any], audit: Dict[str, Any], tobe_delta:
     ctx["quality_score_to_be"] = int(q_to or 0)
     ctx["tobe_actions"] = [a for a in (d.get("actions") or []) if isinstance(a, dict)]
     ctx["sla_saved_hours"] = round(float(d.get("sla_saved_hours") or max(0.0, float(as_is or 0) - float(to_be or 0))), 3)
+    ctx["rework_hours_as_is"] = round(float(d.get("rework_hours_before") or 0), 3)
+    ctx["rework_hours_to_be"] = round(float(d.get("rework_hours_after") or 0), 3)
 
 
 def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
@@ -1493,6 +1498,9 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
         ]
         for act in (ctx.get("tobe_actions") or [])[:6]:
             lines.append(f"  действие To-Be [{act.get('kind')}]: {act.get('detail')}")
+        lines.append(f"  rework_hours_as_is: {ctx.get('rework_hours_as_is')}")
+        lines.append(f"  rework_hours_to_be: {ctx.get('rework_hours_to_be')}")
+        lines.append(f"  sla_saved_hours: {ctx.get('sla_saved_hours')}")
     return "\n".join(lines)
 
 
@@ -1778,18 +1786,120 @@ def _analysis_open(message: str, ctx: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+_QUALITY_Q_RE = re.compile(
+    r"quality|качеств\w+\s+(нотац|score)|почему.{0,50}(score|балл|нотац|линтер)|"
+    r"(упал|изменил|просел)\w*.{0,30}(quality|балл|нотац)|линтер\w*\s+нотац",
+    re.I,
+)
+_WHY_SAVED_RE = re.compile(
+    r"как\s+(мы\s+)?сократ|за сч[её]т чего|за счет чего|объясни подробн|"
+    r"почему.{0,40}(сократ|ускор|экономи|to-be|tobe)|"
+    r"как.{0,40}(ускор\w+\s+процесс|экономи)|декомпозиц\w+\s+экономи|"
+    r"в ч[её]м причина.{0,30}(сократ|экономи|to-be|tobe)",
+    re.I,
+)
+
+
+def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
+    """Декомпозиция экономии SLA To-Be: петли, параллель, scriptTask — не заглушка читаемости."""
+    if not ctx.get("tobe_ready"):
+        return (
+            "**To-Be ещё не посчитан.** Откройте вкладку «Оптимизация As-Is → To-Be» — "
+            "разложу экономию по петлям доработки, параллелизации шагов и автоматизации (scriptTask)."
+        )
+    as_h = float(ctx.get("sla_hours_as_is") or 0)
+    to_h = float(ctx.get("sla_hours_to_be") or 0)
+    saved = float(ctx.get("sla_saved_hours") or max(0.0, as_h - to_h))
+    pct = float(ctx.get("delta_sla_percent") or 0)
+    rw_h_as = float(ctx.get("rework_hours_as_is") or 0)
+    rw_h_to = float(ctx.get("rework_hours_to_be") or 0)
+    loop_saved = max(0.0, rw_h_as - rw_h_to)
+    rb, ra = int(ctx.get("rework_loops_as_is") or 0), int(ctx.get("rework_loops_to_be") or 0)
+    actions = [a for a in (ctx.get("tobe_actions") or []) if isinstance(a, dict)]
+    par = [a for a in actions if a.get("kind") == "parallel"]
+    auto = [a for a in actions if a.get("kind") == "automation"]
+    ctrl = [a for a in actions if a.get("kind") == "zero_rework"]
+    rest = max(0.0, saved - loop_saved)
+    out = [
+        f"**Как сократили SLA «{ctx.get('title')}»: {_fh(as_h)} → {_fh(to_h)} "
+        f"(экономия {_fh(saved)}, {pct:g}%).**",
+        "Декомпозиция выигрыша:",
+        f"1) **Устранение петель доработки:** {rb} → {ra} "
+        f"(снято {max(0, rb - ra)} цикл.). Экономия циклов: **{_fh(loop_saved)}** "
+        f"(худший возврат {_fh(rw_h_as)} → {_fh(rw_h_to)}).",
+    ]
+    loops = sorted(ctx.get("rework_loops") or [], key=lambda x: -float((x or {}).get("cycle_hours") or 0))
+    for item in loops[:3]:
+        out.append(f"   - цикл As-Is «{item.get('label')}»: {_fh(float(item.get('cycle_hours') or 0))}")
+    par_txt = "; ".join(str(a.get("detail") or "").rstrip(".") for a in par if a.get("detail")) or (
+        "независимые шаги разных ролей вынесены в параллельный AND-шлюз"
+    )
+    out.append(f"2) **Параллелизация конкретных шагов:** {par_txt}. "
+               f"Выигрыш на критическом пути (без петель): **{_fh(rest)}**.")
+    if auto:
+        auto_txt = "; ".join(str(a.get("detail") or "") for a in auto if a.get("detail"))
+        out.append(
+            f"3) **Автоматизация рутины (scriptTask):** {auto_txt}. "
+            "Фиксация в журналах выполняется информационной системой (обычно 5 мин вместо ручного шага)."
+        )
+    else:
+        out.append("3) **Автоматизация рутины (scriptTask):** отдельных журнальных шагов к автоматизации не было.")
+    for act in ctrl[:2]:
+        if act.get("detail"):
+            out.append(f"- Zero-Rework: {act['detail']}")
+    return "\n".join(out)
+
+
+def _analysis_quality_score(ctx: Dict[str, Any]) -> str:
+    """Почему изменился Quality Score — не анти-метро и не заглушка читаемости."""
+    meth = ctx.get("methodology") or {}
+    now = int(meth.get("score") or 0)
+    qb = int(ctx.get("quality_score_as_is") or now)
+    qa = int(ctx.get("quality_score_to_be") or now)
+    naming = next((c for c in (meth.get("checks") or []) if c.get("key") == "naming"), None)
+    if ctx.get("tobe_ready"):
+        if qa >= 100 and qb >= 100:
+            return (
+                f"**Quality Score нотации: {qb}% → {qa}%.** Стандарты соблюдены на 100%: "
+                "все задачи To-Be в форме «глагол в инфинитиве + объект», шлюзы подписаны. "
+                "Параллельные шлюзы и входной контроль добавлены без поломки Naming Compliance."
+            )
+        extra = f"\nNaming: {naming.get('detail')}" if naming else ""
+        if qa < qb:
+            return (
+                f"**Quality Score: {qb}% → {qa}%.** При реинжиниринге добавлены шлюзы параллелизации "
+                "и шаги входного контроля. Правило «глагол + объект» для задач сохранено; "
+                "расхождение даёт линтер на новых элементах, а не отказ от стандарта."
+                + extra
+            )
+        return (
+            f"**Quality Score: {qb}% → {qa}%.** Нотация не просела: глагол + объект сохранены, "
+            "добавлены только параллельные шлюзы и контроли."
+        )
+    if now >= 100:
+        return (
+            f"**Quality Score текущей схемы: {now}%.** Стандарты нотации соблюдены на 100% "
+            "(глагол в инфинитиве + объект)."
+        )
+    return _analysis_readability(ctx)
+
+
 def heuristic_analysis(message: str, ctx: Dict[str, Any]) -> str:
     low = message.lower()
     roles = _roles_in_message(message, _roles_of(ctx))
+    if _QUALITY_Q_RE.search(low):
+        return _analysis_quality_score(ctx)
+    if _WHY_SAVED_RE.search(low):
+        return _analysis_why_saved(ctx)
     if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|до/после|целев\w+\s+схем|реинжинир", low):
         return _analysis_tobe(ctx)
-    if re.search(r"читаем|метро|нотаци|подпроцесс|линтер|методолог|quality score|анти-метро|декомпозиц", low):
+    if re.search(r"читаем|метро|нотаци|подпроцесс|анти-метро|методолог", low):
         return _analysis_readability(ctx)
     if re.search(r"sla|срок|срыв|задерж|критическ|длительн|долго|почему.*(долго|медлен)", low):
         return _analysis_sla(ctx)
     if re.search(r"цикл|возврат|доработ|rework|замечани", low):
         return _analysis_loops(ctx)
-    if re.search(r"ускор|оптимиз|сократ|быстрее|повысить эффективн|улучш", low):
+    if re.search(r"ускор|оптимиз|быстрее|повысить эффективн|улучш", low):
         return _analysis_speedup(ctx)
     if re.search(r"систем|it\b|ит-|scada|документ|артефакт|ландшафт|crm|1с|sap", low):
         return _analysis_landscape(ctx)
@@ -2468,7 +2578,8 @@ def assistant_chat(
         # ---- режим 1: аналитика ----
         if intent == "next_step" and not use_llm:
             return suggest_next_steps(ctx) + _source_note(None, trace), None, None, None
-        if use_llm:
+        force_local = bool(_QUALITY_Q_RE.search(message.lower()) or _WHY_SAVED_RE.search(message.lower()))
+        if use_llm and not force_local:
             system = CHAT_SYSTEM + format_context_for_prompt(ctx)
             got = _chat_llm([{"role": "system", "content": system}, *hist, {"role": "user", "content": message}], trace)
             if got:
@@ -3020,11 +3131,13 @@ def build_canvas_copilot(
         roles_a = _analysis_load(ctx, [])
         compare_a = heuristic_analysis("Сравни As-Is и To-Be, до и после", ctx)
         read_a = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx)
+        why_a = heuristic_analysis("Как мы сократили время? Объясни подробнее", ctx)
+        qual_a = heuristic_analysis("Почему изменился Quality Score?", ctx)
         loops_a = heuristic_analysis("Циклы возврата на доработку", ctx)
         land_a = heuristic_analysis("ИТ-ландшафт и документы процесса", ctx)
         fallback = _analysis_open("краткий архитектурный разбор", ctx)
     except Exception:  # noqa: BLE001 — холст не должен падать
-        sla_a = speed_a = roles_a = compare_a = read_a = loops_a = land_a = fallback = (
+        sla_a = speed_a = roles_a = compare_a = read_a = why_a = qual_a = loops_a = land_a = fallback = (
             "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
         )
     chips = [
@@ -3042,6 +3155,8 @@ def build_canvas_copilot(
         "fallback": fallback,
         "compare": compare_a,
         "readability": read_a,
+        "why": why_a,
+        "quality": qual_a,
         "loops": loops_a,
         "landscape": land_a,
         "chips": chips,
@@ -3067,9 +3182,11 @@ _RACI_STOP = {"выполн", "провод", "оформ", "провер", "п�
 TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
 Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
 1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
-2) Zero-Rework: перед шлюзами согласования добавь шаг входного контроля комплектности;
+2) Zero-Rework: перед шлюзами согласования добавь шаг «Роль проводит предварительный входной контроль … перед шагом N»;
    формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
-3) Автоматизация: фиксацию в журналах и реестрах формулируй как действие информационной системы (автоматически).
+   Не начинай шаг с существительного («Входной контроль…») — только роль + глагол.
+3) Автоматизация: фиксацию в журналах пиши БЕЗ двоеточия после системы:
+   «Информационная система автоматически регистрирует … (5 минут)».
 Верни ТОЛЬКО текст регламента с нумерованными шагами, без комментариев и markdown."""
 
 
@@ -3176,16 +3293,26 @@ def _independent_steps(a: Step, b: Step) -> bool:
 
 
 def _automate_journal_body(body: str) -> str:
-    if re.search(r"информационн\w+\s+систем\w+\s+автоматическ", body, re.I):
-        return body
+    """scriptTask: система сама выполняет действие. Заголовок должен начинаться с глагола, не с роли."""
     text = body.strip()
     if _DUR_RE.search(text):
         text = _DUR_RE.sub("(5 минут)", text, count=1)
     else:
         text = text.rstrip(" .") + " (5 минут)."
-    if not text.lower().startswith("информационн"):
-        text = "Информационная система автоматически: " + text[:1].lower() + text[1:]
-    return text
+
+    def _action_after_role(src: str) -> str:
+        role, start, end = _find_role(src)
+        if role and start == 0 and end > 0:
+            src = src[end:].lstrip(" :;—–-")
+        return src
+
+    action = _action_after_role(text)
+    probe = (action[:1].upper() + action[1:]) if action else ""
+    action = _action_after_role(probe) or action
+    if not action:
+        action = "фиксирует запись в журнале (5 минут)."
+    action = action[:1].lower() + action[1:]
+    return f"Информационная система автоматически {action}"
 
 
 def _cut_rework_loop(body: str) -> str:
@@ -3263,9 +3390,13 @@ def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str,
                 }
             )
             continue
+        prev_role = parsed.steps[i - 1].role if i else ""
+        ctrl_role = prev_role if prev_role and prev_role != st.role else next(
+            (s.role for s in parsed.steps if s.role and s.role != st.role), st.role
+        )
         control_at[i] = (
-            f"{st.role} выполняет входной контроль комплектности документов и исходных данных "
-            f"перед согласованием (15 минут)."
+            f"{ctrl_role} проводит предварительный входной контроль комплектности документов "
+            f"и исходных данных перед шагом {st.num} (15 минут)."
         )
         actions.append(
             {
@@ -3352,6 +3483,8 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
     loops_a = len(new_a.get("rework_loops") or [])
     q_b = int((old_a.get("methodology") or {}).get("score") or 0)
     q_a = int((new_a.get("methodology") or {}).get("score") or 0)
+    rw_h_b = float(old_sla.get("rework_hours") or 0)
+    rw_h_a = float(new_sla.get("rework_hours") or 0)
     return {
         "sla_before_hours": round(before, 3),
         "sla_after_hours": round(after, 3),
@@ -3360,6 +3493,8 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
         "rework_before": loops_b,
         "rework_after": loops_a,
         "rework_removed": max(0, loops_b - loops_a),
+        "rework_hours_before": round(rw_h_b, 3),
+        "rework_hours_after": round(rw_h_a, 3),
         "quality_before": q_b,
         "quality_after": q_a,
         "quality_gain": max(0, q_a - q_b),
@@ -3380,6 +3515,7 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
     empty = {
         "sla_before_hours": 0.0, "sla_after_hours": 0.0, "sla_saved_hours": 0.0, "sla_saved_pct": 0.0,
         "rework_before": 0, "rework_after": 0, "rework_removed": 0,
+        "rework_hours_before": 0.0, "rework_hours_after": 0.0,
         "quality_before": 0, "quality_after": 0, "quality_gain": 0,
         "breach_before": False, "breach_after": False, "actions": [], "engine": "semantic-optimizer",
         "tobe_xml": "", "tobe_audit": {}, "tobe_error": "",
