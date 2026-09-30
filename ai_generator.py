@@ -255,6 +255,8 @@ def execute_generated_code(
         if errors:
             return "", {}, "XML не прошёл проверку по XSD BPMN 2.0: " + "; ".join(errors[:3])
         audit["xsd_valid"] = errors is not None
+        audit.setdefault("artifacts", [])
+        audit.setdefault("it_systems", [])
         return xml, audit, ""
     except Exception as exc:  # noqa: BLE001 — песочница обязана не падать
         return "", {}, f"Ошибка исполнения кода: {type(exc).__name__}: {exc}"
@@ -523,6 +525,98 @@ def _find_role(text: str) -> Tuple[Optional[str], int, int]:
     return None, -1, -1
 
 
+# --------------------------------------------------------------------------- #
+# ИТ-ландшафт и документооборот: какие документы и системы фигурируют в регламенте
+# --------------------------------------------------------------------------- #
+_ENDINGS = r"(?:а|у|ом|е|ы|и|ой|ов|ам|ами|ах)?"
+# (regex, каноническое название); более конкретные шаблоны стоят раньше общих и «съедают» свой фрагмент.
+ARTIFACT_PATTERNS: List[Tuple[str, str]] = [
+    (r"наряд[\s-]*допуск\w*", "Наряд-допуск"),
+    (r"дефектн\w+\s+ведомост\w+", "Дефектная ведомость"),
+    (r"техническ\w+\s+услови\w+|(?-i:\bТУ\b)", "Технические условия (ТУ)"),
+    (r"техническ\w+\s+задани\w+|(?-i:\bТЗ\b)", "Техническое задание (ТЗ)"),
+    (r"закупочн\w+\s+документаци\w+", "Закупочная документация"),
+    (r"\bакт" + _ENDINGS + r"\s+о(?:б)?\s+[а-яё]+(?:ом|ем|ой|ей|ых)\s+[а-яё]{4,}", "Акт {tail}"),
+    (r"\bакт" + _ENDINGS + r"\s+о(?:б)?\s+[а-яё]{4,}", "Акт {tail}"),
+    (r"\bакт" + _ENDINGS + r"\s+(?:выполненных\s+работ|при[её]мки(?:-передачи)?|сдачи-при[её]мки|осмотра|допуска)", "Акт {tail}"),
+    (r"\bакт" + _ENDINGS + r"\b", "Акт"),
+    (r"\bдоговор" + _ENDINGS + r"\b", "Договор"),
+    (r"\bзаяв(?:к(?:а|и|е|у|ой|ам|ами|ах)|ок|лени\w+)\b", "Заявка"),
+    (r"\bсмет" + _ENDINGS + r"\b", "Смета"),
+    (r"\bсч[её]т" + _ENDINGS + r"\b", "Счёт"),
+    (r"\bпротокол" + _ENDINGS + r"\b", "Протокол"),
+    (r"\bприказ" + _ENDINGS + r"\b|\bраспоряжени\w+", "Приказ / распоряжение"),
+    (r"экспертн\w+\s+заключени\w+|заключени\w+\s+экспертизы", "Экспертное заключение"),
+    (r"\bизвещени\w+", "Извещение о закупке"),
+    (r"график\w*\s+ремонт\w*", "График ремонтов"),
+    (r"\bуведомлени\w+", "Уведомление"),
+    (r"пакет\w*\s+документ\w*", "Пакет документов"),
+]
+SYSTEM_PATTERNS: List[Tuple[str, str]] = [
+    (r"(?-i:\bАСУ\s*ТП\b)|(?-i:\bSCADA\b)|\bскад[аеу]\b|(?-i:\bАСДУ\b)|(?-i:\bОИК\b)|телемеханик\w*", "АСУ ТП / SCADA"),
+    (r"оперативн\w+\s+журнал\w*", "Оперативный журнал"),
+    (r"\bв\s+журнал\w*", "Журнал"),
+    (r"(?-i:\bCRM\b)", "CRM"),
+    (r"электронн\w+\s+площадк\w+|(?-i:\bЭТП\b)", "Электронная площадка"),
+    (r"биллинг\w*", "Биллинг"),
+    (r"(?-i:\b1[СC]\b)|(?-i:\bSAP\b)|(?-i:\bERP\b)", "1С / SAP / ERP"),
+    (r"(?-i:\bСЭД\b)|электронн\w+\s+документооборот\w*|систем\w+\s+электронного\s+документооборота", "СЭД (электронный документооборот)"),
+    (r"личн\w+\s+кабинет\w*", "Личный кабинет"),
+    (r"информационн\w+\s+систем\w+|автоматизированн\w+\s+систем\w+|(?-i:\bА?ИС\b)", "Информационная система (ИС / АС)"),
+]
+_ARTIFACT_RE = [(re.compile(p, re.I), n) for p, n in ARTIFACT_PATTERNS]
+_SYSTEM_RE_LIST = [(re.compile(p, re.I), n) for p, n in SYSTEM_PATTERNS]
+
+
+def _find_named(text: str, patterns: List[Tuple["re.Pattern[str]", str]]) -> List[str]:
+    """Канонические названия всех найденных объектов (в порядке появления, без повторов)."""
+    taken: List[Tuple[int, int]] = []
+    found: List[Tuple[int, str]] = []
+    for regex, name in patterns:
+        for m in regex.finditer(text):
+            span = m.span()
+            if any(span[0] < e and s < span[1] for s, e in taken):  # уже учтено более конкретным шаблоном
+                continue
+            taken.append(span)
+            if "{tail}" in name:
+                head = re.match(r"\bакт\w*\s+", m.group(0), re.I)
+                tail = m.group(0)[head.end():] if head else ""
+                label = name.replace("{tail}", tail.strip().lower())
+            else:
+                label = name
+            found.append((span[0], label))
+    found.sort()
+    result: List[str] = []
+    for _, label in found:
+        if label not in result:
+            result.append(label)
+    return result
+
+
+def extract_artifacts(text: str) -> List[str]:
+    """Документы и артефакты процесса: наряд-допуск, дефектная ведомость, ТУ, договор, заявка, акт…"""
+    return _find_named(text, _ARTIFACT_RE)
+
+
+def extract_it_systems(text: str) -> List[str]:
+    """ИТ-системы: АСУ ТП / SCADA, оперативный журнал, CRM, электронная площадка, биллинг, 1С / SAP…"""
+    return _find_named(text, _SYSTEM_RE_LIST)
+
+
+def aggregate_landscape(steps: List["Step"], attr: str) -> List[Dict[str, Any]]:
+    """Сводит найденное по шагам в список {name, mentions, steps, roles}, самые упоминаемые — первыми."""
+    index: Dict[str, Dict[str, Any]] = {}
+    for step in steps:
+        for name in getattr(step, attr):
+            item = index.setdefault(name, {"name": name, "mentions": 0, "steps": [], "roles": []})
+            item["mentions"] += 1
+            if step.num not in item["steps"]:
+                item["steps"].append(step.num)
+            if step.role and step.role not in item["roles"]:
+                item["roles"].append(step.role)
+    return sorted(index.values(), key=lambda it: (-it["mentions"], it["steps"][0] if it["steps"] else 0))
+
+
 @dataclass
 class Decision:
     yes_label: str
@@ -547,6 +641,8 @@ class Step:
     system: bool = False
     decision: Optional[Decision] = None
     action: bool = True  # есть ли собственное действие перед шлюзом
+    artifacts: List[str] = field(default_factory=list)  # документы шага: наряд-допуск, акт, договор…
+    systems: List[str] = field(default_factory=list)  # ИТ-системы шага: АСУ ТП, CRM, 1С…
 
 
 @dataclass
@@ -566,6 +662,8 @@ class ParsedRegulation:
     sla_hours: Optional[float]
     steps: List[Step] = field(default_factory=list)
     roles: List[str] = field(default_factory=list)
+    artifacts: List[Dict[str, Any]] = field(default_factory=list)  # сводка по документам процесса
+    it_systems: List[Dict[str, Any]] = field(default_factory=list)  # сводка по ИТ-системам процесса
 
 
 def _derive_no_label(clause: str) -> str:
@@ -680,9 +778,13 @@ def parse_regulation(text: str) -> ParsedRegulation:
             source = source[re_:]
         step.title = _task_title(source) if step.action else ""
         step.system = bool(_SYSTEM_RE.search(source))
+        step.artifacts = extract_artifacts(body)
+        step.systems = extract_it_systems(body)
         parsed.steps.append(step)
         if step.role not in parsed.roles:
             parsed.roles.append(step.role)
+    parsed.artifacts = aggregate_landscape(parsed.steps, "artifacts")
+    parsed.it_systems = aggregate_landscape(parsed.steps, "systems")
     return parsed
 
 
@@ -919,9 +1021,12 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
     if len(text) < 20:
         return "", {}, "Регламент пуст или слишком короткий: введите не менее одного-двух шагов процесса."
 
+    artifacts: List[Dict[str, Any]] = []
+    it_systems: List[Dict[str, Any]] = []
     try:
         header = parse_regulation(text)
         process_name, sla = header.title, header.sla_hours
+        artifacts, it_systems = header.artifacts, header.it_systems
     except Exception:  # noqa: BLE001
         process_name, sla = "Бизнес-процесс по регламенту", None
 
@@ -945,6 +1050,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                 xml, audit, err = execute_generated_code(raw, process_name, sla)
                 quality = audit.get("quality", {}) if not err else {}
                 if not err and quality.get("ok"):
+                    audit["artifacts"], audit["it_systems"] = artifacts, it_systems
                     audit["generation"] = {
                         "engine": engine_label,
                         "fallback": False,
@@ -973,6 +1079,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
     xml, audit, err = execute_generated_code(code, process_name, sla)
     if err:
         return "", {}, f"Не удалось построить диаграмму: {err}"
+    audit["artifacts"], audit["it_systems"] = artifacts, it_systems
     audit["generation"] = {
         "engine": "semantic-emulator",
         "fallback": use_llm,

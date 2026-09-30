@@ -12,7 +12,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -42,6 +42,10 @@ ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
+DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (не менее 700)
+DIAGRAM_HEIGHT_WIDE = 820  # в широком режиме
+VIEW_SPLIT = "🗂  Раздельный вид"
+VIEW_WIDE = "🖥  Широкий вид"
 
 BLUE_DARK, BLUE = "#003366", "#1565C0"
 OK, WARN, BAD = "#2E7D32", "#F57F17", "#C62828"
@@ -147,6 +151,25 @@ textarea {{ font-size:.9rem !important; line-height:1.45 !important; }}
 table.loops {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 table.loops th {{ text-align:left; color:#607D8B; font-weight:700; border-bottom:2px solid #DCE6F3; padding:6px 8px; }}
 table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#263238; }}
+[data-testid="stRadio"] div[role="radiogroup"] {{
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label {{
+  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
+[data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
+[data-testid="stRadio"] div[role="radiogroup"] > label:hover {{ background:rgba(21,101,192,.10); }}
+[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) {{
+  background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); box-shadow:0 4px 12px rgba(21,101,192,.35);
+}}
+[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) p {{ color:#fff; }}
+.land-cap {{ color:#607D8B; font-size:.76rem; text-transform:uppercase; letter-spacing:.6px; font-weight:700; margin:10px 0 4px 0; }}
+.chip-sys, .chip-doc {{ display:inline-block; border-radius:999px; padding:6px 14px; margin:4px 6px 4px 0; font-size:.86rem; font-weight:600; }}
+.chip-sys {{ background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; }}
+.chip-doc {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; }}
+.chip-sys small, .chip-doc small {{ opacity:.7; font-weight:700; margin-left:6px; }}
+.land-empty {{ color:#78909C; font-size:.88rem; font-style:italic; margin:2px 0 6px 0; }}
 .engine {{ font-size:.82rem; color:#455A64; background:#E3F2FD; border-radius:10px; padding:8px 12px; margin:10px 0 6px 0; }}
 </style>
 """
@@ -155,11 +178,35 @@ table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#26323
 # --------------------------------------------------------------------------- #
 # Компонент просмотра BPMN (bpmn-js)
 # --------------------------------------------------------------------------- #
-def viewer_html(xml: str, height: int) -> str:
+# Заголовки раскрытых подпроцессов — крупнее и жирнее (bpmn-js рисует все подписи одним кеглем).
+# Один и тот же код выполняется и в просмотрщике, и в странице экспорта SVG — файл выглядит как на экране.
+EMPHASIZE_JS = """
+  function emphasizeSubprocessTitles() {
+    const registry = viewer.get('elementRegistry');
+    registry.filter(el => el.type === 'bpmn:SubProcess').forEach(el => {
+      const label = registry.getGraphics(el).querySelector('text.djs-label');
+      if (!label) return;
+      label.style.fontSize = '16px';
+      label.style.fontWeight = '700';
+      label.querySelectorAll('tspan').forEach(t => {
+        t.setAttribute('x', Math.max(4, (el.width - t.getComputedTextLength()) / 2));
+        t.setAttribute('y', parseFloat(t.getAttribute('y')) + 4);  // крупный кегль не должен касаться рамки
+      });
+    });
+  }
+"""
+
+
+def _bpmn_js_tags() -> Tuple[str, str]:
     js_inline = read_asset("bpmn-navigated-viewer.production.min.js")
     css_inline = read_asset("diagram-js.css")
     js_tag = f"<script>{js_inline}</script>" if js_inline else f'<script src="{BPMN_JS_CDN}"></script>'
     css_tag = f"<style>{css_inline}</style>" if css_inline else f'<link rel="stylesheet" href="{DIAGRAM_CSS_CDN}">'
+    return js_tag, css_tag
+
+
+def viewer_html(xml: str, height: int) -> str:
+    js_tag, css_tag = _bpmn_js_tags()
     payload = json.dumps(xml).replace("</", "<\\/")
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
@@ -177,36 +224,42 @@ def viewer_html(xml: str, height: int) -> str:
       border:1px solid #DCE6F3; border-radius:8px; padding:4px 10px; }}
   #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828; padding:24px; text-align:center; font-weight:600; }}
   .bjs-powered-by {{ opacity:.55; }}
+  /* Панорама: на весь монитор виден только холст + плавающая кнопка закрытия */
+  #close {{ display:none; position:absolute; top:16px; right:16px; z-index:9; border:1px solid rgba(255,255,255,.55);
+      background:rgba(0,51,102,.55); color:#fff; font-weight:700; font-size:14px; border-radius:12px; padding:9px 16px;
+      cursor:pointer; backdrop-filter:blur(4px); opacity:.72; transition:opacity .15s, background .15s; }}
+  #close:hover {{ opacity:1; background:rgba(0,51,102,.9); }}
+  #wrap.pano {{ position:fixed; top:0; left:0; width:100vw; height:100vh !important; border:0; border-radius:0; z-index:999999; }}
+  #wrap.pano .bar {{ display:none; }}
+  #wrap.pano #close {{ display:block; }}
+  #wrap.pano .hint {{ opacity:.75; }}
 </style></head>
 <body>
 <div id="wrap">
   <div class="bar">
     <button id="zin" title="Приблизить">＋</button><button id="zout" title="Отдалить">－</button>
     <button id="fit" title="Вписать в окно">По размеру</button><button id="one" title="Масштаб 100%">100%</button>
+    <button id="full" title="Панорама на весь экран (выход — Esc)">⛶ Панорама на весь экран</button>
   </div>
+  <button id="close" title="Закрыть панораму (Esc)">✕ Закрыть панораму</button>
   <div id="canvas"></div><div id="err"></div>
-  <div class="hint">Перетаскивание — панорама · Ctrl + колесо / кнопки ＋ － — масштаб</div>
+  <div class="hint" id="hint"></div>
 </div>
 {js_tag}
 <script>
   const XML = {payload};
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
-  function fit() {{ canvas().zoom('fit-viewport', 'auto'); }}
-  // Заголовки раскрытых подпроцессов — крупнее и жирнее (bpmn-js рисует все подписи одним кеглем).
-  function emphasizeSubprocessTitles() {{
-    const registry = viewer.get('elementRegistry');
-    registry.filter(el => el.type === 'bpmn:SubProcess').forEach(el => {{
-      const label = registry.getGraphics(el).querySelector('text.djs-label');
-      if (!label) return;
-      label.style.fontSize = '16px';
-      label.style.fontWeight = '700';
-      label.querySelectorAll('tspan').forEach(t => {{
-        t.setAttribute('x', Math.max(4, (el.width - t.getComputedTextLength()) / 2));
-        t.setAttribute('y', parseFloat(t.getAttribute('y')) + 4);  // крупный кегль не должен касаться рамки
-      }});
-    }});
-  }}
+  const wrap = document.getElementById('wrap');
+  const hint = document.getElementById('hint');
+  const HINT_NORMAL = 'Перетаскивание — панорама · Ctrl + колесо / кнопки ＋ － — масштаб';
+  const HINT_PANO = 'Перетаскивание — перемещение · колесо — масштаб · Esc — закрыть панораму';
+  hint.textContent = HINT_NORMAL;
+
+  function fit() {{ try {{ canvas().zoom('fit-viewport', 'auto'); }} catch (e) {{}} }}
+  // размеры контейнера меняются не мгновенно: вписываем сразу и после перерисовки/анимации
+  function fitSoon() {{ fit(); requestAnimationFrame(fit); setTimeout(fit, 120); setTimeout(fit, 350); }}
+  {EMPHASIZE_JS}
   viewer.importXML(XML).then(() => {{ emphasizeSubprocessTitles(); fit(); }}).catch(e => {{
     const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
   }});
@@ -216,6 +269,117 @@ def viewer_html(xml: str, height: int) -> str:
   document.getElementById('fit').onclick = fit;
   document.getElementById('one').onclick = () => canvas().zoom(1, 'auto');
   window.addEventListener('resize', fit);
+
+  // ---------------- Панорама на весь экран ----------------
+  // Приоритет: Fullscreen API. Если он недоступен/отклонён — гарантированный оверлей:
+  // iframe растягивается на 100vw x 100vh поверх всей страницы (fixed, z-index 999999).
+  let panoMode = null;                     // null | 'api' | 'overlay'
+  let savedFrameStyle = null, savedParentOverflow = null;
+  const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+  const frameEl = (() => {{ try {{ return window.frameElement; }} catch (e) {{ return null; }} }})();
+  const parentDoc = (() => {{ try {{ return window.parent.document; }} catch (e) {{ return null; }} }})();
+
+  function setPanoUi(on) {{
+    wrap.classList.toggle('pano', on);
+    hint.textContent = on ? HINT_PANO : HINT_NORMAL;
+    fitSoon();
+  }}
+  function enterOverlay() {{
+    if (!frameEl || panoMode) return false;
+    savedFrameStyle = frameEl.getAttribute('style');
+    frameEl.style.cssText = (savedFrameStyle || '') +
+      ';position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;' +
+      'max-width:none!important;z-index:999999!important;border:0!important;background:#fff!important;';
+    if (parentDoc) {{ savedParentOverflow = parentDoc.documentElement.style.overflow; parentDoc.documentElement.style.overflow = 'hidden'; }}
+    panoMode = 'overlay';
+    setPanoUi(true);
+    return true;
+  }}
+  function exitOverlay() {{
+    if (panoMode !== 'overlay') return;
+    if (savedFrameStyle === null) frameEl.removeAttribute('style'); else frameEl.setAttribute('style', savedFrameStyle);
+    if (parentDoc) parentDoc.documentElement.style.overflow = savedParentOverflow || '';
+    panoMode = null;
+    setPanoUi(false);
+  }}
+  function enterPanorama() {{
+    if (panoMode) return;
+    const req = wrap.requestFullscreen || wrap.webkitRequestFullscreen;
+    const canApi = (document.fullscreenEnabled || document.webkitFullscreenEnabled) && req;
+    if (!canApi) {{ enterOverlay(); return; }}
+    try {{
+      const p = req.call(wrap);
+      if (p && p.catch) p.catch(() => {{ if (!fsElement()) enterOverlay(); }});
+    }} catch (e) {{ enterOverlay(); }}
+  }}
+  function exitPanorama() {{
+    if (panoMode === 'overlay') exitOverlay();
+    else if (fsElement()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  }}
+  function onFsChange() {{
+    const on = fsElement() === wrap;
+    panoMode = on ? 'api' : (panoMode === 'overlay' ? 'overlay' : null);
+    setPanoUi(on || panoMode === 'overlay');
+  }}
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+  document.getElementById('full').onclick = enterPanorama;
+  document.getElementById('close').onclick = exitPanorama;
+  const onKey = e => {{ if (e.key === 'Escape' && panoMode) exitPanorama(); }};
+  document.addEventListener('keydown', onKey);
+  if (parentDoc) parentDoc.addEventListener('keydown', onKey);   // Esc, когда фокус вне iframe (режим оверлея)
+
+  // В панораме колесо мышки = зум вокруг курсора (в обычном режиме — как у bpmn-js: Ctrl + колесо)
+  wrap.addEventListener('wheel', e => {{
+    if (!wrap.classList.contains('pano')) return;
+    e.preventDefault(); e.stopPropagation();
+    const r = document.getElementById('canvas').getBoundingClientRect();
+    const scale = Math.min(6, Math.max(0.03, canvas().zoom() * Math.exp(-e.deltaY * 0.0016)));
+    canvas().zoom(scale, {{ x: e.clientX - r.left, y: e.clientY - r.top }});
+  }}, {{ capture: true, passive: false }});
+</script></body></html>
+"""
+
+
+def svg_export_html(xml: str, file_name: str) -> str:
+    """Мини-страница с кнопкой «Скачать .svg»: bpmn-js в невидимом контейнере → viewer.saveSVG() → файл."""
+    js_tag, css_tag = _bpmn_js_tags()
+    payload = json.dumps(xml).replace("</", "<\\/")
+    name = json.dumps(file_name)
+    return f"""
+<!doctype html><html><head><meta charset="utf-8">{css_tag}
+<style>
+  html,body {{ margin:0; background:transparent; font-family:"Source Sans Pro",-apple-system,Segoe UI,Roboto,Arial,sans-serif; overflow:hidden; }}
+  #host {{ position:absolute; left:-12000px; top:0; width:2600px; height:1600px; }}
+  button {{ width:100%; height:44px; box-sizing:border-box; border:2px solid {BLUE}; color:{BLUE}; background:#fff;
+      border-radius:12px; font-weight:700; font-size:15px; cursor:pointer; transition:background .15s; }}
+  button:hover:not(:disabled) {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
+  button:disabled {{ opacity:.55; cursor:progress; }}
+</style></head>
+<body>
+<button id="dl" disabled>⏳  Готовим .svg…</button>
+<div id="host"></div>
+{js_tag}
+<script>
+  const XML = {payload};
+  const FILE_NAME = {name};
+  const btn = document.getElementById('dl');
+  const viewer = new BpmnJS({{ container: '#host' }});
+  {EMPHASIZE_JS}
+  viewer.importXML(XML).then(() => {{
+    emphasizeSubprocessTitles();
+    btn.disabled = false; btn.textContent = '⬇️  Скачать .svg';
+  }}).catch(e => {{ btn.textContent = 'SVG недоступен'; btn.title = e.message; }});
+  btn.onclick = async () => {{
+    try {{
+      let {{ svg }} = await viewer.saveSVG();
+      svg = svg.replace(/<svg\\b/, '<svg style="background:#fff"');   // белый фон в браузере и просмотрщиках
+      const url = URL.createObjectURL(new Blob([svg], {{ type: 'image/svg+xml;charset=utf-8' }}));
+      const a = document.createElement('a');
+      a.href = url; a.download = FILE_NAME; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }} catch (e) {{ btn.textContent = 'Ошибка экспорта SVG'; btn.title = e.message; }}
+  }};
 </script></body></html>
 """
 
@@ -228,6 +392,33 @@ def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
         f'<div class="ir-card" style="--c:{color}"><div class="k">{esc(title)}</div>'
         f'<div class="v">{esc(value)}</div><div class="s">{sub}</div>'
         f'<span class="pill">{esc(pill)}</span></div>'
+    )
+
+
+def _landscape_chips(items: List[Dict[str, Any]], css: str, icon: str) -> str:
+    chips = []
+    for it in items:
+        steps = ", ".join(str(n) for n in it.get("steps", []))
+        roles = ", ".join(it.get("roles", []))
+        tip = f"Шаги регламента: {steps}" + (f" · Роли: {roles}" if roles else "")
+        mentions = int(it.get("mentions", 1))
+        count = f"<small>×{mentions}</small>" if mentions > 1 else ""
+        chips.append(f'<span class="{css}" title="{esc(tip)}">{icon} {esc(it["name"])}{count}</span>')
+    return "".join(chips)
+
+
+def render_landscape(audit: Dict[str, Any]) -> None:
+    """ИТ-системы (синие плашки) и документы процесса (зелёные плашки), найденные в тексте регламента."""
+    systems: List[Dict[str, Any]] = audit.get("it_systems") or []
+    artifacts: List[Dict[str, Any]] = audit.get("artifacts") or []
+    st.markdown('<div class="ir-title" style="margin-top:18px">ИТ-ландшафт и документооборот процесса</div>', unsafe_allow_html=True)
+    sys_html = _landscape_chips(systems, "chip-sys", "💻") or '<div class="land-empty">ИТ-системы в регламенте не упомянуты — ' \
+        "процесс не привязан к системам: это риск ручной обработки.</div>"
+    doc_html = _landscape_chips(artifacts, "chip-doc", "📄") or '<div class="land-empty">Документы и артефакты в регламенте не обнаружены.</div>'
+    st.markdown(
+        f'<div class="land-cap">ИТ-системы ({len(systems)})</div>{sys_html}'
+        f'<div class="land-cap">Документы и артефакты ({len(artifacts)})</div>{doc_html}',
+        unsafe_allow_html=True,
     )
 
 
@@ -325,6 +516,8 @@ def render_audit(audit: Dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
 
+    render_landscape(audit)
+
     st.markdown('<div class="ir-title" style="margin-top:18px">Рекомендации по оптимизации</div>', unsafe_allow_html=True)
     risk_messages = [r for r in audit["sla_risks"] if r.get("severity") == "high"]
     recs = "".join(f'<div class="rec bad">{esc(r["message"])}</div>' for r in risk_messages)
@@ -395,35 +588,36 @@ def on_example_change() -> None:
         st.session_state["file_stem"] = "custom_process"
 
 
-def main() -> None:
-    st.set_page_config(page_title="Архитектор BPMN — Интер РАО", page_icon="⚡", layout="wide")
-    st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown(
-        """
-<div class="ir-hero">
-  <div><h1>⚡ Архитектор BPMN-диаграмм</h1>
-  <p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · регламент → BPMN 2.0 → аудит процесса</p></div>
-  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span></div>
-</div>""",
-        unsafe_allow_html=True,
-    )
+def render_downloads(key: str) -> None:
+    """Скачивание результата: BPMN 2.0 (.bpmn) и векторная диаграмма (.svg) — рядом."""
+    result = st.session_state.get("result")
+    ok = bool(result and not result["error"])
+    stem = st.session_state.get("file_stem", "process")
+    col_bpmn, col_svg = st.columns(2, gap="small")
+    with col_bpmn:
+        st.download_button(
+            "⬇️  Скачать .bpmn",
+            data=(result["xml"] if ok else ""),
+            file_name=f"{stem}.bpmn",
+            mime="application/xml",
+            disabled=not ok,
+            key=f"dl_bpmn_{key}",
+        )
+    with col_svg:
+        if ok:
+            page = svg_export_html(result["xml"], f"{stem}.svg")
+            if hasattr(st, "iframe"):
+                st.iframe(page, height=48)
+            else:
+                components.html(page, height=48, scrolling=False)
+        else:
+            st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}")
 
-    examples = load_examples()
-    labels = list(examples)
-    if "reg_text" not in st.session_state:
-        first = labels[0] if labels else CUSTOM_LABEL
-        st.session_state["example_choice"] = first
-        st.session_state["reg_text"] = examples[first]["text"] if labels else ""
-        st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
-    if "result" not in st.session_state and st.session_state["reg_text"].strip():
-        with st.spinner("Готовим эталонный пример…"):
-            # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
-            run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
 
-    left, right = st.columns([5, 7], gap="large")
-
-    with left:
-        st.markdown('<div class="ir-title">1 · Регламент</div>', unsafe_allow_html=True)
+def render_input_panel(labels: List[str], compact: bool = False, show_downloads: bool = True) -> None:
+    """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
+    box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
+    with box_left:
         st.selectbox(
             "Готовый отраслевой регламент",
             [*labels, CUSTOM_LABEL],
@@ -434,8 +628,9 @@ def main() -> None:
         st.text_area(
             "Текст регламента (шаги нумеруются; условия — «Если … — перейти к п.N, иначе …»)",
             key="reg_text",
-            height=400,
+            height=260 if compact else 400,
         )
+    with box_right:
         use_llm = st.checkbox(
             "Использовать LLM (Ollama / OpenAI), если доступна",
             value=True,
@@ -464,32 +659,80 @@ def main() -> None:
                 f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
                 unsafe_allow_html=True,
             )
-        st.download_button(
-            "⬇️  Скачать .bpmn",
-            data=(result["xml"] if result and not result["error"] else ""),
-            file_name=f"{st.session_state.get('file_stem', 'process')}.bpmn",
-            mime="application/xml",
-            disabled=not (result and not result["error"]),
-        )
+        if show_downloads:
+            render_downloads("left")
 
-    with right:
-        st.markdown('<div class="ir-title">2 · Интерактивная диаграмма</div>', unsafe_allow_html=True)
-        result = st.session_state.get("result")
-        if not result:
-            st.info("Выберите регламент и нажмите «Сгенерировать BPMN 2.0».")
-        elif result["error"]:
-            st.error(result["error"])
+
+def render_diagram(canvas_height: int) -> None:
+    result = st.session_state.get("result")
+    if not result:
+        st.info("Выберите регламент и нажмите «Сгенерировать BPMN 2.0».")
+    elif result["error"]:
+        st.error(result["error"])
+    else:
+        page = viewer_html(result["xml"], canvas_height)
+        if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
+            st.iframe(page, height=canvas_height + 16)
         else:
-            page = viewer_html(result["xml"], 660)
-            if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
-                st.iframe(page, height=676)
-            else:
-                components.html(page, height=676, scrolling=False)
+            components.html(page, height=canvas_height + 16, scrolling=False)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Архитектор BPMN — Интер РАО", page_icon="⚡", layout="wide")
+    st.markdown(CSS, unsafe_allow_html=True)
+    # Часть виджетов не рисуется в отдельных режимах — не даём Streamlit стереть их состояние.
+    for _k in ("reg_text", "example_choice"):
+        if _k in st.session_state:
+            st.session_state[_k] = st.session_state[_k]
+
+    st.markdown(
+        """
+<div class="ir-hero">
+  <div><h1>⚡ Архитектор BPMN-диаграмм</h1>
+  <p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · регламент → BPMN 2.0 → аудит процесса</p></div>
+  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span></div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    examples = load_examples()
+    labels = list(examples)
+    if "reg_text" not in st.session_state:
+        first = labels[0] if labels else CUSTOM_LABEL
+        st.session_state["example_choice"] = first
+        st.session_state["reg_text"] = examples[first]["text"] if labels else ""
+        st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
+    if "result" not in st.session_state and st.session_state["reg_text"].strip():
+        with st.spinner("Готовим эталонный пример…"):
+            # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
+            run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
+
+    mode_col, _, dl_col = st.columns([5, 1, 5], gap="medium", vertical_alignment="center")
+    with mode_col:
+        view = st.radio(
+            "Режим отображения",
+            [VIEW_SPLIT, VIEW_WIDE],
+            key="view_mode",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+    wide = view == VIEW_WIDE
+    if wide:
+        with dl_col:
+            render_downloads("wide")
+        with st.expander("Регламент и настройки", expanded=False):
+            render_input_panel(labels, compact=True, show_downloads=False)
+        render_diagram(DIAGRAM_HEIGHT_WIDE)
+    else:
+        left, right = st.columns([5, 7], gap="large")
+        with left:
+            render_input_panel(labels)
+        with right:
+            render_diagram(DIAGRAM_HEIGHT)
 
     result = st.session_state.get("result")
     if result and not result["error"]:
         render_audit(result["audit"])
         render_details(result["audit"])
-
 
 main()
