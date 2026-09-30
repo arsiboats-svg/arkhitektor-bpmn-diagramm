@@ -58,10 +58,10 @@ ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
-DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (не менее 700)
-DIAGRAM_HEIGHT_WIDE = 900  # широкий вид — схема сразу крупная
-VIEW_SPLIT = "🗂  Раздельный вид"
+DIAGRAM_HEIGHT = 580  # ноутбук ~900 px: холст + карточки без бесконечной прокрутки
+DIAGRAM_HEIGHT_WIDE = 640
 VIEW_WIDE = "🖥  Широкий вид"
+VIEW_SPLIT = "🗂  Раздельный вид"
 ASIS_LABEL = "Текущий процесс (As-Is)"
 TOBE_LABEL = "Целевой оптимизированный (To-Be)"
 
@@ -102,7 +102,7 @@ def read_asset(name: str) -> Optional[str]:
 
 
 def _reg_hash(text: str, *parts: object) -> str:
-    payload = "\u001f".join([text or "", *[str(p) for p in parts]])
+    payload = "\u001f".join(["palette-corporate-v3", text or "", *[str(p) for p in parts]])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -157,30 +157,46 @@ def fmt_days(hours: float) -> str:
 CSS = f"""
 <style>
 :root {{ --dark:{BLUE_DARK}; --blue:{BLUE}; --ok:{OK}; --warn:{WARN}; --bad:{BAD}; }}
-.stApp {{ background: #F4F8FD; }}
-.block-container {{ padding-top: 1.2rem; max-width: 1500px; }}
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"], button, input, textarea, select {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+}}
+.stApp {{ background: #F4F8FD; color: #0F172A; }}
+.block-container {{ padding-top: 0.85rem; max-width: 1500px; }}
 header[data-testid="stHeader"] {{ background: transparent; }}
 #MainMenu, footer {{ visibility: hidden; }}
-.ir-hero {{
-  background: linear-gradient(105deg, {BLUE_DARK} 0%, {BLUE} 100%);
-  border-radius: 18px; padding: 22px 30px; color: #fff; margin-bottom: 18px;
-  box-shadow: 0 8px 24px rgba(0,51,102,.22); display:flex; justify-content:space-between; align-items:center; gap:24px;
+button, a, [role="button"], [data-baseweb="tab"], [data-baseweb="select"],
+[data-testid="stRadio"] label, .stDownloadButton > button, .stButton > button {{
+  transition: all 0.2s ease;
 }}
-.ir-hero h1 {{ color:#fff; font-size: 1.75rem; margin:0; padding:0; letter-spacing:.2px; }}
-.ir-hero p {{ margin:4px 0 0 0; color:#DCE9FA; font-size:.98rem; }}
-.ir-badges span {{
-  display:inline-block; background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.35);
-  color:#fff; padding:5px 12px; border-radius:999px; font-size:.78rem; margin-left:6px; white-space:nowrap;
+.ir-hero {{
+  background: linear-gradient(115deg, #002244 0%, #003366 55%, #1565C0 100%);
+  border-radius: 16px; padding: 16px 26px; min-height: 86px; color: #fff;
+  box-shadow: 0 8px 24px rgba(0,34,68,0.22);
+  display: flex; justify-content: space-between; align-items: center; gap: 24px;
+  margin-bottom: 10px;
+}}
+.ir-hero h1 {{
+  color:#fff; font-size:1.55rem; font-weight:800; margin:0; padding:0;
+  letter-spacing:.15px; line-height:1.2;
+}}
+.ir-hero p {{ margin:6px 0 0 0; color:#DCE8F8; font-size:.9rem; line-height:1.35; }}
+.ir-hero .ir-badges {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }}
+.ir-hero .ir-badges span {{
+  display:inline-flex; align-items:center;
+  background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.32);
+  color:#fff; padding:6px 12px; border-radius:999px;
+  font-size:.78rem; font-weight:700; white-space:nowrap;
 }}
 .ir-panel {{
   background:#fff; border:1px solid #DCE6F3; border-radius:16px; padding:18px 20px 8px 20px;
   box-shadow:0 2px 10px rgba(0,51,102,.06);
 }}
 [data-testid="stRadio"] div[role="radiogroup"] {{
-  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:999px; padding:3px;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label {{
-  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+  margin:0; padding:5px 14px; border-radius:999px; cursor:pointer; transition: all 0.2s ease;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
 [data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
@@ -192,22 +208,52 @@ header[data-testid="stHeader"] {{ background: transparent; }}
 .ir-title {{ color:{BLUE_DARK}; font-weight:700; font-size:1.05rem; margin:0 0 10px 0; }}
 .ir-section {{ color:{BLUE_DARK}; font-weight:800; font-size:1.35rem; margin:26px 0 12px 0; display:flex; align-items:center; gap:10px; }}
 .ir-section:before {{ content:""; width:6px; height:26px; background:{BLUE}; border-radius:3px; display:inline-block; }}
-.stButton > button, .stDownloadButton > button {{ width:100%; border-radius:12px; font-weight:700; padding:.65rem 1rem; }}
+.stButton > button, .stDownloadButton > button {{
+  width:100%; border-radius:12px; font-weight:700; padding:.5rem .7rem; height:40px;
+  font-size:.82rem; transition: all 0.2s ease; white-space:nowrap;
+}}
+div[data-testid="stDownloadButton"] button, .stDownloadButton > button {{
+  white-space: nowrap !important; font-size: 0.82rem !important;
+}}
 .stButton > button[kind="primary"] {{
   background: linear-gradient(105deg, {BLUE_DARK}, {BLUE}); border:none; color:#fff;
   box-shadow:0 6px 16px rgba(21,101,192,.35);
 }}
-.stButton > button[kind="primary"]:hover {{ filter:brightness(1.08); }}
+.stButton > button[kind="primary"]:hover {{ filter:brightness(1.08); transform: translateY(-1px); }}
 .stDownloadButton > button {{ border:2px solid {BLUE}; color:{BLUE}; background:#fff; }}
 .stDownloadButton > button:hover {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
-textarea {{ font-size:.9rem !important; line-height:1.45 !important; }}
-.ir-card {{
-  background:#fff; border:1px solid #DCE6F3; border-radius:16px; padding:16px 18px; height:100%;
-  border-top:5px solid var(--c); box-shadow:0 2px 10px rgba(0,51,102,.06);
+textarea, [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {{
+  font-size:.9rem !important; line-height:1.45 !important; border-radius:14px !important;
+  transition: all 0.2s ease !important;
 }}
-.ir-card .k {{ color:#607D8B; font-size:.78rem; text-transform:uppercase; letter-spacing:.6px; font-weight:700; }}
-.ir-card .v {{ color:{BLUE_DARK}; font-size:2.05rem; font-weight:800; line-height:1.15; margin:4px 0; }}
-.ir-card .s {{ color:#455A64; font-size:.86rem; }}
+.ir-card {{
+  background: linear-gradient(180deg, #FFFFFF 0%, #F7FAFD 100%);
+  border: 1px solid #E2E8F0; border-radius:18px; padding:16px 18px; height:100%;
+  border-top:5px solid var(--c); box-shadow:0 4px 16px rgba(0, 51, 102, 0.05);
+}}
+.ir-card .k {{
+  color:#64748B; font-size:.75rem; text-transform:uppercase; letter-spacing:.7px; font-weight:700;
+  display:flex; align-items:center; gap:8px;
+}}
+.ir-card .v {{
+  color:{BLUE_DARK}; font-size:2.05rem; font-weight:800; letter-spacing:-0.03em;
+  line-height:1.1; margin:6px 0 4px 0; font-variant-numeric: tabular-nums;
+}}
+.ir-card .s {{ color:#475569; font-size:.86rem; }}
+.ir-dot {{
+  width:8px; height:8px; border-radius:50%; background:var(--c); flex-shrink:0;
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent);
+}}
+.ir-card.tone-ok .ir-dot {{
+  background:{OK}; animation: ir-pulse 1.8s ease-out infinite;
+}}
+.ir-card.tone-warn .ir-dot {{ background:{WARN}; box-shadow:0 0 0 3px rgba(245,127,23,.22); }}
+.ir-card.tone-alert .ir-dot {{ background:{BAD}; box-shadow:0 0 0 3px rgba(198,40,40,.18); }}
+@keyframes ir-pulse {{
+  0% {{ box-shadow: 0 0 0 0 rgba(46,125,50,.45); }}
+  70% {{ box-shadow: 0 0 0 8px rgba(46,125,50,0); }}
+  100% {{ box-shadow: 0 0 0 0 rgba(46,125,50,0); }}
+}}
 .pill {{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:.74rem; font-weight:700; color:#fff; background:var(--c); margin-top:8px; }}
 .bar-row {{ display:grid; grid-template-columns: minmax(72px, 30%) minmax(48px, 1fr) auto; align-items:center; gap:8px 10px; margin:9px 0; font-size:.88rem; color:#37474F; }}
 .bar-row .n {{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
@@ -230,10 +276,10 @@ table.loops {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 table.loops th {{ text-align:left; color:#607D8B; font-weight:700; border-bottom:2px solid #DCE6F3; padding:6px 8px; }}
 table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#263238; }}
 [data-testid="stRadio"] div[role="radiogroup"] {{
-  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:14px; padding:4px;
+  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:999px; padding:3px;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label {{
-  margin:0; padding:7px 22px; border-radius:10px; cursor:pointer; transition:background .15s, box-shadow .15s;
+  margin:0; padding:5px 14px; border-radius:999px; cursor:pointer; transition: all 0.2s ease;
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
 [data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
@@ -282,6 +328,46 @@ table.raci td.cell {{ text-align:center; white-space:nowrap; }}
 @media (max-width: 900px) {{ .insp-grid {{ grid-template-columns:1fr; }} .tobe-grid {{ grid-template-columns:1fr; }} }}
 section[data-testid="stSidebar"] {{ background:#F7FBFF; }}
 section[data-testid="stSidebar"] .stMarkdown p {{ font-size:.92rem; }}
+.stTabs [data-baseweb="tab-list"],
+div[data-testid="stTabs"] [data-baseweb="tab-list"],
+div[data-testid="stTabs"] [role="tablist"] {{
+  gap: 4px !important; background: #E8EEF7 !important; border-radius: 999px !important;
+  padding: 4px !important; border: 1px solid #D3DFF0; width: fit-content; max-width: 100%;
+}}
+.stTabs [data-baseweb="tab"],
+div[data-testid="stTabs"] button[data-baseweb="tab"],
+div[data-testid="stTab"],
+div[data-testid="stTabs"] [role="tab"] {{
+  height: auto !important; border-radius: 999px !important; padding: 8px 16px !important;
+  background: transparent !important; color: {BLUE_DARK} !important; font-weight: 650 !important;
+  border: 0 !important; letter-spacing: .01em;
+}}
+.stTabs [aria-selected="true"],
+div[data-testid="stTabs"] button[aria-selected="true"],
+div[data-testid="stTab"][aria-selected="true"] {{
+  background: {BLUE_DARK} !important; color: #fff !important;
+  box-shadow: 0 4px 12px rgba(0, 51, 102, .22) !important;
+}}
+div[data-testid="stTab"] p, div[data-testid="stTab"] span,
+div[data-testid="stTabs"] [role="tab"] p {{
+  color: inherit !important;
+}}
+.stTabs [data-baseweb="tab-highlight"],
+.stTabs [data-baseweb="tab-border"],
+div[data-testid="stTabs"] [data-baseweb="tab-highlight"],
+div[data-testid="stTabs"] [data-baseweb="tab-border"],
+div[data-testid="stTabs"] .react-aria-SelectionIndicator {{
+  display: none !important; background: transparent !important; height: 0 !important;
+  visibility: hidden !important;
+}}
+.stTabs [data-baseweb="tab"]:focus, .stTabs [data-baseweb="tab"]:focus-visible,
+div[data-testid="stTab"]:focus {{
+  outline: none !important; box-shadow: none !important;
+}}
+.stTabs [aria-selected="true"]:focus, .stTabs [aria-selected="true"]:focus-visible,
+div[data-testid="stTab"][aria-selected="true"]:focus {{
+  box-shadow: 0 4px 12px rgba(0, 51, 102, .22) !important;
+}}
 </style>
 """
 
@@ -321,52 +407,122 @@ def viewer_html(
     height: int,
     catalog: Optional[Dict[str, Any]] = None,
     copilot: Optional[Dict[str, Any]] = None,
+    xml_tobe: str = "",
+    catalog_tobe: Optional[Dict[str, Any]] = None,
+    canvas_tobe: bool = False,
 ) -> str:
     js_tag, css_tag = _bpmn_js_tags()
-    payload = json.dumps(xml).replace("</", "<\\/")
-    catalog_js = json.dumps(catalog or {}, ensure_ascii=False).replace("</", "<\\/")
+    payload_asis = json.dumps(xml or "").replace("</", "<\\/")
+    payload_tobe = json.dumps(xml_tobe or "").replace("</", "<\\/")
+    catalog_asis_js = json.dumps(catalog or {}, ensure_ascii=False).replace("</", "<\\/")
+    catalog_tobe_js = json.dumps(catalog_tobe or {}, ensure_ascii=False).replace("</", "<\\/")
     copilot_js = json.dumps(copilot or {}, ensure_ascii=False).replace("</", "<\\/")
+    asis_on = " on" if not canvas_tobe else ""
+    tobe_on = " on" if canvas_tobe else ""
+    tobe_disabled = "" if xml_tobe else " disabled"
+    tobe_title = "Целевой оптимизированный" if xml_tobe else "To-Be ещё не готов"
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
-  html,body {{ margin:0; height:100%; font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#fff; }}
-  #wrap {{ position:relative; height:{height}px; border:1px solid #DCE6F3; border-radius:14px; overflow:hidden; background:
-      linear-gradient(#F4F8FD 1px, transparent 1px) 0 0/24px 24px, linear-gradient(90deg,#F4F8FD 1px, transparent 1px) 0 0/24px 24px, #fff; }}
+  html,body {{ margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
+  #wrap {{ position:relative; height:{height}px; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
+      background-color:#fff;
+      background-image: radial-gradient(circle, #D0DCEB 1.5px, transparent 1.5px);
+      background-size: 24px 24px; }}
   #canvas {{ position:absolute; inset:0; cursor:grab; }}
   #canvas:active {{ cursor:grabbing; }}
-  .bar {{ position:absolute; top:10px; right:10px; z-index:5; display:flex; gap:6px; }}
-  .bar button {{ border:1px solid #90CAF9; background:#fff; color:#003366; font-weight:700; border-radius:10px;
-      padding:6px 12px; cursor:pointer; box-shadow:0 2px 6px rgba(0,51,102,.12); font-size:13px; }}
-  .bar button:hover {{ background:#E3F2FD; }}
-  .hint {{ position:absolute; left:12px; bottom:10px; z-index:5; font-size:12px; color:#455A64; background:rgba(255,255,255,.92);
-      border:1px solid #DCE6F3; border-radius:8px; padding:4px 10px; }}
+  .bar {{
+    position:absolute; top:12px; right:12px; z-index:5; display:flex; gap:4px; align-items:center;
+    flex-wrap:wrap; justify-content:flex-end; max-width:calc(100% - 24px);
+    padding:5px 6px 5px 8px;
+    background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-radius: 999px; border: 1px solid rgba(0, 51, 102, 0.12);
+    box-shadow: 0 8px 24px rgba(0, 51, 102, 0.08);
+  }}
+  .bar button {{
+    border:0; background:transparent; color:#003366; font-weight:650; border-radius:999px;
+    padding:7px 12px; cursor:pointer; font-size:13px; letter-spacing:.01em;
+    box-shadow:none; transition: all 0.2s ease;
+  }}
+  .bar button:hover {{ background:rgba(0,51,102,.08); }}
+  .bar button:active {{ transform:scale(0.96); background:rgba(0,51,102,.12); }}
+  .bar .cv-switch {{
+    display:flex; background:rgba(232,238,247,.92); border-radius:999px; padding:2px; margin-right:2px;
+  }}
+  .bar .cv-switch button {{ padding:6px 11px; font-size:12px; font-weight:700; }}
+  .bar .cv-switch button.on {{ background:#003366; color:#fff; }}
+  .bar .cv-switch button.on:hover {{ background:#003366; color:#fff; }}
+  .bar .cv-switch button:disabled {{ opacity:.4; cursor:not-allowed; }}
+  .bar #canvas-search {{
+    width:168px; max-width:28vw; border:0; background:transparent; color:#003366;
+    border-radius:999px; padding:7px 10px; font-size:12.5px; outline:none; box-shadow:none;
+    font-family:inherit; transition: all 0.2s ease;
+  }}
+  .bar #canvas-search:focus {{ background:transparent; box-shadow:none; }}
+  .bar .search-box {{
+    display:flex; align-items:center; gap:0;
+    background:rgba(232,238,247,.72); border-radius:999px; padding-right:4px;
+    flex:0 1 auto; min-width:0;
+  }}
+  .bar .search-box:focus-within {{ background:#fff; box-shadow:0 0 0 3px rgba(21,101,192,.18); }}
+  .bar #search-count {{
+    display:none; font-size:11px; font-weight:700; color:#546E7A; padding:0 6px; white-space:nowrap;
+  }}
+  .bar #search-prev, .bar #search-next {{
+    display:none; padding:3px 7px; font-size:11px; line-height:1; min-width:22px;
+  }}
+  .djs-element.ir-match-all .djs-visual > :nth-child(1) {{
+    stroke: #90CAF9 !important; stroke-width: 2px !important;
+  }}
+  .hint {{ position:absolute; left:12px; bottom:10px; z-index:5; font-size:12px; color:#455A64;
+      background:rgba(255,255,255,.85); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+      border:1px solid rgba(0,51,102,.10); border-radius:999px; padding:5px 12px;
+      box-shadow:0 4px 16px rgba(0,51,102,.06); }}
   #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828; padding:24px; text-align:center; font-weight:600; }}
   .bjs-powered-by {{ opacity:.55; }}
   .djs-element.ir-selected .djs-visual > :nth-child(1) {{
-    stroke:#0D47A1 !important; stroke-width:4px !important;
-    filter:drop-shadow(0 0 7px rgba(13,71,161,.55));
+    stroke:#1565C0 !important; stroke-width:3px !important;
+    filter:drop-shadow(0 0 6px rgba(21,101,192,.35));
+  }}
+  .djs-element.ir-spotlight .djs-visual > :nth-child(1) {{
+    stroke: #FF6D00 !important; stroke-width: 5px !important;
+    filter: drop-shadow(0 0 12px #FF6D00) !important;
+    animation: ir-spot 1.15s ease-in-out infinite;
+  }}
+  @keyframes ir-spot {{
+    0%, 100% {{ filter: drop-shadow(0 0 8px #FF6D00); }}
+    50% {{ filter: drop-shadow(0 0 16px #FF6D00); }}
   }}
   #tip {{
     display:none; position:absolute; z-index:20; width:340px; max-width:calc(100% - 24px);
-    background:#fff; border:1px solid #90CAF9; border-left:6px solid #1565C0;
-    border-radius:14px; box-shadow:0 12px 32px rgba(0,51,102,.22); padding:12px 14px 14px 14px;
+    background:rgba(255,255,255,.94); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    border:1px solid rgba(0,51,102,.12); border-left:6px solid #1565C0;
+    border-radius:16px; box-shadow:0 12px 32px rgba(0,51,102,.16); padding:12px 14px 14px 14px;
     font-size:13px; color:#263238; line-height:1.4;
   }}
   #tip .x {{ position:absolute; top:8px; right:8px; border:0; background:#E3F2FD; color:#003366;
-      width:28px; height:28px; border-radius:8px; font-weight:800; cursor:pointer; }}
+      width:28px; height:28px; border-radius:999px; font-weight:800; cursor:pointer; transition: all 0.2s ease; }}
   #tip .x:hover {{ background:#1565C0; color:#fff; }}
   #tip .kind {{ color:#1565C0; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.4px; padding-right:28px; }}
-  #tip .name {{ color:#003366; font-weight:800; font-size:15px; margin:4px 0 8px 0; }}
+  #tip .name {{ color:#003366; font-weight:800; font-size:15px; margin:4px 0 8px 0; letter-spacing:-.02em; }}
   #tip .meta {{ color:#455A64; margin:3px 0; }}
   #tip .crit {{ display:none; margin:8px 0; background:#FFF3E0; color:#E65100; border-radius:8px; padding:5px 8px; font-weight:700; font-size:12px; }}
   #tip .ai {{ margin-top:8px; background:#E8F1FB; border-radius:10px; padding:8px 10px; color:#0D47A1; }}
-  #close {{ display:none; position:absolute; top:16px; right:16px; z-index:9; border:1px solid rgba(255,255,255,.55);
-      background:rgba(0,51,102,.55); color:#fff; font-weight:700; font-size:14px; border-radius:12px; padding:9px 16px;
-      cursor:pointer; backdrop-filter:blur(4px); opacity:.72; transition:opacity .15s, background .15s; }}
-  #close:hover {{ opacity:1; background:rgba(0,51,102,.9); }}
+  #close {{
+    display:none; position:absolute; top:16px; right:16px; z-index:1000004;
+    border:1px solid rgba(255,255,255,.35); background:rgba(0,51,102,.62); color:#fff;
+    font-weight:700; font-size:13px; letter-spacing:.02em; border-radius:999px; padding:10px 18px;
+    cursor:pointer; backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    box-shadow:0 8px 24px rgba(0,51,102,.22); opacity:.92; transition: all 0.2s ease;
+  }}
+  #close:hover {{ opacity:1; background:rgba(0,51,102,.82); transform:translateY(-1px); }}
+  #close:active {{ transform:scale(0.96); opacity:1; }}
   #wrap.pano {{ position:fixed; top:0; left:0; width:100vw; height:100vh !important; border:0; border-radius:0; z-index:999999; }}
-  #wrap.pano .bar {{ display:none; }}
-  #wrap.pano #close {{ display:block; }}
+  #wrap.pano .bar {{
+    display: flex !important; position: absolute; top: 16px; left: 16px; right: auto;
+    z-index: 1000003; max-width: calc(100vw - 200px); flex-wrap: wrap;
+  }}
+  #wrap.pano #close {{ display:block; top:16px; right:16px; z-index:1000004; }}
   #wrap.pano .hint {{ opacity:.75; left:12px; right:auto; max-width:calc(100% - 100px); }}
   #ai-fab {{
     position:absolute; bottom:24px; right:24px; z-index:1000001;
@@ -374,7 +530,7 @@ def viewer_html(
     background:linear-gradient(135deg,#003366,#1565C0); color:#fff; font-size:22px;
     cursor:pointer; box-shadow:0 8px 22px rgba(0,51,102,.38);
     display:flex; align-items:center; justify-content:center;
-    transition:transform .15s, box-shadow .15s;
+    transition: all 0.2s ease;
   }}
   #ai-fab:hover {{ transform:scale(1.07); box-shadow:0 10px 28px rgba(21,101,192,.45); }}
   #ai-fab span {{ font-size:11px; font-weight:800; display:none; }}
@@ -418,6 +574,16 @@ def viewer_html(
 <body>
 <div id="wrap">
   <div class="bar">
+    <div class="cv-switch" role="group" aria-label="Схема">
+      <button type="button" id="cv-asis" class="{asis_on.strip()}" title="Текущий процесс">As-Is</button>
+      <button type="button" id="cv-tobe" class="{tobe_on.strip()}" title="{tobe_title}"{tobe_disabled}>To-Be</button>
+    </div>
+    <div class="search-box" id="search-box">
+      <input id="canvas-search" placeholder="🔍 Найти узел или роль..." autocomplete="off">
+      <span id="search-count" style="display:none; font-size:11px; font-weight:700; color:#546E7A; padding:0 6px;"></span>
+      <button id="search-prev" type="button" title="Предыдущее совпадение (Shift+Enter)" style="display:none; padding:3px 7px;">▲</button>
+      <button id="search-next" type="button" title="Следующее совпадение (Enter)" style="display:none; padding:3px 7px;">▼</button>
+    </div>
     <button id="zin" title="Приблизить">＋</button><button id="zout" title="Отдалить">－</button>
     <button id="fit" title="Вписать в окно">По размеру</button><button id="one" title="Масштаб 100%">100%</button>
     <button id="full" title="Панорама на весь экран (выход — Esc)">⛶ Панорама на весь экран</button>
@@ -446,9 +612,13 @@ def viewer_html(
 </div>
 {js_tag}
 <script>
-  const XML = {payload};
-  const CATALOG = {catalog_js};
+  const XML_ASIS = {payload_asis};
+  const XML_TOBE = {payload_tobe};
+  const CATALOG_ASIS = {catalog_asis_js};
+  const CATALOG_TOBE = {catalog_tobe_js};
   const COPILOT = {copilot_js};
+  let CATALOG = CATALOG_ASIS;
+  let activeMode = 'asis';
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
   const wrap = document.getElementById('wrap');
@@ -476,6 +646,7 @@ def viewer_html(
   {EMPHASIZE_JS}
 
   let selectedId = null;
+  let spotlightId = null;
   const IGNORE = /bpmn:(Process|Participant|Lane|Collaboration|Group|TextAnnotation|Association|SequenceFlow|DataObject|DataStoreReference|label)/i;
   function resolveEl(el) {{
     if (!el) return null;
@@ -484,7 +655,9 @@ def viewer_html(
   }}
   function clearPick() {{
     if (selectedId) {{ try {{ canvas().removeMarker(selectedId, 'ir-selected'); }} catch (e) {{}} }}
+    if (spotlightId) {{ try {{ canvas().removeMarker(spotlightId, 'ir-spotlight'); }} catch (e) {{}} }}
     selectedId = null;
+    spotlightId = null;
     tip.style.display = 'none';
   }}
   function placeTip(evt) {{
@@ -514,17 +687,201 @@ def viewer_html(
     tip.style.display = 'block';
     placeTip(evt);
   }}
-  viewer.importXML(XML).then(() => {{
-    emphasizeSubprocessTitles();
-    fitSoon();
-    viewer.get('eventBus').on('element.click', function(e) {{
-      const el = resolveEl(e.element);
+  let searchMatches = [];
+  let searchIndex = 0;
+  let matchAllIds = [];
+  const searchCountEl = document.getElementById('search-count');
+  const searchPrevBtn = document.getElementById('search-prev');
+  const searchNextBtn = document.getElementById('search-next');
+  function searchables() {{
+    const registry = viewer.get('elementRegistry');
+    return registry.filter(el => {{
       const t = (el && el.type) || '';
-      if (!el || IGNORE.test(t) || t === 'label') {{ clearPick(); return; }}
-      if (!/Task|Gateway|Event|SubProcess/i.test(t)) {{ clearPick(); return; }}
-      showPick(el, e.originalEvent);
+      if (!el || IGNORE.test(t) || t === 'label') return false;
+      return /Task|Gateway|Event|SubProcess/i.test(t);
+    }}).map(el => {{
+      const bo = el.businessObject || {{}};
+      const meta = CATALOG[el.id] || {{}};
+      const lane = (el.parent && /Lane/i.test(el.parent.type || '') && el.parent.businessObject)
+        ? (el.parent.businessObject.name || '') : '';
+      return {{
+        el,
+        name: String(meta.name || bo.name || '').toLowerCase(),
+        role: String(meta.role || lane || '').toLowerCase(),
+      }};
     }});
-  }}).catch(e => {{
+  }}
+  function clearMatchAll() {{
+    matchAllIds.forEach(id => {{
+      try {{ canvas().removeMarker(id, 'ir-match-all'); }} catch (e) {{}}
+    }});
+    matchAllIds = [];
+  }}
+  function resetSearchUi(hideChrome) {{
+    searchMatches = [];
+    searchIndex = 0;
+    clearMatchAll();
+    clearPick();
+    if (searchCountEl) {{
+      searchCountEl.textContent = '';
+      searchCountEl.style.display = hideChrome ? 'none' : 'inline';
+      if (!hideChrome) searchCountEl.textContent = '0 из 0';
+    }}
+    if (searchPrevBtn) searchPrevBtn.style.display = 'none';
+    if (searchNextBtn) searchNextBtn.style.display = 'none';
+  }}
+  function updateSearchChrome() {{
+    if (!searchCountEl) return;
+    if (!searchMatches.length) {{
+      searchCountEl.textContent = '0 из 0';
+      searchCountEl.style.display = 'inline';
+      if (searchPrevBtn) searchPrevBtn.style.display = 'none';
+      if (searchNextBtn) searchNextBtn.style.display = 'none';
+      return;
+    }}
+    searchCountEl.textContent = (searchIndex + 1) + ' из ' + searchMatches.length;
+    searchCountEl.style.display = 'inline';
+    if (searchPrevBtn) searchPrevBtn.style.display = 'inline-block';
+    if (searchNextBtn) searchNextBtn.style.display = 'inline-block';
+  }}
+  function centerOn(el) {{
+    if (!el) return;
+    const c = canvas();
+    try {{
+      if (typeof c.zoom === 'function' && c.zoom() < 0.95) c.zoom(0.95);
+    }} catch (err) {{}}
+    try {{
+      const bbox = el;
+      const midX = bbox.x + (bbox.width || 0) / 2;
+      const midY = bbox.y + (bbox.height || 0) / 2;
+      const vb = c.viewbox();
+      c.viewbox({{
+        x: midX - vb.width / 2,
+        y: midY - vb.height / 2,
+        width: vb.width,
+        height: vb.height,
+      }});
+    }} catch (err) {{
+      try {{ if (c.scrollToElement) c.scrollToElement(el); }} catch (e2) {{}}
+    }}
+  }}
+  function focusMatch() {{
+    if (!searchMatches.length) return;
+    searchIndex = ((searchIndex % searchMatches.length) + searchMatches.length) % searchMatches.length;
+    const item = searchMatches[searchIndex];
+    centerOn(item.el);
+    let evt = {{ clientX: Math.round(wrap.clientWidth * 0.55), clientY: Math.round(wrap.clientHeight * 0.28) }};
+    try {{
+      const gfx = viewer.get('elementRegistry').getGraphics(item.el);
+      if (gfx && gfx.getBoundingClientRect) {{
+        const r = gfx.getBoundingClientRect();
+        evt = {{ clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }};
+      }}
+    }} catch (err) {{}}
+    showPick(item.el, evt);
+    try {{
+      canvas().addMarker(item.el.id, 'ir-spotlight');
+      spotlightId = item.el.id;
+    }} catch (err) {{}}
+    updateSearchChrome();
+  }}
+  function goSearch(delta) {{
+    if (!searchMatches.length) return;
+    searchIndex = (searchIndex + delta + searchMatches.length) % searchMatches.length;
+    focusMatch();
+  }}
+  function runCanvasSearch(query) {{
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) {{
+      resetSearchUi(true);
+      return;
+    }}
+    searchMatches = searchables().filter(it => it.name.indexOf(q) !== -1 || it.role.indexOf(q) !== -1);
+    searchIndex = 0;
+    clearMatchAll();
+    if (!searchMatches.length) {{
+      clearPick();
+      updateSearchChrome();
+      return;
+    }}
+    searchMatches.forEach(it => {{
+      try {{
+        canvas().addMarker(it.el.id, 'ir-match-all');
+        matchAllIds.push(it.el.id);
+      }} catch (err) {{}}
+    }});
+    focusMatch();
+  }}
+  function resetSearch() {{
+    if (searchBox) searchBox.value = '';
+    resetSearchUi(true);
+  }}
+  const searchBox = document.getElementById('canvas-search');
+  const searchCluster = document.getElementById('search-box');
+  if (searchCluster) {{
+    searchCluster.addEventListener('mousedown', ev => ev.stopPropagation());
+    searchCluster.addEventListener('click', ev => ev.stopPropagation());
+  }}
+  if (searchBox) {{
+    searchBox.addEventListener('mousedown', ev => ev.stopPropagation());
+    searchBox.addEventListener('input', () => runCanvasSearch(searchBox.value));
+    searchBox.addEventListener('keydown', ev => {{
+      if (ev.key === 'Enter') {{
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!searchMatches.length) runCanvasSearch(searchBox.value);
+        else goSearch(ev.shiftKey ? -1 : 1);
+      }}
+      if (ev.key === 'Escape') {{
+        ev.preventDefault();
+        ev.stopPropagation();
+        resetSearch();
+        searchBox.blur();
+      }}
+    }});
+  }}
+  if (searchPrevBtn) searchPrevBtn.addEventListener('click', ev => {{ ev.preventDefault(); ev.stopPropagation(); goSearch(-1); }});
+  if (searchNextBtn) searchNextBtn.addEventListener('click', ev => {{ ev.preventDefault(); ev.stopPropagation(); goSearch(1); }});
+  function applyXml(xml) {{
+    resetSearch();
+    const errEl = document.getElementById('err');
+    if (errEl) errEl.style.display = 'none';
+    return viewer.importXML(xml).then(() => {{
+      emphasizeSubprocessTitles();
+      fitSoon();
+    }});
+  }}
+  function setCanvasMode(m) {{
+    if (m === activeMode) return;
+    if (m === 'tobe' && !XML_TOBE) return;
+    activeMode = m;
+    CATALOG = m === 'tobe' ? CATALOG_TOBE : CATALOG_ASIS;
+    if (bAsis) bAsis.classList.toggle('on', m === 'asis');
+    if (bTobe) bTobe.classList.toggle('on', m === 'tobe');
+    applyXml(m === 'tobe' ? XML_TOBE : XML_ASIS).catch(e => {{
+      const el = document.getElementById('err');
+      el.style.display = 'flex';
+      el.textContent = 'Ошибка отображения BPMN: ' + e.message;
+    }});
+  }}
+  const bAsis = document.getElementById('cv-asis');
+  const bTobe = document.getElementById('cv-tobe');
+  if (bAsis) {{
+    bAsis.addEventListener('mousedown', ev => ev.stopPropagation());
+    bAsis.onclick = () => setCanvasMode('asis');
+  }}
+  if (bTobe) {{
+    bTobe.addEventListener('mousedown', ev => ev.stopPropagation());
+    bTobe.onclick = () => setCanvasMode('tobe');
+  }}
+  viewer.get('eventBus').on('element.click', function(e) {{
+    const el = resolveEl(e.element);
+    const t = (el && el.type) || '';
+    if (!el || IGNORE.test(t) || t === 'label') {{ clearPick(); return; }}
+    if (!/Task|Gateway|Event|SubProcess/i.test(t)) {{ clearPick(); return; }}
+    showPick(el, e.originalEvent);
+  }});
+  applyXml(XML_ASIS).catch(e => {{
     const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
   }});
   document.getElementById('tip-x').onclick = ev => {{ ev.stopPropagation(); clearPick(); }};
@@ -593,6 +950,12 @@ def viewer_html(
   document.getElementById('close').onclick = exitPanorama;
   const onKey = e => {{
     if (e.key === 'Escape') {{
+      const box = document.getElementById('canvas-search');
+      if (box && box.value) {{
+        resetSearch();
+        e.stopPropagation();
+        return;
+      }}
       if (wrap.classList.contains('ai-open')) {{ setCopilot(false); e.stopPropagation(); return; }}
       if (tip.style.display === 'block') {{ clearPick(); if (!panoMode) e.stopPropagation(); }}
       if (panoMode) exitPanorama();
@@ -706,10 +1069,10 @@ def svg_export_html(xml: str, file_name: str) -> str:
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
-  html,body {{ margin:0; background:transparent; font-family:"Source Sans Pro",-apple-system,Segoe UI,Roboto,Arial,sans-serif; overflow:hidden; }}
+  html,body {{ margin:0; background:transparent; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; overflow:hidden; }}
   #host {{ position:absolute; left:-12000px; top:0; width:2600px; height:1600px; }}
-  button {{ width:100%; height:44px; box-sizing:border-box; border:2px solid {BLUE}; color:{BLUE}; background:#fff;
-      border-radius:12px; font-weight:700; font-size:15px; cursor:pointer; transition:background .15s; }}
+  button {{ width:100%; height:40px; box-sizing:border-box; border:2px solid {BLUE}; color:{BLUE}; background:#fff;
+      border-radius:12px; font-weight:700; font-size:0.82rem; white-space:nowrap; cursor:pointer; transition: all 0.2s ease; }}
   button:hover:not(:disabled) {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
   button:disabled {{ opacity:.55; cursor:progress; }}
 </style></head>
@@ -725,7 +1088,7 @@ def svg_export_html(xml: str, file_name: str) -> str:
   {EMPHASIZE_JS}
   viewer.importXML(XML).then(() => {{
     emphasizeSubprocessTitles();
-    btn.disabled = false; btn.textContent = '⬇️  Скачать .svg';
+    btn.disabled = false; btn.textContent = '⬇️ SVG вектор';
   }}).catch(e => {{ btn.textContent = 'SVG недоступен'; btn.title = e.message; }});
   btn.onclick = async () => {{
     try {{
@@ -744,8 +1107,17 @@ def svg_export_html(xml: str, file_name: str) -> str:
 # Аудит: визуальные блоки
 # --------------------------------------------------------------------------- #
 def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
+    if color == OK:
+        tone = "tone-ok"
+    elif color == BAD:
+        tone = "tone-alert"
+    elif color == WARN:
+        tone = "tone-warn"
+    else:
+        tone = "tone-ok"
     return (
-        f'<div class="ir-card" style="--c:{color}"><div class="k">{esc(title)}</div>'
+        f'<div class="ir-card {tone}" style="--c:{color}">'
+        f'<div class="k"><span class="ir-dot" aria-hidden="true"></span>{esc(title)}</div>'
         f'<div class="v">{esc(value)}</div><div class="s">{sub}</div>'
         f'<span class="pill">{esc(pill)}</span></div>'
     )
@@ -1138,7 +1510,10 @@ def on_example_change() -> None:
         st.session_state["file_stem"] = examples[choice]["stem"]
         st.session_state.pop("last_uploaded_filename", None)
         st.session_state.pop("upload_badge", None)
+        st.session_state.pop("_keep_custom_text", None)
     else:
+        if choice == CUSTOM_LABEL and not st.session_state.pop("_keep_custom_text", False):
+            st.session_state["reg_text"] = ""
         stem = Path(st.session_state.get("last_uploaded_filename") or "custom_process").stem
         st.session_state["file_stem"] = re.sub(r"[^\w.\-]+", "_", stem, flags=re.U) or "custom_process"
     st.session_state["chat_messages"] = []
@@ -1240,6 +1615,7 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state["reg_text"] = text
     st.session_state["last_uploaded_filename"] = name
     st.session_state["file_stem"] = stem
+    st.session_state["_keep_custom_text"] = True
     st.session_state["example_choice"] = CUSTOM_LABEL
     st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
@@ -1249,7 +1625,7 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state.pop("tobe_pack", None)
 
 
-def render_downloads(key: str, stacked: bool = False) -> None:
+def render_downloads(key: str) -> None:
     """Скачивание: BPMN 2.0, SVG, Паспорт (.md) и официальный регламент (.docx)."""
     result = st.session_state.get("result")
     ok = bool(result and not result["error"])
@@ -1274,18 +1650,10 @@ def render_downloads(key: str, stacked: bool = False) -> None:
         except Exception:  # noqa: BLE001
             docx_bytes = b""
 
-    def _slot():
-        return st.container()
-
-    if stacked:
-        slots = [_slot(), _slot(), _slot(), _slot()]
-    else:
-        row1 = st.columns(2, gap="small")
-        row2 = st.columns(2, gap="small")
-        slots = [row1[0], row1[1], row2[0], row2[1]]
+    slots = st.columns(4, gap="small")
     with slots[0]:
         st.download_button(
-            "⬇️  Скачать .bpmn",
+            "⬇️ BPMN 2.0",
             data=(result["xml"] if ok else ""),
             file_name=f"{stem}.bpmn",
             mime="application/xml",
@@ -1297,14 +1665,14 @@ def render_downloads(key: str, stacked: bool = False) -> None:
         if ok:
             page = svg_export_html(result["xml"], f"{stem}.svg")
             if hasattr(st, "iframe"):
-                st.iframe(page, height=48)
+                st.iframe(page, height=44)
             else:
-                components.html(page, height=48, scrolling=False)
+                components.html(page, height=44, scrolling=False)
         else:
-            st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
+            st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
     with slots[2]:
         st.download_button(
-            "⬇️  Скачать Паспорт (.md)",
+            "⬇️ Паспорт .md",
             data=passport or "",
             file_name=f"{stem}_passport.md",
             mime="text/markdown",
@@ -1314,7 +1682,7 @@ def render_downloads(key: str, stacked: bool = False) -> None:
         )
     with slots[3]:
         st.download_button(
-            "⬇️  Скачать регламент (.docx)",
+            "⬇️ Регламент .docx",
             data=docx_bytes or b"",
             file_name=f"{stem}_reglament.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1381,7 +1749,7 @@ def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
 
 def render_tobe_tab() -> None:
     st.markdown('<div class="ir-section">Оптимизация As-Is → To-Be</div>', unsafe_allow_html=True)
-    st.caption("Переключатель над холстом меняет схему: текущий процесс или целевой To-Be. Карточка — эффект реинжиниринга.")
+    st.caption("Переключатель As-Is / To-Be на холсте меняет схему. Карточка — эффект реинжиниринга.")
     pack = ensure_tobe_pack()
     if not pack:
         st.info("Сначала сгенерируйте диаграмму As-Is.")
@@ -1568,7 +1936,7 @@ def _raci_tip(letter: str, role: str) -> str:
     return titles.get(letter, letter)
 
 
-def render_input_panel(labels: List[str], compact: bool = False, show_downloads: bool = True) -> None:
+def render_input_panel(labels: List[str], compact: bool = False) -> None:
     """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
     box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
     with box_left:
@@ -1594,7 +1962,7 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
             help="Выберите эталонный кейс или введите свой текст ниже.",
         )
         st.text_area(
-            "Текст регламента (шаги нумеруются; условия — «Если … — перейти к п.N, иначе …»)",
+            "Текст регламента (свободный текст или нумерованный список; развилки — «Если ..., иначе ...»)",
             key="reg_text",
             height=220 if compact else 360,
         )
@@ -1635,8 +2003,6 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
                     f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
                     unsafe_allow_html=True,
                 )
-        if show_downloads:
-            render_downloads("left", stacked=True)
 
 
 def _diagram_height(wide: bool) -> int:
@@ -1650,8 +2016,52 @@ def _diagram_height(wide: bool) -> int:
     lanes = int(stats.get("lanes") or 3)
     nodes = int(stats.get("nodes") or 12)
     base = DIAGRAM_HEIGHT_WIDE if wide else DIAGRAM_HEIGHT
-    extra = min(360, max(0, (lanes - 3) * 80 + max(0, nodes - 18) * 8))
-    return int(base + extra)
+    extra = min(140, max(0, (lanes - 3) * 40 + max(0, nodes - 18) * 4))
+    return int(min(720, max(580, base + extra)))
+
+
+def _sync_canvas_from_query() -> None:
+    """As-Is / To-Be с холста приходит query-параметром cv — без отдельного radio над сеткой."""
+    raw = ""
+    try:
+        val = st.query_params.get("cv")
+        if isinstance(val, list):
+            val = val[0] if val else ""
+        raw = str(val or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        raw = ""
+    if raw == "tobe":
+        st.session_state["canvas_variant"] = TOBE_LABEL
+    elif raw == "asis":
+        st.session_state["canvas_variant"] = ASIS_LABEL
+    elif "canvas_variant" not in st.session_state:
+        st.session_state["canvas_variant"] = ASIS_LABEL
+
+
+def _hero_html() -> str:
+    connected = bool(os.getenv("OPENAI_API_KEY"))
+    engine = "🟢 Groq 120B Online" if connected else "LLM офлайн"
+    return (
+        '<div class="ir-hero">'
+        "<div><h1>⚡ Архитектор BPMN-диаграмм</h1>"
+        "<p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · "
+        "Трансформация регламентов в BPMN 2.0.2 и аудит процессов</p></div>"
+        f'<div class="ir-badges"><span>{esc(engine)}</span>'
+        "<span>BPMN 2.0.2</span><span>XSD Valid</span></div></div>"
+    )
+
+
+def _migrate_view_mode() -> None:
+    current = st.session_state.get("view_mode")
+    if current in (VIEW_SPLIT, VIEW_WIDE):
+        return
+    text = str(current or "")
+    if "Широкий" in text:
+        st.session_state["view_mode"] = VIEW_WIDE
+    elif "Раздельн" in text:
+        st.session_state["view_mode"] = VIEW_SPLIT
+    else:
+        st.session_state["view_mode"] = VIEW_WIDE
 
 
 def render_diagram(canvas_height: int) -> None:
@@ -1661,36 +2071,44 @@ def render_diagram(canvas_height: int) -> None:
     elif result["error"]:
         st.error(result["error"])
     else:
-        st.radio(
-            "Схема на холсте",
-            [ASIS_LABEL, TOBE_LABEL],
-            key="canvas_variant",
-            horizontal=True,
+        pack = ensure_tobe_pack()
+        if pack and pack.get("error") and not pack.get("xml"):
+            st.warning("To-Be недоступен — на холсте остаётся As-Is. " + str(pack.get("error") or ""))
+        xml_asis = result.get("xml") or ""
+        audit_asis = result.get("audit") or {}
+        text_asis = st.session_state.get("reg_text") or ""
+        xml_tobe = ""
+        if pack and pack.get("xml") and not pack.get("error"):
+            xml_tobe = str(pack.get("xml") or "")
+        catalog = build_diagram_catalog(xml_asis, audit_asis, text_asis)
+        catalog_tb = (
+            build_diagram_catalog(
+                xml_tobe,
+                pack.get("audit") or audit_asis,
+                pack.get("text") or text_asis,
+            )
+            if xml_tobe
+            else {}
         )
-        if st.session_state.get("canvas_variant") == TOBE_LABEL:
-            pack = ensure_tobe_pack()
-            if pack and pack.get("error") and not pack.get("xml"):
-                st.warning("To-Be недоступен — показан As-Is. " + str(pack.get("error") or ""))
-            elif st.session_state.get("_last_canvas_variant") != TOBE_LABEL:
-                st.session_state.pop("inspector_choice", None)
-        if st.session_state.get("_last_canvas_variant") != st.session_state.get("canvas_variant"):
-            st.session_state["_last_canvas_variant"] = st.session_state.get("canvas_variant")
-            st.session_state.pop("inspector_choice", None)
-        xml, audit, text = _active_canvas()
-        catalog = build_diagram_catalog(xml, audit, text)
-        pack = st.session_state.get("tobe_pack")
-        asis = st.session_state.get("result") or {}
         copilot = build_canvas_copilot(
-            asis.get("xml") or xml,
-            asis.get("audit") or audit,
-            st.session_state.get("reg_text") or text,
+            xml_asis,
+            audit_asis,
+            text_asis,
             (pack or {}).get("delta"),
         )
-        page = viewer_html(xml, canvas_height, catalog, copilot)
+        page = viewer_html(
+            xml_asis,
+            canvas_height,
+            catalog,
+            copilot,
+            xml_tobe=xml_tobe,
+            catalog_tobe=catalog_tb,
+        )
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
             st.iframe(page, height=canvas_height + 16)
         else:
             components.html(page, height=canvas_height + 16, scrolling=False)
+    render_downloads("under_canvas")
 
 
 def _send_assistant(prompt: str) -> None:
@@ -1763,14 +2181,16 @@ def main() -> None:
         if _k in st.session_state:
             st.session_state[_k] = st.session_state[_k]
 
-    st.markdown(
-        """
-<div class="ir-hero">
-  <div><h1>⚡ Архитектор BPMN-диаграмм</h1>
-  <p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · регламент → BPMN 2.0 → аудит процесса</p></div>
-  <div class="ir-badges"><span>BPMN 2.0.2</span><span>demo.bpmn.io ready</span><span>ИИ + fail-safe</span><span>MCP</span></div>
-</div>""",
-        unsafe_allow_html=True,
+    _sync_canvas_from_query()
+    _migrate_view_mode()
+
+    st.markdown(_hero_html(), unsafe_allow_html=True)
+    view = st.radio(
+        "Режим отображения",
+        [VIEW_WIDE, VIEW_SPLIT],
+        key="view_mode",
+        horizontal=True,
+        label_visibility="collapsed",
     )
 
     examples = load_examples()
@@ -1786,18 +2206,6 @@ def main() -> None:
             run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
             st.session_state["quickstart"] = True
 
-    if "view_mode" not in st.session_state:
-        st.session_state["view_mode"] = VIEW_WIDE
-
-    mode_col, _, dl_col = st.columns([5, 1, 5], gap="medium", vertical_alignment="center")
-    with mode_col:
-        view = st.radio(
-            "Режим отображения",
-            [VIEW_SPLIT, VIEW_WIDE],
-            key="view_mode",
-            horizontal=True,
-            label_visibility="collapsed",
-        )
     wide = view == VIEW_WIDE
     canvas_h = _diagram_height(wide)
     if st.session_state.pop("diagram_updated_by_assistant", False):
@@ -1806,10 +2214,8 @@ def main() -> None:
             unsafe_allow_html=True,
         )
     if wide:
-        with dl_col:
-            render_downloads("wide")
-        with st.expander("Регламент и настройки", expanded=False):
-            render_input_panel(labels, compact=True, show_downloads=False)
+        with st.expander("Параметры регламента", expanded=True):
+            render_input_panel(labels, compact=True)
         render_diagram(canvas_h)
     else:
         left, right = st.columns([5, 7], gap="large")

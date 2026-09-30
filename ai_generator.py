@@ -38,7 +38,7 @@ import re
 import time
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 from validate_bpmn import xsd_errors_xml
@@ -85,7 +85,16 @@ API объекта DIAGRAM (строго эти сигнатуры):
    первый шаг связывай DIAGRAM.add_link(ROOT_START_TASK_ID, ...), все финальные ветки —
    DIAGRAM.add_link(..., ROOT_END_TASK_ID). Тупиков и «висящих» узлов быть не должно.
 6. Имена задач — короткие, в форме «глагол + объект» (до 70 символов), на русском языке.
-7. ФОРМАТ ОТВЕТА: верни ТОЛЬКО исполняемый Python-код для объекта DIAGRAM. Никаких markdown-тегов
+7. ПОСЛЕДОВАТЕЛЬНОЕ СОГЛАСОВАНИЕ. Если в тексте описано последовательное согласование несколькими лицами
+   («любой вносит замечания — возврат на доработку»), создавай цепочку:
+   Задача согласования 1 → Exclusive Gateway (Замечания → возврат, Согласовано → Задача согласования 2) → и т.д.
+   НИКОГДА не делай 2 выхода из обычной задачи без шлюза.
+8. АТОМАРНОСТЬ ЗАДАЧ: Каждая задача в BPMN должна принадлежать ровно одному исполнителю. Если в одном пункте
+   регламента описаны действия нескольких участников (например: «Инициатор готовит заявку, а согласующий проверяет её»)
+   или последовательные этапы со связками «после чего / затем» — ОБЯЗАТЕЛЬНО разбивай их на отдельные последовательные
+   задачи (userTask / scriptTask) в дорожках соответствующих ролей. Однородные действия одного исполнителя
+   («проверить и подписать акт») оставляй одной задачей.
+9. ФОРМАТ ОТВЕТА: верни ТОЛЬКО исполняемый Python-код для объекта DIAGRAM. Никаких markdown-тегов
    (без ```), пояснений, импортов, циклов while и обращений к файлам/сети.
 
 ПРИМЕР ОТВЕТА:
@@ -326,8 +335,8 @@ def execute_generated_code(
             return "", {}, _UNRECOGNIZED_PROCESS
 
         sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
-        structure_issues = _structure_issues(diagram)
         diagram.heal_graph()
+        structure_issues = _structure_issues(diagram)
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit)
@@ -448,8 +457,9 @@ def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
 # Семантический эмулятор (fail-safe)
 # --------------------------------------------------------------------------- #
 ROLE_PATTERNS: List[Tuple[str, str]] = [
-    (r"диспетчер\w*", "Диспетчер"),
+    (r"диспетчерск\w+ служб\w*|диспетчер\w*", "Диспетчер"),
     (r"начальник\w* смены", "Начальник смены"),
+    (r"начальник\w* служб\w* подстанц\w*|служб\w* подстанц\w*", "Служба подстанций"),
     (r"ремонтн\w+ бригад\w*|бригад[аыуеой]\b", "Ремонтная бригада"),
     (r"служб\w* безопасности|\bСБ\b", "Служба безопасности"),
     (r"тендерн\w+ комитет\w*|закупочн\w+ комисси\w*", "Тендерный комитет"),
@@ -462,11 +472,15 @@ ROLE_PATTERNS: List[Tuple[str, str]] = [
     (r"отдел\w* технологического присоединения", "Отдел технологического присоединения"),
     (r"эксплуатационн\w+ служб\w*|служб\w* эксплуатации", "Эксплуатационная служба"),
     (r"эколог\w*|служб\w* экологии|отдел\w* экологии", "Служба экологии"),
-    (r"охран\w* труда|специалист\w* по охране труда", "Служба охраны труда"),
+    (r"охран\w* труда|специалист\w* по охране труда|инженер\w* по охране труда", "Служба охраны труда"),
+    (r"\bРВБ\b|ремонтно-восстановительн\w+ бригад\w*", "РВБ"),
+    (r"\bОМТО\b|отдел\w* материально-техническ\w+|служб\w* МТО", "ОМТО"),
     (r"главн\w+ инженер\w*", "Главный инженер"),
     (r"бухгалтер\w*", "Бухгалтерия"),
     (r"служб\w* (?:информационных технологий|ИТ)\b|ИТ-служб\w*|\bИТ-отдел\w*", "Служба ИТ"),
     (r"руководител\w+|директор\w*", "Руководитель"),
+    (r"согласующ\w*", "Согласующий"),
+    (r"\bинициатор\w*", "Инициатор"),
 ]
 _ROLE_RE = [(re.compile(p, re.I), name) for p, name in ROLE_PATTERNS]
 
@@ -478,9 +492,10 @@ VERB_MAP = {
     "передаёт": "передать", "передает": "передать", "допускает": "допустить", "выводит": "вывести",
     "восстанавливает": "восстановить", "измеряет": "измерить", "рассчитывает": "рассчитать",
     "регистрирует": "зарегистрировать", "формирует": "сформировать", "фиксирует": "зафиксировать",
-    "утверждает": "утвердить", "согласует": "согласовать", "публикует": "опубликовать",
+    "рассматривает": "рассмотреть", "рассматривают": "рассмотреть",
     "уведомляет": "уведомить", "закрывает": "закрыть", "обосновывает": "обосновать",
     "уточняет": "уточнить", "разрабатывает": "разработать", "оценивает": "оценить", "подключает": "подключить",
+    "выезжает": "выехать", "выезжают": "выехать",
     "организует": "организовать", "устраняет": "устранить", "выбирает": "выбрать", "готовят": "подготовить",
     "создаёт": "создать", "создает": "создать", "заносит": "занести", "платит": "оплатить", "берёт": "взять",
     "отвечает": "ответить", "решает": "решить", "принимают": "принять", "отправит": "отправить",
@@ -498,12 +513,413 @@ _DUR_RE = re.compile(
     re.I,
 )
 _REF_RE = re.compile(r"(?:п(?:ункт\w*|\.|п\.)?|шаг\w*)\s*(\d+)", re.I)
-_END_KW = re.compile(r"завершить|отказать|завершается|завершение процесса|прекрат|закрыть\s+(?:заявку|процесс|закупку)", re.I)
-_BACK_KW = re.compile(r"верну|возврат|доработ|повтор|заново", re.I)
+_END_KW = re.compile(r"завершить|завершается|завершение процесса|прекрат|закрыть\s+(?:заявку|процесс|закупку)", re.I)
+_BACK_KW = re.compile(r"верну|возврат|возвраща|доработ|повтор|заново|перенос\s+срок", re.I)
+_CASE_RE = re.compile(r"\b(?:если|в случае(?:\s+если)?)\b", re.I)
+_RETURN_RE = re.compile(
+    r"(?:возвраща\w+|верну\w+|направляется\s+на\s+доработ|на\s+доработк|перенос\s+срок)",
+    re.I,
+)
+_INITIATOR_RE = re.compile(r"инициатор\w*", re.I)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+(?=[А-ЯЁA-Z«\"])")
+_NUMBERED_LINE_RE = re.compile(r"^\s*\d+[.)]\s+\S")
+_SEQ_SPLIT_RE = re.compile(
+    r"(?:;+\s*|(?:,\s*)?(?:после\s+чего|затем|далее|после\s+этого|при\s+этом)\s+)",
+    re.I,
+)
+_WHO_RE = re.compile(r",\s+кото(?:рый|рая|рое|рые)\s+", re.I)
+_A_CONJ_RE = re.compile(r",\s+а\s+(?!также\b)", re.I)
 
 
 _PAGE_MARK_RE = re.compile(r"(?:стр\.?|страница)\s*\d+\s*(?:из\s*\d+)?", re.I)
 _MULTI_NUM_RE = re.compile(r"^(\d+(?:\.\d+)+)\.?\s+", re.M)
+_ROMAN_LINE_RE = re.compile(
+    r"^(?P<rom>(?=[IVXLCDM])M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))[.)]\s+(?P<title>\S.*)$",
+    re.I,
+)
+_LETTER_SUB_RE = re.compile(r"^([а-яёa-z])[).]\s+(\S.*)$", re.I)
+_JOINT_LINK_RE = re.compile(r"^(?P<head>.+?)\s+(?P<link>совместно\s+с|вместе\s+с)\s+", re.I)
+_CYR_SUB_LETTERS = "абвгдежзиклмнопрстуфхцчшщэюя"
+_LAT_SUB_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+_SUB_LETTERS = set(_CYR_SUB_LETTERS + _LAT_SUB_LETTERS)
+_PAR_WORD_RE = re.compile(r"\b(?:параллельно|одновременно)\b", re.I)
+_PAR_GENERIC_RE = re.compile(
+    r"(?:запуска\w*|старту\w*|начина\w*|выполня\w+ся|проводятся|ид[её]т|независим)",
+    re.I,
+)
+_LET_TOKEN_RE = re.compile(r"(^|[\s;:])([а-яёa-z])[)]\s+", re.I)
+_INTRO_CLAUSE_RE = re.compile(
+    r"^(?:"
+    r"после\s+(?:получения|утверждения|согласования|поступления|"
+    r"завершения|окончания|оформления|подписания|выполнения|уведомления|"
+    r"рассмотрения|регистрации)(?:\s+дефектной\s+ведомости|\s+наряда[\s-]*допуска|\s+\S+)?"
+    r"|перед\s+(?:началом|стартом|проведением|выполнением)(?:\s+работ|\s+\S+)?"
+    r"|запуска\w*(?:\s+(?:три|два|несколько|все|независим\w+))*\s+процесс\w*"
+    r")[,:]?\s*",
+    re.I,
+)
+
+
+def _letter_line_body(s: str) -> Optional[str]:
+    lm = _LETTER_SUB_RE.match((s or "").strip())
+    if not lm:
+        return None
+    if lm.group(1).lower() not in _SUB_LETTERS:
+        return None
+    return lm.group(2).strip()
+
+
+def _split_inline_lettered(text: str) -> Tuple[str, List[str]]:
+    src = text or ""
+    found = [m for m in _LET_TOKEN_RE.finditer(src) if m.group(2).lower() in _SUB_LETTERS]
+    if len(found) < 2:
+        return src.strip(), []
+    items: List[str] = []
+    for i, m in enumerate(found):
+        end = found[i + 1].start() if i + 1 < len(found) else len(src)
+        chunk = src[m.end():end].strip(" ;,.\t")
+        if chunk:
+            items.append(chunk)
+    if len(items) < 2:
+        return src.strip(), []
+    intro = src[: found[0].start()].strip(" :;,—–-\t")
+    return intro, items
+
+
+def _is_parallel_fork_intro(body: str) -> bool:
+    t = (body or "").strip()
+    if not t:
+        return True
+    low = t.lower()
+    has_par = bool(_PAR_WORD_RE.search(low))
+    generic = bool(_PAR_GENERIC_RE.search(low)) and bool(
+        re.search(r"процесс|работ|ветк|поток|действи|независим", low)
+    )
+    stripped = _PAR_WORD_RE.sub("", t, count=1)
+    stripped = re.sub(r"^[\s:,—–-]+", "", stripped)
+    role, _, _ = _find_role(stripped)
+    if has_par and generic:
+        return True
+    if generic and role is None:
+        return True
+    if has_par and role is None and len(stripped.split()) <= 12:
+        return True
+    return False
+
+
+def _promote_lettered_parallels(text: str) -> str:
+    """Буквенные подпункты внутри параллельного блока → отдельные шаги с префиксом «Параллельно»."""
+    raw_lines = (text or "").split("\n")
+    out: List[str] = []
+    i = 0
+    while i < len(raw_lines):
+        raw = raw_lines[i]
+        s = raw.strip()
+        num_m = re.match(r"^(\d+)[.)]\s+(.*)$", s)
+        if not num_m:
+            out.append(raw)
+            i += 1
+            continue
+        num, body = num_m.group(1), num_m.group(2)
+        intro_inline, inline_items = _split_inline_lettered(body)
+        kids: List[str] = list(inline_items)
+        j = i + 1
+        skipped_blank = 0
+        while j < len(raw_lines):
+            stripped = raw_lines[j].strip()
+            if not stripped:
+                skipped_blank += 1
+                j += 1
+                continue
+            lb = _letter_line_body(stripped)
+            if lb is None:
+                j -= skipped_blank
+                break
+            kids.append(lb)
+            skipped_blank = 0
+            j += 1
+        head = intro_inline if inline_items else body
+        if kids and _is_parallel_fork_intro(head):
+            for k, kid in enumerate(kids):
+                mark = "Параллельно*: " if k == 0 else "Параллельно: "
+                if k == 0:
+                    out.append(f"{num}. {mark}{kid}")
+                else:
+                    let = _CYR_SUB_LETTERS[k] if k < len(_CYR_SUB_LETTERS) else _LAT_SUB_LETTERS[min(k, 25)]
+                    out.append(f"{let}) {mark}{kid}")
+            i = j
+            continue
+        if kids and _PAR_WORD_RE.search(head):
+            out.append(f"{num}. {head.strip()}")
+            for k, kid in enumerate(kids):
+                let = _CYR_SUB_LETTERS[k] if k < len(_CYR_SUB_LETTERS) else _LAT_SUB_LETTERS[min(k, 25)]
+                out.append(f"{let}) Параллельно: {kid}")
+            i = j
+            continue
+        out.append(raw)
+        i += 1
+    return "\n".join(out)
+
+
+def _expand_corporate_numbering(text: str) -> str:
+    """Римские этапы (I./II.) и буквенные подпункты (а)/б)) → сквозные шаги с маркером стадии."""
+    out: List[str] = []
+    stage: Optional[str] = None
+    last_n = 0
+    extra = 0
+    for line in text.split("\n"):
+        s = line.strip()
+        rm = _ROMAN_LINE_RE.match(s)
+        if rm and rm.group("rom"):
+            stage = rm.group("title").strip()
+            continue
+        lm = _LETTER_SUB_RE.match(s)
+        if lm and lm.group(1).lower() in _SUB_LETTERS:
+            last_n += 1
+            extra += 1
+            body = lm.group(2).strip()
+            if stage and "этап" not in body.lower():
+                body = f"{body} (этап «{stage}»)"
+            out.append(f"{last_n}. {body}")
+            continue
+        m = re.match(r"^(\d+)[.)]\s+(.*)$", s)
+        if m:
+            last_n = int(m.group(1)) + extra
+            body = m.group(2)
+            if stage and "этап" not in body.lower():
+                body = f"{body} (этап «{stage}»)"
+            out.append(f"{last_n}. {body}")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _count_explicit_numbers(text: str) -> int:
+    n = 0
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if _NUMBERED_LINE_RE.match(s):
+            n += 1
+            continue
+        rm = _ROMAN_LINE_RE.match(s)
+        if rm and rm.group("rom"):
+            n += 1
+    return n
+
+
+def _roles_mentioned(text: str) -> List[str]:
+    found: List[Tuple[int, str]] = []
+    for regex, name in _ROLE_RE:
+        for m in regex.finditer(text or ""):
+            found.append((m.start(), name))
+    found.sort()
+    out: List[str] = []
+    for _, name in found:
+        if not out or out[-1] != name:
+            out.append(name)
+    return out
+
+
+def _role_at_start(text: str) -> Optional[str]:
+    src = (text or "").strip()
+    if not src:
+        return None
+    joint = _split_joint_role(src)
+    if joint:
+        return joint[0]
+    inv = _match_inverted_role(src)
+    if inv:
+        return inv[0]
+    role, rs, _ = _find_role(src)
+    if role and rs == 0:
+        return role
+    subj = _subject_before_verb(src)
+    if subj:
+        name = _canonical_role(subj[0])
+        if name.lower() in {"который", "которая", "которое", "которые", "которого", "которой"}:
+            return None
+        return name
+    return None
+
+
+def _chunk_role(text: str) -> Optional[str]:
+    return _role_at_start(text) or (_find_role(text or "")[0])
+
+
+def _split_seq_conjunctions(text: str) -> List[str]:
+    bits = _SEQ_SPLIT_RE.split(text or "")
+    return [b.strip(" ,;.—–-") for b in bits if len(b.strip(" ,;.—–-")) > 2]
+
+
+def _split_role_handoff(text: str) -> List[str]:
+    """Один пункт с передачей другой роли → отдельные шаги; однородные «и» не режем."""
+    t = (text or "").strip()
+    if len(t) < 12:
+        return [t] if t else []
+    m = _WHO_RE.search(t)
+    if m:
+        left, right = t[: m.start()].strip(), t[m.end() :].strip()
+        actor = _role_at_start(left) or _chunk_role(left)
+        mentioned = _roles_mentioned(left)
+        referred = mentioned[-1] if mentioned else None
+        if referred and actor != referred and right:
+            prefixed = right if _role_at_start(right) else f"{referred} {right}"
+            return _split_role_handoff(left) + _split_role_handoff(prefixed)
+    m = _A_CONJ_RE.search(t)
+    if m:
+        left, right = t[: m.start()].strip(), t[m.end() :].strip()
+        rrole = _role_at_start(right)
+        lrole = _role_at_start(left) or _chunk_role(left)
+        if rrole and rrole != lrole:
+            return _split_role_handoff(left) + _split_role_handoff(right)
+    for cm in re.finditer(r",\s+", t):
+        right = t[cm.end() :]
+        rrole = _role_at_start(right)
+        if not rrole:
+            continue
+        left = t[: cm.start()].strip()
+        lrole = _role_at_start(left) or _chunk_role(left)
+        if lrole and rrole != lrole:
+            return _split_role_handoff(left) + _split_role_handoff(right)
+    return [t]
+
+
+def _merge_homogeneous(parts: List[str]) -> List[str]:
+    """«Проверить и подписать акт» одного исполнителя остаётся одной задачей."""
+    if not parts:
+        return []
+    out = [parts[0]]
+    for part in parts[1:]:
+        prev = out[-1]
+        if re.match(r"^и\s+", part, re.I):
+            out[-1] = (prev.rstrip(" ,;") + " " + part).strip()
+            continue
+        pr = _role_at_start(prev) or _chunk_role(prev)
+        cr = _role_at_start(part) or _chunk_role(part)
+        if cr is None and pr is not None and len(part.split()) <= 5:
+            words = part.split()
+            if words and not _is_verb(words[0].strip(".,;:")):
+                out[-1] = (prev.rstrip(" ,;") + " " + part).strip()
+                continue
+        out.append(part)
+    return out
+
+
+def _atomize_step_body(text: str) -> List[str]:
+    """Смысловые шаги: ; / после чего / затем / смена роли. Не дробит «если» и однородные «и»."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return []
+    if len(t) < 12:
+        return [t]
+    if _CASE_RE.search(t):
+        return [t]
+    parts: List[str] = []
+    for seq in _split_seq_conjunctions(t):
+        parts.extend(_split_role_handoff(seq))
+    merged = _merge_homogeneous(parts)
+    return [p for p in merged if len(p.strip()) > 8] or [t]
+
+
+def _atomize_numbered_lines(text: str) -> str:
+    extra = 0
+    out: List[str] = []
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        m = re.match(r"^(\d+)[.)]\s+(.*)$", s)
+        if not m:
+            out.append(line)
+            continue
+        n = int(m.group(1))
+        bits = _atomize_step_body(m.group(2))
+        if len(bits) <= 1:
+            out.append(f"{n + extra}. {bits[0]}" if bits else line)
+            continue
+        for i, bit in enumerate(bits):
+            out.append(f"{n + extra + i}. {bit}")
+        extra += len(bits) - 1
+    return "\n".join(out)
+
+
+def _split_prose_sentences(text: str) -> List[str]:
+    src = (text or "").strip()
+    if not src:
+        return []
+    out: List[str] = []
+    for line in src.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for sent in _SENTENCE_SPLIT_RE.split(line):
+            for semi in re.split(r";+\s*", sent):
+                chunk = semi.strip()
+                if len(chunk) > 8:
+                    out.extend(_atomize_step_body(chunk))
+    return out
+
+
+def _sentence_is_step(sentence: str) -> bool:
+    s = (sentence or "").strip()
+    if not s:
+        return False
+    if re.match(r"^(?:регламент|название|процесс)\s*[:—–-]", s, re.I):
+        return False
+    if re.match(r"^порядок\s+", s, re.I) and not _CASE_RE.search(s) and not _RETURN_RE.search(s):
+        if not any(_is_verb(w.strip(".,;:")) for w in s.split()[:8]):
+            return False
+    if _CASE_RE.search(s) or _BACK_KW.search(s) or _PAR_WORD_RE.search(s):
+        return True
+    if _find_role(s)[0] or _match_inverted_role(s):
+        return True
+    return any(_is_verb(w.strip(".,;:—–-")) for w in s.split()[:14])
+
+
+def _segment_unnumbered_prose(text: str) -> str:
+    """Сплошной текст без «1.» / «I.» → виртуально нумерованные шаги по предложениям."""
+    src = (text or "").strip()
+    if not src or _count_explicit_numbers(src) >= 2:
+        return src
+    headers: List[str] = []
+    body: List[str] = []
+    for line in src.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r"^(?:регламент|название|процесс)\s*[:—–-]", s, re.I):
+            headers.append(s)
+            continue
+        if re.match(r"^(?:целев\w+\s+(?:срок|sla)[^:—–]*|sla)\s*[:—–-]", s, re.I):
+            headers.append(s)
+            continue
+        body.append(s)
+    if body:
+        first = body[0]
+        looks_title = (
+            not re.search(r"[.!?]$", first)
+            and len(first.split()) <= 18
+            and not _CASE_RE.search(first)
+            and not _RETURN_RE.search(first)
+            and not any(_is_verb(w.strip(".,;:")) for w in first.split())
+        )
+        if looks_title:
+            if not headers:
+                headers.append("Регламент: " + first.rstrip(" ."))
+            body = body[1:]
+    sentences: List[str] = []
+    for chunk in body or ([src] if not headers else []):
+        sentences.extend(_split_prose_sentences(chunk))
+    steps = [s for s in sentences if _sentence_is_step(s)]
+    if len(steps) < 2:
+        return src
+    if not headers:
+        leftover = next((s for s in sentences if s not in steps), "")
+        if leftover:
+            headers.append("Регламент: " + leftover.rstrip(" ."))
+    numbered = []
+    for i, s in enumerate(steps, 1):
+        body_s = s if s.endswith((".", "!", "?")) else s.rstrip(".") + "."
+        numbered.append(f"{i}. {body_s}")
+    return "\n".join([*headers, *numbered]).strip()
 
 
 def normalize_regulation(text: str) -> str:
@@ -533,7 +949,8 @@ def normalize_regulation(text: str) -> str:
         text = _MULTI_NUM_RE.sub(lambda m: mapping[m.group(1)] + ". " if m.group(1) in mapping else m.group(0), text)
         for num in sorted(mapping, key=len, reverse=True):
             text = re.sub(r"(?<![\d.])" + re.escape(num) + r"(?![\d])", mapping[num], text)
-    return text
+    text = _segment_unnumbered_prose(text)
+    return _atomize_numbered_lines(_expand_corporate_numbering(_promote_lettered_parallels(text)))
 
 
 def _to_hours(value: str, unit: str) -> float:
@@ -561,6 +978,10 @@ def _infinitive(word: str) -> str:
 
 def _task_title(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip(" .;,:—–-")
+    text = _CONNECTORS_RE.sub("", text).strip(" .;,:—–-")
+    text = _INTRO_CLAUSE_RE.sub("", text).strip(" .;,:—–-")
+    if not text:
+        return "Выполнить действие"
     words = [_infinitive(w) if re.fullmatch(r"[А-Яа-яЁё]+", w) else w for w in text.split(" ")]
     title = " ".join(words)
     title = title[:1].upper() + title[1:] if title else "Выполнить действие"
@@ -571,8 +992,13 @@ def _task_title(text: str) -> str:
 
 
 TITLE_MAX = 110  # длиннее — обрезаем по слову; блок задачи растёт по высоте под текст
-_CONNECTORS_RE = re.compile(r"^(?:затем|далее|потом|после этого|также|при этом)[,\s]+", re.I)
+_CONNECTORS_RE = re.compile(
+    r"^(?:затем|далее|потом|после этого|после проверки|также|при этом|"
+    r"при согласовании|в случае согласования)[,\s]+",
+    re.I,
+)
 _ADVERBS = {"автоматически", "затем", "далее", "также", "самостоятельно", "обязательно", "незамедлительно", "оперативно"}
+_REL_PRONOUNS = {"который", "которая", "которое", "которые", "которого", "которой", "которым", "которыми"}
 
 
 def _is_verb(word: str) -> bool:
@@ -592,6 +1018,8 @@ def _subject_before_verb(text: str) -> Optional[Tuple[str, int]]:
                 words.pop()
             if not words or len(words) > 4 or any(re.search(r"[\d:;()«»,]", w) for w in words):
                 return None
+            if all(w.lower().strip(",") in _REL_PRONOUNS for w in words):
+                return None
             return " ".join(words), offset + tok.start()
         if re.search(r"[.;:]$", tok.group()):
             break
@@ -605,11 +1033,77 @@ def _canonical_role(subject: str) -> str:
     return subject[:1].upper() + subject[1:]
 
 
+_INVERSE_VERB_RE = re.compile(
+    r"\s+(?P<verb>выполняет|выполняют|проводит|проводят|осуществляет|осуществляют|"
+    r"ведёт|ведет|ведут|производит|производят|"
+    r"готовит|готовят|направляет|направляют|рассматривает|рассматривают|"
+    r"проверяет|проверяют|вносит|вносят|принимает|принимают)\s+",
+    re.I,
+)
+
+
+def _match_inverted_role(text: str) -> Optional[Tuple[str, str, str]]:
+    """Инверсия ТЭК: «Осмотр оборудования проводит начальник смены» → (роль, действие, глагол)."""
+    src = (text or "").strip()
+    if not src:
+        return None
+    m = _INVERSE_VERB_RE.search(src)
+    if not m or m.start() < 3:
+        return None
+    action = src[: m.start()].strip(" .,;:—–-")
+    tail = src[m.end() :].strip()
+    if not action or not tail or len(action.split()) > 12:
+        return None
+    head = action.split()[0].lower().strip("«»\"'")
+    if any(rx.search(head) for rx, _ in _ROLE_RE):
+        return None
+    role: Optional[str] = None
+    for regex, name in _ROLE_RE:
+        mm = regex.search(tail[:90])
+        if mm and mm.start() <= 3:
+            role = name
+            break
+    if role is None:
+        rm = re.match(r"([А-ЯЁ][А-Яа-яЁё\-]+(?:\s+[а-яёА-ЯЁ\-]{3,24}){0,3})", tail)
+        if not rm:
+            return None
+        cand = rm.group(1).strip()
+        if len(cand.split()) > 5 or re.search(r"[\d:;()]", cand):
+            return None
+        role = _canonical_role(cand)
+    return role, action, m.group("verb")
+
+
+def _split_joint_role(text: str) -> Optional[Tuple[str, str]]:
+    """«Диспетчер совместно с бригадой …» → первая роль + полный текст действия."""
+    src = (text or "").strip()
+    m = _JOINT_LINK_RE.match(src)
+    if not m:
+        return None
+    head = m.group("head").strip(" ,")
+    role: Optional[str] = None
+    for regex, name in _ROLE_RE:
+        mm = regex.search(head)
+        if mm and mm.start() <= 2:
+            role = name
+            break
+    if not role:
+        return None
+    action = src[len(head) :].strip(" ,:;.—–-")
+    return role, action
+
+
 def _find_role(text: str) -> Tuple[Optional[str], int, int]:
     """Роль-исполнитель шага: (название, начало, конец вырезаемого префикса)."""
     m = re.match(r"^([А-ЯЁ][А-Яа-яЁё\- ]{2,45}?)\s*[:—–]\s+", text)
     if m and len(m.group(1).split()) <= 5 and not re.match(r"(?i)^(если|параллельно|одновременно)", m.group(1)):
         return _canonical_role(m.group(1).strip()), 0, m.end()
+    inverted = _match_inverted_role(text)
+    if inverted:
+        role, _action, _verb = inverted
+        vm = _INVERSE_VERB_RE.search(text.strip())
+        tail_start = vm.end() if vm else 0
+        return role, tail_start, len(text.strip())
     subject = _subject_before_verb(text[:120])
     if subject:
         return _canonical_role(subject[0]), 0, subject[1]
@@ -725,6 +1219,7 @@ class Decision:
     no_end: bool = False
     no_back: bool = False
     has_else: bool = False
+    back_clause: str = ""
 
 
 @dataclass
@@ -734,6 +1229,7 @@ class Step:
     role: str = ""
     title: str = ""
     parallel: bool = False
+    fork_parallel: bool = False
     stage: Optional[str] = None
     hours: Optional[float] = None
     system: bool = False
@@ -776,42 +1272,113 @@ def _derive_no_label(clause: str) -> str:
 
 
 def _parse_decision(text: str) -> Tuple[str, Optional[Decision]]:
-    m = re.search(r"\bесли\b", text, re.I)
-    if not m:
-        return text, None
-    action = text[: m.start()].strip(" .;,—–-")
-    rest = text[m.end():]
-    else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае)\b[,:]?", rest, re.I)
-    yes_part = rest[: else_m.start()] if else_m else rest
-    no_part = rest[else_m.end():] if else_m else ""
-    pieces = re.split(r"\s+[—–-]\s+|,\s+|:\s+", yes_part.strip(), maxsplit=1)
-    cond = pieces[0].strip(" ,.;")
-    yes_clause = pieces[1] if len(pieces) > 1 else ""
-    quoted_yes = re.search(r"«([^»]+)»", cond)
-    quoted_no = re.search(r"«([^»]+)»", no_part)
-    yes_label = (quoted_yes.group(1) if quoted_yes else cond).strip()
-    yes_label = yes_label[:1].upper() + yes_label[1:]
-    no_label = quoted_no.group(1).strip() if quoted_no else _derive_no_label(no_part)
-    no_label = no_label[:1].upper() + no_label[1:]
-    yes_ref = _REF_RE.search(yes_clause)
-    no_ref = _REF_RE.search(no_part)
-    decision = Decision(
-        yes_label=yes_label[:40],
-        no_label=no_label[:40],
-        yes_ref=int(yes_ref.group(1)) if yes_ref else None,
-        no_ref=int(no_ref.group(1)) if no_ref else None,
-        yes_end=bool(_END_KW.search(yes_clause)),
-        no_end=bool(_END_KW.search(no_part)) and not no_ref,
-        no_back=bool(_BACK_KW.search(no_part)) and not no_ref,
-        has_else=bool(else_m),
-    )
-    return action, decision
+    src = text or ""
+    m = _CASE_RE.search(src)
+    if m:
+        action = src[: m.start()].strip(" .;,—–-")
+        rest = src[m.end():]
+        else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае)\b[,:]?", rest, re.I)
+        yes_part = rest[: else_m.start()] if else_m else rest
+        no_part = rest[else_m.end():] if else_m else ""
+        pieces = re.split(r"\s+[—–-]\s+|,\s+|:\s+", yes_part.strip(), maxsplit=1)
+        cond = pieces[0].strip(" ,.;")
+        yes_clause = pieces[1] if len(pieces) > 1 else ""
+        quoted_yes = re.search(r"«([^»]+)»", cond)
+        quoted_no = re.search(r"«([^»]+)»", no_part)
+        yes_label = (quoted_yes.group(1) if quoted_yes else cond).strip()
+        yes_label = (yes_label[:1].upper() + yes_label[1:]) if yes_label else "Да"
+        no_label = quoted_no.group(1).strip() if quoted_no else _derive_no_label(no_part)
+        no_label = (no_label[:1].upper() + no_label[1:]) if no_label else "Иначе"
+        yes_ref = _REF_RE.search(yes_clause)
+        no_ref_m = _REF_RE.search(no_part) if no_part else None
+        back_src = no_part
+        yes_end = bool(_END_KW.search(yes_clause))
+        no_end = bool(_END_KW.search(no_part)) and not no_ref_m
+        no_back = bool(_BACK_KW.search(no_part)) and not no_ref_m
+        if not else_m and _BACK_KW.search(yes_part) and not _END_KW.search(yes_part):
+            back_src = yes_part
+            no_ref_m = no_ref_m or _REF_RE.search(yes_part)
+            no_back = not bool(no_ref_m)
+            no_label = _derive_no_label(yes_part)
+            no_label = (no_label[:1].upper() + no_label[1:]) if no_label else "На доработку"
+            low = yes_part.lower()
+            if "замечан" in low:
+                yes_label = "Замечаний нет"
+            elif "отказ" in low or "отклон" in low:
+                yes_label = "Согласовано"
+            else:
+                yes_label = "Продолжить"
+            yes_end = False
+            yes_ref = None
+        if yes_end and not else_m:
+            low_end = f"{cond} {yes_clause}".lower()
+            if "отказ" in low_end or "отклон" in low_end:
+                yes_label = "Отказ"
+                no_label = "Согласовано"
+        decision = Decision(
+            yes_label=yes_label[:40],
+            no_label=no_label[:40],
+            yes_ref=int(yes_ref.group(1)) if yes_ref else None,
+            no_ref=int(no_ref_m.group(1)) if no_ref_m else None,
+            yes_end=yes_end,
+            no_end=no_end,
+            no_back=bool(no_back or (no_ref_m and _BACK_KW.search(back_src or ""))),
+            has_else=bool(else_m),
+            back_clause=back_src or "",
+        )
+        if no_ref_m and _BACK_KW.search(back_src or yes_part):
+            decision.no_back = True
+            decision.no_ref = int(no_ref_m.group(1))
+        return action, decision
+
+    rm = _RETURN_RE.search(src)
+    if rm and _BACK_KW.search(src):
+        action = src[: rm.start()].strip(" .;,—–-")
+        clause = src[rm.start():]
+        ref_m = _REF_RE.search(clause)
+        decision = Decision(
+            yes_label="Замечаний нет",
+            no_label=_derive_no_label(clause),
+            no_ref=int(ref_m.group(1)) if ref_m else None,
+            no_back=True,
+            back_clause=clause,
+        )
+        return action, decision
+    return src, None
+
+
+def _resolve_implicit_returns(steps: List[Step]) -> None:
+    """Возврат без «п.N» → последний предыдущий шаг указанной (или текущей) роли."""
+    for i, step in enumerate(steps):
+        d = step.decision
+        if not d or d.no_ref is not None or not d.no_back:
+            continue
+        clause = d.back_clause or d.no_label or ""
+        hinted, _, _ = _find_role(clause)
+        if hinted is None and _INITIATOR_RE.search(clause):
+            hinted = steps[0].role if steps else None
+        if hinted is None:
+            hinted = step.role
+        found: Optional[int] = None
+        for prev in reversed(steps[:i]):
+            if prev.role == hinted:
+                found = prev.num
+                break
+        if found is None and _INITIATOR_RE.search(clause) and steps:
+            found = steps[0].num
+        if found is None and i:
+            found = steps[i - 1].num
+        if found is not None:
+            d.no_ref = found
 
 
 def parse_regulation(text: str) -> ParsedRegulation:
+    text = _promote_lettered_parallels(text or "")
+    text = _segment_unnumbered_prose(text)
     title: Optional[str] = None
     sla: Optional[float] = None
     raw_steps: List[Tuple[Optional[int], str]] = []
+    current_stage: Optional[str] = None
     for line in text.splitlines():
         s = line.strip()
         if not s:
@@ -826,9 +1393,27 @@ def parse_regulation(text: str) -> ParsedRegulation:
             if d:
                 sla = _to_hours(d.group(1), d.group(2))
             continue
+        rm = _ROMAN_LINE_RE.match(s)
+        if rm and rm.group("rom"):
+            current_stage = rm.group("title").strip()
+            rest = current_stage
+            if _find_role(rest)[0] or _match_inverted_role(rest) or _split_joint_role(rest):
+                body = rest if re.search(r"этап", rest, re.I) else f"{rest} (этап «{current_stage}»)"
+                raw_steps.append((None, body))
+            continue
+        lm = _LETTER_SUB_RE.match(s)
+        if lm and lm.group(1).lower() in _SUB_LETTERS:
+            body = lm.group(2).strip()
+            if current_stage and "этап" not in body.lower():
+                body = f"{body} (этап «{current_stage}»)"
+            raw_steps.append((None, body))
+            continue
         m = re.match(r"^(\d+)[.)]\s+(.*)$", s)
         if m:
-            raw_steps.append((int(m.group(1)), m.group(2)))
+            body = m.group(2)
+            if current_stage and "этап" not in body.lower():
+                body = f"{body} (этап «{current_stage}»)"
+            raw_steps.append((int(m.group(1)), body))
             continue
         m = re.match(r"^[-•*]\s+(.*)$", s)
         if m:
@@ -842,18 +1427,42 @@ def parse_regulation(text: str) -> ParsedRegulation:
         else:
             raw_steps.append((None, s))
 
+    expanded: List[Tuple[Optional[int], str]] = []
+    for num, body in raw_steps:
+        bits = _atomize_step_body(body)
+        if not bits:
+            expanded.append((num, body))
+            continue
+        expanded.append((num, bits[0]))
+        for extra in bits[1:]:
+            expanded.append((None, extra))
+    raw_steps = expanded
+
     if len(raw_steps) < 2:  # нет нумерации — режем на предложения
-        sentences = re.split(r"(?<=[.;!?])\s+(?=[А-ЯЁA-Z«])", " ".join(t for _, t in raw_steps) or text)
+        sentences = _split_prose_sentences(" ".join(t for _, t in raw_steps) or text)
         raw_steps = [(None, s.strip()) for s in sentences if len(s.strip()) > 8]
 
     parsed = ParsedRegulation(title=title or "Бизнес-процесс по регламенту", sla_hours=sla)
     last_role = ""
+    letter_shift = 0
+    last_assigned = 0
+    sequenced: List[Tuple[int, str]] = []
+    for num, body in raw_steps:
+        if num is None:
+            last_assigned += 1
+            letter_shift += 1
+            sequenced.append((last_assigned, body))
+        else:
+            last_assigned = num + letter_shift
+            sequenced.append((last_assigned, body))
+    raw_steps = sequenced
     for idx, (num, body) in enumerate(raw_steps):
         step = Step(idx=idx, num=num if num is not None else idx + 1)
         t = body.strip()
-        pm = re.match(r"^(параллельно|одновременно)\s*[:,—–-]?\s*", t, re.I)
+        pm = re.match(r"^(параллельно|одновременно)\s*(\*)?\s*[:,—–-]?\s*", t, re.I)
         if pm:
             step.parallel = True
+            step.fork_parallel = bool(pm.group(2))
             t = t[pm.end():]
         sm = re.search(r"\(\s*этап\s*«([^»]+)»\s*\)", t, re.I)
         if sm:
@@ -863,24 +1472,45 @@ def parse_regulation(text: str) -> ParsedRegulation:
         if dm:
             step.hours = _to_hours(dm.group(1), dm.group(2))
             t = (t[: dm.start()] + " " + t[dm.end():]).strip()
+        t = _INTRO_CLAUSE_RE.sub("", t).strip(" .;,:—–-")
+        t = _CONNECTORS_RE.sub("", t).strip(" .;,:—–-")
         action, decision = _parse_decision(t)
         step.decision = decision
         step.action = bool(action)
         source = action if action else t
-        role, rs, re_ = _find_role(source)
-        if role is None and decision is not None:
-            role, rs, re_ = _find_role(t)
-        step.role = role or last_role or "Исполнитель"
-        last_role = step.role
-        if role and rs == 0:
-            source = source[re_:]
-        step.title = _task_title(source) if step.action else ""
+        joint = _split_joint_role(source)
+        inverted = None if joint else _match_inverted_role(source)
+        if inverted is None and decision is not None and joint is None:
+            inverted = _match_inverted_role(t)
+        if joint:
+            step.role = joint[0] or last_role or "Исполнитель"
+            last_role = step.role
+            step.title = _task_title(joint[1]) if step.action else ""
+        elif inverted:
+            role, action_phrase, verb = inverted
+            step.role = role or last_role or "Исполнитель"
+            last_role = step.role
+            inf = _infinitive(verb)
+            rest = action_phrase[:1].lower() + action_phrase[1:] if action_phrase else ""
+            step.title = _task_title(f"{inf} {rest}".strip()) if step.action else ""
+        else:
+            role, rs, re_ = _find_role(source)
+            if role is None and decision is not None:
+                role, rs, re_ = _find_role(t)
+            if decision is not None and not step.action:
+                role = last_role or role
+            step.role = role or last_role or "Исполнитель"
+            last_role = step.role
+            if role and rs == 0 and step.action:
+                source = source[re_:]
+            step.title = _task_title(source) if step.action else ""
         step.system = bool(_SYSTEM_RE.search(source))
         step.artifacts = extract_artifacts(body)
         step.systems = extract_it_systems(body)
         parsed.steps.append(step)
         if step.role not in parsed.roles:
             parsed.roles.append(step.role)
+    _resolve_implicit_returns(parsed.steps)
     parsed.artifacts = aggregate_landscape(parsed.steps, "artifacts")
     parsed.it_systems = aggregate_landscape(parsed.steps, "systems")
     return parsed
@@ -895,14 +1525,20 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
     for step in steps:
         if step.decision is not None:
             blocks.append(Block("decision", [step]))
-        elif step.parallel and blocks and blocks[-1].kind in ("step", "parallel"):
-            prev = blocks[-1]
-            if prev.kind == "step":
-                blocks[-1] = Block("parallel", prev.steps + [step])
+        elif step.parallel:
+            if step.fork_parallel or not blocks or blocks[-1].kind not in ("step", "parallel"):
+                blocks.append(Block("parallel", [step]))
+            elif blocks[-1].kind == "parallel":
+                blocks[-1].steps.append(step)
             else:
-                prev.steps.append(step)
+                prev = blocks[-1]
+                blocks[-1] = Block("parallel", prev.steps + [step])
         else:
             blocks.append(Block("step", [step]))
+
+    for block in blocks:
+        if block.kind == "parallel" and len(block.steps) < 2:
+            block.kind = "step"
 
     merged: List[Block] = []
     i = 0
@@ -944,10 +1580,58 @@ def _q(text: str) -> str:
     return repr(text)
 
 
+def _decision_branch_keys(b_idx: int, block: Block, n_blocks: int, num_to_block: Dict[int, int]) -> Tuple[Any, Any]:
+    d = block.steps[0].decision
+    nxt: Any = b_idx + 1 if b_idx + 1 < n_blocks else "END"
+    if d is None:
+        return nxt, nxt
+
+    def resolve(end: bool, ref: Optional[int], back: bool, has_else: bool) -> Any:
+        if end:
+            return "END"
+        if ref is not None:
+            target = num_to_block.get(ref)
+            if target is None or target == b_idx:
+                return nxt
+            return target
+        if back:
+            return b_idx - 1 if b_idx > 0 else "END"
+        if has_else:
+            return "END"
+        return nxt
+
+    yes = resolve(d.yes_end, d.yes_ref, False, False)
+    no = resolve(d.no_end, d.no_ref, d.no_back, d.has_else)
+    return yes, no
+
+
+def _flatten_unary_blocks(blocks: List[Block], num_to_block: Dict[int, int]) -> Tuple[List[Block], Dict[int, int]]:
+    """Убирает шлюзы без реального ветвления (1 исходящая ветка) и параллельные группы из 1 шага."""
+    n_blocks = len(blocks)
+    out: List[Block] = []
+    for b_idx, block in enumerate(blocks):
+        if block.kind == "parallel" and len(block.steps) < 2:
+            out.append(Block("step", block.steps, name=block.name))
+            continue
+        if block.kind == "decision":
+            yes, no = _decision_branch_keys(b_idx, block, n_blocks, num_to_block)
+            if yes == no:
+                if block.steps[0].action:
+                    out.append(Block("step", block.steps, name=block.name))
+                continue
+        out.append(block)
+    mapping: Dict[int, int] = {}
+    for i, block in enumerate(out):
+        for s in block.steps:
+            mapping[s.num] = i
+    return out, mapping
+
+
 def emulate_generation(regulation_text: str) -> Tuple[str, Dict[str, Any]]:
     """Строит код для DIAGRAM по тексту регламента без внешних моделей."""
     parsed = parse_regulation(regulation_text)
     blocks, num_to_block = _build_blocks(parsed)
+    blocks, num_to_block = _flatten_unary_blocks(blocks, num_to_block)
     lane_var = {role: f"lane_{i}" for i, role in enumerate(parsed.roles)}
 
     code: List[str] = [
@@ -988,6 +1672,12 @@ def emulate_generation(regulation_text: str) -> Tuple[str, Dict[str, Any]]:
             gateways[b_idx] = gw
             exits.append(gw)
         elif block.kind == "parallel":
+            if len(block.steps) < 2:
+                var = f"n{b_idx}"
+                emit_task(var, block.steps[0], lane)
+                entry.append(var)
+                exits.append(var)
+                continue
             split, join = f"ps{b_idx}", f"pj{b_idx}"
             code.append(f"{split} = DIAGRAM.add_parallel_gateway('Параллельные работы', {lane})")
             code.append(f"{join} = DIAGRAM.add_parallel_gateway('Работы завершены', {lane})")
@@ -1012,7 +1702,10 @@ def emulate_generation(regulation_text: str) -> Tuple[str, Dict[str, Any]]:
             exits.append(sub)
 
     end_expr = "ROOT_END_TASK_ID"
-    code.append(f"DIAGRAM.add_link(ROOT_START_TASK_ID, {entry[0]})")
+    if not entry:
+        code.append("DIAGRAM.add_link(ROOT_START_TASK_ID, ROOT_END_TASK_ID)")
+    else:
+        code.append(f"DIAGRAM.add_link(ROOT_START_TASK_ID, {entry[0]})")
 
     def resolve(ref: Optional[int], own: int) -> Optional[str]:
         if ref is None or ref not in num_to_block:
@@ -2024,6 +2717,7 @@ def _step_title(body: str) -> str:
 
 def _split_steps(text: str) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Текст регламента → (строки заголовка, [{num, body}]). Проза без нумерации режется на предложения."""
+    text = _segment_unnumbered_prose(text or "")
     header: List[str] = []
     steps: List[Dict[str, Any]] = []
     for line in text.replace("\r\n", "\n").split("\n"):
@@ -2348,18 +3042,38 @@ def _llm_edit(message: str, text: str, trace: List[str]) -> Optional[Tuple[str, 
     return label, new_text + ("\n" if not new_text.endswith("\n") else "")
 
 
-def _rebuild_process(text: str, engine: str, trace: List[str]) -> Tuple[str, Dict[str, Any], str]:
-    """Перестроение диаграммы по обновлённому регламенту: эмулятор → код DIAGRAM → execute_generated_code."""
+def _rebuild_process(
+    text: str, engine: str, trace: List[str], use_llm: bool = False
+) -> Tuple[str, Dict[str, Any], str]:
+    """Перестроение диаграммы по обновлённому регламенту.
+
+    Если правка идёт из LLM-сессии — generate_bpmn_from_text(..., use_llm=True).
+    Эмулятор только при явном сбое или таймауте.
+    """
     started = time.time()
     norm = normalize_regulation(text)
-    header = parse_regulation(norm)
+    if use_llm:
+        xml, audit, err = generate_bpmn_from_text(norm, use_llm=True)
+        if xml and not err:
+            gen = audit.setdefault("generation", {})
+            gen["rebuild"] = engine
+            if trace:
+                gen["trace"] = list(trace) + list(gen.get("trace") or [])
+            return xml, audit, ""
+        (trace or []).append(
+            f"LLM-перестроение недоступно ({err or 'пустой XML'}) — fallback на эмулятор"
+        )
+    try:
+        header = parse_regulation(norm)
+    except Exception:  # noqa: BLE001
+        header = ParsedRegulation(title="Бизнес-процесс по регламенту", sla_hours=None)
     code, info = emulate_generation(norm)
     xml, audit, err = execute_generated_code(code, header.title, header.sla_hours, regulation_text=norm)
     if err:
         return "", {}, err
     audit["artifacts"], audit["it_systems"] = header.artifacts, header.it_systems
     audit["generation"] = {
-        "engine": engine, "fallback": False, "attempts": 1, "trace": trace, "rejected": [],
+        "engine": engine, "fallback": bool(use_llm), "attempts": 1, "trace": trace, "rejected": [],
         "code": code, "elapsed_s": round(time.time() - started, 2), "parsed": info,
     }
     return xml, audit, ""
@@ -2597,7 +3311,7 @@ def assistant_chat(
                     changes = ["правка сформулирована моделью по вашей команде"]
             if not new_text:
                 return (hint or _EDIT_HELP) + _source_note(None, trace), None, None, None
-            xml, new_audit, err = _rebuild_process(new_text, f"assistant · {label}", trace)
+            xml, new_audit, err = _rebuild_process(new_text, f"assistant · {label}", trace, use_llm=use_llm)
             if err:
                 return f"Правка сформирована, но диаграмму построить не удалось: {err}. Процесс оставлен без изменений.", None, None, None
             delta = _audit_delta(audit, new_audit)
@@ -3705,7 +4419,7 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
             actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
     xml, new_audit, err = "", {}, ""
     try:
-        xml, new_audit, err = _rebuild_process(optimized, f"to-be · {engine}", [])
+        xml, new_audit, err = _rebuild_process(optimized, f"to-be · {engine}", [], use_llm=(engine == "llm"))
     except Exception as exc:  # noqa: BLE001
         err = f"{type(exc).__name__}: {exc}"
     delta = _tobe_delta(audit_data or {}, new_audit or {}, actions, engine)
@@ -3721,6 +4435,20 @@ def _docx_shade(cell: Any, fill: str) -> None:
 
     tc_pr = cell._tc.get_or_add_tcPr()
     tc_pr.append(parse_xml(f'<w:shd {nsdecls("w")} w:fill="{fill}" w:val="clear"/>'))
+
+
+def _docx_set_col_widths(table: Any, widths_cm: Sequence[float]) -> None:
+    """Жёсткая сетка колонок: autofit выключен, ширина ячеек в сантиметрах."""
+    from docx.shared import Cm
+
+    table.autofit = False
+    if hasattr(table, "allow_autofit"):
+        table.allow_autofit = False
+    widths = [Cm(float(w)) for w in widths_cm]
+    for row in table.rows:
+        for i, w in enumerate(widths):
+            if i < len(row.cells):
+                row.cells[i].width = w
 
 
 def _docx_set_cell(cell: Any, text: str, *, header: bool = False, center: bool = False) -> None:
@@ -3850,6 +4578,17 @@ def export_docx_passport(xml_str: str, audit_data: dict, regulation_text: str) -
         for j, role in enumerate(roles):
             letters = "".join(assigns.get(role) or [])
             _docx_set_cell(cells[j + 2], letters or "—", center=True)
+    usable = 17.4
+    n_roles = len(roles)
+    remain = usable - 1.0 - 6.5
+    if n_roles:
+        role_w = remain / n_roles
+        if n_roles * 1.6 <= remain + 1e-9:
+            role_w = min(1.8, max(1.6, role_w))
+        raci_widths = [1.0, 6.5] + [role_w] * n_roles
+    else:
+        raci_widths = [1.0, 16.4]
+    _docx_set_col_widths(rtable, raci_widths)
 
     heading("3. Пошаговый операционный регламент")
     ot = doc.add_table(rows=1, cols=6)
@@ -3876,6 +4615,7 @@ def export_docx_passport(xml_str: str, audit_data: dict, regulation_text: str) -
         _docx_set_cell(row[3], "—")
         _docx_set_cell(row[4], "—")
         _docx_set_cell(row[5], "—")
+    _docx_set_col_widths(ot, [1.0, 3.5, 6.0, 2.0, 2.5, 2.5])
 
     heading("4. Карта рисков и план мероприятий по оптимизации")
     risk_p = doc.add_paragraph()
