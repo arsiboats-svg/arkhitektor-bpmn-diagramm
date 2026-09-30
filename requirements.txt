@@ -3,3 +3,5 @@
 streamlit>=1.36
 requests>=2.31
 lxml>=5.0        # проверка по официальной XSD BPMN 2.0 (validate_bpmn.py)
+pypdf>=4.0.0     # загрузка регламентов из PDF
+python-docx>=1.0.0  # загрузка регламентов из Word (.docx)
