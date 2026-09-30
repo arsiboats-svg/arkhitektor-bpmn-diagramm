@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from ai_generator import (
@@ -27,8 +28,17 @@ def main() -> None:
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
 
     opt, delta = optimize_process_to_be(text, audit)
-    assert "Параллельно" in opt or any(a.get("kind") == "parallel" for a in delta.get("actions") or [])
-    assert any(a.get("kind") in ("zero_rework", "automation", "parallel") for a in delta.get("actions") or [])
+    ot_stop = re.compile(
+        r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+        re.I,
+    )
+    for line in opt.splitlines():
+        if re.search(r"параллельно|одновременно", line, re.I) and ot_stop.search(line):
+            raise AssertionError(f"запрещено распараллеливать охрану труда: {line}")
+        if re.search(r"аварийн\w+\s+ремонт|выполн\w+.{0,40}ремонт", line, re.I):
+            assert not re.search(r"^\s*\d+\.\s*(?:параллельно|одновременно)", line, re.I), line
+    assert any(a.get("kind") == "safety_seq" for a in delta.get("actions") or []), delta.get("actions")
+    assert any(a.get("kind") in ("zero_rework", "automation", "parallel", "safety_seq") for a in delta.get("actions") or [])
     assert "sla_saved_hours" in delta
     assert delta.get("tobe_xml") or not delta.get("tobe_error")
     assert int(delta.get("rework_after") or 0) <= int(delta.get("rework_before") or 0)

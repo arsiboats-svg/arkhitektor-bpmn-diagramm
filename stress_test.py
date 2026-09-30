@@ -63,7 +63,9 @@ def main(argv: List[str]) -> int:
         xml, audit, err = generate_bpmn_from_text(path.read_text(encoding="utf-8"), use_llm=use_llm)
         elapsed = time.time() - started
         if err:
-            failed += "не распознан" not in err  # мусорный ввод обязан давать понятную ошибку, это не сбой
+            failed += (
+                "не удалось распознать" not in err.lower() and "не распознан" not in err.lower()
+            )  # мусорный ввод обязан давать понятную ошибку, это не сбой
             rows.append(f"| {path.name} | — | {elapsed:.0f} с | — | — | — | — | — | {err[:80]} |")
             print(f"[ERR] {path.name}: {err}")
             continue

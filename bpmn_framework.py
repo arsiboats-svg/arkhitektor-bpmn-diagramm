@@ -1411,7 +1411,7 @@ class BPMNDiagramBuilder:
         checks = [
             check(
                 "naming",
-                "Naming compliance",
+                "Стандарт названий задач (Глагол + Объект)",
                 naming_pass,
                 30,
                 naming_pts,
@@ -1421,7 +1421,7 @@ class BPMNDiagramBuilder:
             ),
             check(
                 "gateway",
-                "Gateway semantics",
+                "Корректность развилок и условий",
                 gateway_pass,
                 25,
                 gateway_pts,
@@ -1432,7 +1432,7 @@ class BPMNDiagramBuilder:
             ),
             check(
                 "subway",
-                "Anti-Subway Index",
+                "Индекс декомпозиции (Анти-метро)",
                 subway_pass,
                 20,
                 subway_pts,
@@ -1443,7 +1443,7 @@ class BPMNDiagramBuilder:
             ),
             check(
                 "topology",
-                "Topology check",
+                "Топологическая связность графа",
                 topology_pass,
                 25,
                 topo_pts,

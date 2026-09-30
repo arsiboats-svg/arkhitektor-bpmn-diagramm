@@ -323,7 +323,7 @@ def execute_generated_code(
 
         work_nodes = [n for n in diagram.nodes.values() if n.kind not in ("startEvent", "endEvent")]
         if len(work_nodes) < 2:
-            return "", {}, "Диаграмма содержит меньше двух рабочих узлов — регламент не распознан."
+            return "", {}, _UNRECOGNIZED_PROCESS
 
         sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
         structure_issues = _structure_issues(diagram)
@@ -1126,6 +1126,12 @@ def _fix_sla_units(code: str, text_hours: List[float]) -> Tuple[str, str]:
     return fixed, f"сроки шагов переведены из дней в часы (×{factor:.0f}): модель указала дни вместо часов"
 
 
+_UNRECOGNIZED_PROCESS = (
+    "Не удалось распознать шаги процесса. Пожалуйста, опишите регламент по пунктам "
+    "(например: 1. Диспетчер принимает заявку...)."
+)
+
+
 def cloud_engine_status() -> str:
     """Строка для интерфейса: подключённые облачные модели по порядку (без раскрытия ключей)."""
     parts = []
@@ -1160,7 +1166,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
     started = time.time()
     text = normalize_regulation(regulation_text or "").strip()
     if len(text) < 20:
-        return "", {}, "Регламент пуст или слишком короткий: введите не менее одного-двух шагов процесса."
+        return "", {}, _UNRECOGNIZED_PROCESS
 
     artifacts: List[Dict[str, Any]] = []
     it_systems: List[Dict[str, Any]] = []
@@ -1208,10 +1214,14 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     }
                     return xml, audit, ""
                 problems = [err] if err else quality["critical"]
-                if err and "не распознан" in err:
+                if err and (
+                    err == _UNRECOGNIZED_PROCESS
+                    or "не удалось распознать" in err.lower()
+                    or "не распознан" in err.lower()
+                ):
                     # Модель сама не нашла процесс в тексте: «исправлять» — значит заставить её выдумывать.
                     trace.append(f"{engine_label}: регламент не распознан — повтор не делаем")
-                    return "", {}, "Регламент не распознан: в тексте не найдено шагов процесса и исполнителей."
+                    return "", {}, _UNRECOGNIZED_PROCESS
                 rejected.append({"engine": engine_label, "attempt": attempt, "problems": problems, "code": _strip_markdown(raw)})
                 trace.append(
                     f"{engine_label}, попытка {attempt} ({call_s:.0f} с): результат отклонён — "
@@ -1225,9 +1235,16 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
     try:
         code, info = emulate_generation(text)
     except Exception as exc:  # noqa: BLE001
-        return "", {}, f"Не удалось разобрать регламент: {type(exc).__name__}: {exc}"
+        return "", {}, _UNRECOGNIZED_PROCESS
     xml, audit, err = execute_generated_code(code, process_name, sla, regulation_text=text)
     if err:
+        if (
+            err == _UNRECOGNIZED_PROCESS
+            or "не удалось распознать" in err.lower()
+            or "не распознан" in err.lower()
+            or "меньше двух" in err
+        ):
+            return "", {}, _UNRECOGNIZED_PROCESS
         return "", {}, f"Не удалось построить диаграмму: {err}"
     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
     audit["generation"] = {
@@ -2934,7 +2951,35 @@ INSPECT_SYSTEM = """Ты — старший мастер оперативног�
   "input_trigger": "основание начать работы и входные документы",
   "output_artifact": "результат: акт, журнал, статус"
 }
-Только факты из контекста процесса; 3–4 конкретных технических действия; по-русски; ничего не выдумывай сверх роли и названия шага."""
+Только факты из контекста процесса; 3–4 конкретных технических действия; по-русски; ничего не выдумывай сверх роли и названия шага.
+СИЗ выдавай только для полевых ролей (бригада, монтёр, обходчик, электромонтёр).
+Для офисных/пультовых (диспетчер, юрист, начальник смены, бухгалтер, закупки, СБ) пиши: «СИЗ: Не требуются (офисный/пультовой режим)»."""
+
+
+_FIELD_ROLE_RE = re.compile(
+    r"бригад|монт[её]р|обходчик|электромонт|линейщ|производитель работ|ремонтн\w+\s+персонал",
+    re.I,
+)
+_OFFICE_ROLE_RE = re.compile(
+    r"диспетчер|юрист|юридическ|начальник смены|бухгалтер|закуп|тендер|"
+    r"служб\w+\s+безопасност|\bсб\b|техническ\w+\s+департамент|"
+    r"центр обслуживания|заявител|секретар|экономист",
+    re.I,
+)
+_PPE_OFFICE = "СИЗ: Не требуются (офисный/пультовой режим)"
+_PPE_FIELD = (
+    "СИЗ: каска, термостойкий комбинезон, диэлектрические перчатки и боты (по наряду). "
+    "При работах в электроустановке — переносные заземления и запирание коммутационных аппаратов."
+)
+
+
+def _ppe_for_role(role: str, sys_txt: str = "") -> str:
+    """СИЗ только для полевых ролей; офис/пульт — явный отказ от касок."""
+    low = (role or "").lower()
+    extra = f" Системы: {sys_txt}." if sys_txt else ""
+    if _OFFICE_ROLE_RE.search(low) or not _FIELD_ROLE_RE.search(low):
+        return _PPE_OFFICE + extra
+    return _PPE_FIELD + extra
 
 
 def _role_requirements(role: str) -> str:
@@ -3001,11 +3046,7 @@ def _heuristic_inspect(task_name: str, task_role: str, ctx: Dict[str, Any]) -> D
     if "script" in low or "автомат" in low:
         safety = f"Автоматизированная операция. Системы: {sys_txt}. Контроль журнала событий, без работ в электроустановке."
     else:
-        safety = (
-            f"СИЗ: каска, термостойкий комбинезон, диэлектрические перчатки и боты (по наряду). "
-            f"При работах в электроустановке — переносные заземления и запирание коммутационных аппаратов. "
-            f"Системы: {sys_txt}."
-        )
+        safety = _ppe_for_role(role, sys_txt)
     trigger = (
         f"Основание: поступление шага «{name}» роли «{role}» по схеме процесса"
         + (f"; входные документы: {doc_txt}." if artifacts or doc_txt else ".")
@@ -3069,7 +3110,7 @@ def inspect_task_details(task_name: str, task_role: str, process_context: dict) 
     return {
         "role_requirements": str(data.get("role_requirements") or fallback["role_requirements"]),
         "procedure_steps": [str(s).strip() for s in steps[:6] if str(s).strip()],
-        "safety_and_tools": str(data.get("safety_and_tools") or fallback["safety_and_tools"]),
+        "safety_and_tools": _ppe_for_role(task_role or "", ""),
         "input_trigger": str(data.get("input_trigger") or fallback["input_trigger"]),
         "output_artifact": str(data.get("output_artifact") or fallback["output_artifact"]),
         "source": got[0],
@@ -3212,10 +3253,22 @@ _JOURNAL_RE = re.compile(
     re.I,
 )
 _CONTROL_HINT_RE = re.compile(r"входн\w+\s+контрол|комплектност\w+\s+документ", re.I)
+_OT_STOP_RE = re.compile(
+    r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+    re.I,
+)
+_REPAIR_WORK_RE = re.compile(
+    r"аварийн\w+\s+ремонт|выполн\w+\s+.{0,40}ремонт|ремонт\s+оборудован|"
+    r"строительно-монтаж|производств\w+\s+работ|выполн\w+\s+работ",
+    re.I,
+)
 _RACI_STOP = {"выполн", "провод", "оформ", "провер", "принят", "переда", "состав", "оценк"}
 TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
 Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
 1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
+   СТОП-ЛИСТ охраны труда — НЕ ставь «Параллельно:», если шаг содержит:
+   допуск, наряд-допуск, инструктаж, проверк, заземлен, отключен, разрешен, согласован, утвержден.
+   Фактический ремонт / выполнение работ — СТРОГО ПОСЛЕ допуска и инструктажа, никогда параллельно с ними.
 2) Zero-Rework: перед шлюзами согласования добавь шаг «Роль проводит предварительный входной контроль … перед шагом N»;
    формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
    Не начинай шаг с существительного («Входной контроль…») — только роль + глагол.
@@ -3326,6 +3379,31 @@ def _independent_steps(a: Step, b: Step) -> bool:
     return not ((stems_a & stems_b) - _RACI_STOP)
 
 
+def _ot_blob(step: Step, body: str = "") -> str:
+    return f"{step.title or ''} {body or ''}"
+
+
+def _ot_sensitive(step: Step, body: str = "") -> bool:
+    """Стоп-лист охраны труда: допуск, инструктаж, заземление, отключения не распараллеливаются."""
+    return bool(_OT_STOP_RE.search(_ot_blob(step, body)))
+
+
+def _is_repair_work(step: Step, body: str = "") -> bool:
+    return bool(_REPAIR_WORK_RE.search(_ot_blob(step, body)))
+
+
+def _forbid_parallel(a: Step, b: Step, body_a: str = "", body_b: str = "") -> bool:
+    """AND запрещён, если шаг из стоп-листа ОТ либо ремонт идёт параллельно допуску/инструктажу."""
+    if _ot_sensitive(a, body_a) or _ot_sensitive(b, body_b):
+        return True
+    a_repair, b_repair = _is_repair_work(a, body_a), _is_repair_work(b, body_b)
+    a_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(a, body_a), re.I))
+    b_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(b, body_b), re.I))
+    if (a_repair and b_permit) or (b_repair and a_permit):
+        return True
+    return False
+
+
 def _automate_journal_body(body: str) -> str:
     """scriptTask: система сама выполняет действие. Заголовок должен начинаться с глагола, не с роли."""
     text = body.strip()
@@ -3394,7 +3472,11 @@ def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str,
     while i < n - 1:
         a, b = parsed.steps[i], parsed.steps[i + 1]
         already = bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", bodies[i + 1], re.I))
-        if _independent_steps(a, b) and not already:
+        if (
+            not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
+            and _independent_steps(a, b)
+            and not already
+        ):
             bodies[i + 1] = "Параллельно: " + bodies[i + 1]
             b.parallel = True
             actions.append(
@@ -3406,6 +3488,24 @@ def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str,
             i += 2
             continue
         i += 1
+
+    for i in range(n):
+        st = parsed.steps[i]
+        if not (_ot_sensitive(st, bodies[i]) or _is_repair_work(st, bodies[i])):
+            continue
+        stripped = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", bodies[i], flags=re.I)
+        if stripped != bodies[i]:
+            bodies[i] = stripped
+            st.parallel = False
+            actions.append(
+                {
+                    "kind": "safety_seq",
+                    "detail": (
+                        f"Шаг {nums[i]} «{st.title or 'работы'}» оставлен строго последовательным: "
+                        "допуск / инструктаж / заземление нельзя выполнять параллельно с ремонтом."
+                    ),
+                }
+            )
 
     control_at: Dict[int, str] = {}
     for i in range(n):

@@ -59,7 +59,7 @@ EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
 DIAGRAM_HEIGHT = 720  # высота холста по умолчанию, px (не менее 700)
-DIAGRAM_HEIGHT_WIDE = 820  # в широком режиме
+DIAGRAM_HEIGHT_WIDE = 900  # широкий вид — схема сразу крупная
 VIEW_SPLIT = "🗂  Раздельный вид"
 VIEW_WIDE = "🖥  Широкий вид"
 ASIS_LABEL = "Текущий процесс (As-Is)"
@@ -425,7 +425,20 @@ def viewer_html(
   hint.textContent = HINT_NORMAL;
 
   function fit() {{ try {{ canvas().zoom('fit-viewport', 'auto'); }} catch (e) {{}} }}
-  function fitSoon() {{ fit(); requestAnimationFrame(fit); setTimeout(fit, 120); setTimeout(fit, 350); }}
+  function focusStart() {{
+    try {{
+      const registry = viewer.get('elementRegistry');
+      const starts = registry.filter(el => el.type === 'bpmn:StartEvent');
+      const start = starts.find(el => !(el.parent && /SubProcess/i.test((el.parent.type || '')))) || starts[0];
+      if (start && canvas().scrollToElement) canvas().scrollToElement(start);
+    }} catch (e) {{}}
+  }}
+  function fitSoon() {{
+    fit();
+    requestAnimationFrame(fit);
+    setTimeout(fit, 120);
+    setTimeout(focusStart, 380);
+  }}
   {EMPHASIZE_JS}
 
   let selectedId = null;
@@ -469,7 +482,7 @@ def viewer_html(
   }}
   viewer.importXML(XML).then(() => {{
     emphasizeSubprocessTitles();
-    fit();
+    fitSoon();
     viewer.get('eventBus').on('element.click', function(e) {{
       const el = resolveEl(e.element);
       const t = (el && el.type) || '';
@@ -745,10 +758,34 @@ def lane_load_html(
     return "".join(rows) or '<div class="land-empty">Нет данных о нагрузке ролей.</div>'
 
 
+_PATH_KEEP_KINDS = {
+    "userTask", "scriptTask", "task", "manualTask", "serviceTask",
+    "sendTask", "receiveTask", "businessRuleTask", "subProcess",
+}
+
+
+def _path_tasks_only(critical_path: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Шлюзы и события с нулевой длительностью не показываем в цепочке КП."""
+    out: List[Dict[str, Any]] = []
+    for item in critical_path or []:
+        kind = str(item.get("kind") or "")
+        if "Gateway" in kind or kind.endswith("Event") or kind in {
+            "exclusiveGateway", "parallelGateway", "inclusiveGateway",
+            "startEvent", "endEvent", "intermediateCatchEvent", "intermediateThrowEvent",
+        }:
+            continue
+        hours = float(item.get("hours") or 0)
+        if kind not in _PATH_KEEP_KINDS and hours < 0.05:
+            continue
+        out.append(item)
+    return out
+
+
 def critical_path_html(critical_path: Optional[List[Dict[str, Any]]]) -> str:
-    """Цепочка чипов критического пути: часы шага и стрелки Беллмана — Форда."""
+    """Цепочка чипов критического пути: только задачи и подпроцессы, без шлюзов/событий с нулевым временем."""
     chips: List[str] = []
-    for i, item in enumerate(critical_path or []):
+    visible = _path_tasks_only(critical_path)
+    for i, item in enumerate(visible):
         arrow = '<span class="arrow">→</span>' if i else ""
         name = str(item.get("name") or "")
         name = name if len(name) <= 42 else name[:41] + "…"
@@ -821,6 +858,24 @@ def render_landscape(audit: Dict[str, Any]) -> None:
     )
 
 
+_METH_TITLE_RU = {
+    "naming": "Стандарт названий задач (Глагол + Объект)",
+    "gateway": "Корректность развилок и условий",
+    "subway": "Индекс декомпозиции (Анти-метро)",
+    "topology": "Топологическая связность графа",
+    "Naming compliance": "Стандарт названий задач (Глагол + Объект)",
+    "Gateway semantics": "Корректность развилок и условий",
+    "Anti-Subway Index": "Индекс декомпозиции (Анти-метро)",
+    "Topology check": "Топологическая связность графа",
+}
+
+
+def _meth_title(chk: Dict[str, Any]) -> str:
+    key = str(chk.get("key") or "")
+    title = str(chk.get("title") or "")
+    return _METH_TITLE_RU.get(key) or _METH_TITLE_RU.get(title) or title
+
+
 def render_methodology(audit: Dict[str, Any]) -> None:
     """Блок «Методологический контроль BPMN 2.0» — бейджи проверок и балл качества."""
     meth = audit.get("methodology") if isinstance(audit.get("methodology"), dict) else {}
@@ -841,14 +896,15 @@ def render_methodology(audit: Dict[str, Any]) -> None:
         mark = "✓" if passed else "✗"
         findings = chk.get("findings") or []
         extra = f"<br>{esc(findings[0])}" if findings and not passed else ""
+        title = _meth_title(chk)
         badges.append(
-            f'<div class="meth-badge" style="--c:{c}"><div class="h">{mark} {esc(chk.get("title"))}</div>'
+            f'<div class="meth-badge" style="--c:{c}"><div class="h">{mark} {esc(title)}</div>'
             f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
         )
     st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
     with st.expander("Детали проверок нотации"):
         for chk in meth.get("checks") or []:
-            st.markdown(f"**{chk.get('title')}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
+            st.markdown(f"**{_meth_title(chk)}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
             for fnd in chk.get("findings") or []:
                 st.markdown(f"- {fnd}")
 
@@ -921,15 +977,15 @@ def render_audit(audit: Dict[str, Any]) -> None:
     sla_sub = f"{stats['critical_path_layers']} слоёв согласования"
     if target:
         sla_sub += f" · цель {fmt_hours(float(target)) if float(target) < 48 else fmt_days(float(target))}"
-    sla_sub += f"<br>с худшим возвратом: {fmt_hours(total_h) if total_h < 48 else fmt_days(total_h)}"
+    rework_value = fmt_hours(total_h) if total_h < 48 else fmt_days(total_h)
+    rework_sub = (
+        "возвратов в модели нет — срок совпадает с базовым КП"
+        if not loops
+        else f"циклов: {len(loops)} · худший: +{fmt_hours(float(sla['rework_hours']))} к КП"
+    )
 
     loop_color = OK if not loops else (BAD if len(loops) >= 3 else WARN)
     loop_pill = "Возвратов нет" if not loops else f"Доля в сроке: {float(sla['rework_share']):.0%}"
-    loop_sub = (
-        "Циклов доработки в модели"
-        if not loops
-        else f"худший: +{fmt_hours(float(sla['rework_hours']))} к критическому пути"
-    )
 
     c1, c2, c3, c4 = st.columns(4, gap="medium")
     c1.markdown(
@@ -942,8 +998,14 @@ def render_audit(audit: Dict[str, Any]) -> None:
         ),
         unsafe_allow_html=True,
     )
-    c2.markdown(card("Критический путь SLA", sla_value, sla_sub, sla_color, sla_pill), unsafe_allow_html=True)
-    c3.markdown(card("Циклы возврата", str(len(loops)), loop_sub, loop_color, loop_pill), unsafe_allow_html=True)
+    c2.markdown(
+        card("Критический путь (базовый, без возвратов)", sla_value, sla_sub, sla_color, sla_pill),
+        unsafe_allow_html=True,
+    )
+    c3.markdown(
+        card("Срок с худшим возвратом (rework)", rework_value, rework_sub, loop_color, loop_pill),
+        unsafe_allow_html=True,
+    )
     c4.markdown(
         card(
             "Структура процесса",
@@ -1156,7 +1218,7 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state.pop("tobe_pack", None)
 
 
-def render_downloads(key: str) -> None:
+def render_downloads(key: str, stacked: bool = False) -> None:
     """Скачивание: BPMN 2.0, SVG, Паспорт (.md) и официальный регламент (.docx)."""
     result = st.session_state.get("result")
     ok = bool(result and not result["error"])
@@ -1180,8 +1242,17 @@ def render_downloads(key: str) -> None:
             )
         except Exception:  # noqa: BLE001
             docx_bytes = b""
-    col_bpmn, col_svg, col_pass, col_docx = st.columns(4, gap="small")
-    with col_bpmn:
+
+    def _slot():
+        return st.container()
+
+    if stacked:
+        slots = [_slot(), _slot(), _slot(), _slot()]
+    else:
+        row1 = st.columns(2, gap="small")
+        row2 = st.columns(2, gap="small")
+        slots = [row1[0], row1[1], row2[0], row2[1]]
+    with slots[0]:
         st.download_button(
             "⬇️  Скачать .bpmn",
             data=(result["xml"] if ok else ""),
@@ -1189,8 +1260,9 @@ def render_downloads(key: str) -> None:
             mime="application/xml",
             disabled=not ok,
             key=f"dl_bpmn_{key}",
+            use_container_width=True,
         )
-    with col_svg:
+    with slots[1]:
         if ok:
             page = svg_export_html(result["xml"], f"{stem}.svg")
             if hasattr(st, "iframe"):
@@ -1198,8 +1270,8 @@ def render_downloads(key: str) -> None:
             else:
                 components.html(page, height=48, scrolling=False)
         else:
-            st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}")
-    with col_pass:
+            st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
+    with slots[2]:
         st.download_button(
             "⬇️  Скачать Паспорт (.md)",
             data=passport or "",
@@ -1207,8 +1279,9 @@ def render_downloads(key: str) -> None:
             mime="text/markdown",
             disabled=not (ok and bool(passport)),
             key=f"dl_passport_{key}",
+            use_container_width=True,
         )
-    with col_docx:
+    with slots[3]:
         st.download_button(
             "⬇️  Скачать регламент (.docx)",
             data=docx_bytes or b"",
@@ -1216,6 +1289,7 @@ def render_downloads(key: str) -> None:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             disabled=not (ok and bool(docx_bytes)),
             key=f"dl_docx_{key}",
+            use_container_width=True,
         )
 
 
@@ -1280,12 +1354,20 @@ def render_tobe_tab() -> None:
     saved_pct = round(100.0 * saved_h / before_h, 1) if before_h and saved_h > 0 else 0.0
     removed = int(delta.get("rework_removed") or 0)
     q_gain = int(delta.get("quality_gain") or 0)
+    asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
+    tobe_audit = pack.get("audit") or {}
+    asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
+    tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
+    asis_rw = float((asis_audit.get("sla") or {}).get("with_rework_hours") or before_h)
+    tobe_rw = float((tobe_audit.get("sla") or {}).get("with_rework_hours") or after_h)
     if saved_h >= 1.0 / 60.0:
         eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
-        eco_sub = f"{fmt_hours(before_h)} → {fmt_hours(after_h)}"
     else:
         eco_value = "Без ускорения"
-        eco_sub = f"{fmt_hours(before_h)} → {fmt_hours(after_h)}" if before_h or after_h else "—"
+    eco_sub = (
+        f"КП без возвратов: {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
+        f"rework: {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
+    )
     st.markdown(
         f'<div class="tobe-grid">'
         f'<div class="tobe-card"><div class="k">Экономия SLA</div>'
@@ -1299,6 +1381,10 @@ def render_tobe_tab() -> None:
         f'<div class="s">{int(delta.get("quality_before") or 0)}% → {int(delta.get("quality_after") or 0)}%</div></div>'
         f"</div>",
         unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
+        f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
     )
     engine = delta.get("engine") or "semantic-optimizer"
     st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
@@ -1328,15 +1414,19 @@ def render_tobe_tab() -> None:
             load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
         elif tobe_bus.get("status") == "ok":
             load_bits.append("нагрузка сбалансирована")
-        asis_path = asis_audit.get("critical_path") or []
-        tobe_path = tobe_audit.get("critical_path") or []
+        asis_path = _path_tasks_only(asis_audit.get("critical_path") or [])
+        tobe_path = _path_tasks_only(tobe_audit.get("critical_path") or [])
         asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
         tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
+        asis_rw = float((asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
+        tobe_rw = float((tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
         shortened = len(tobe_path) < len(asis_path) or tobe_cp + 1e-6 < asis_cp
         path_label = "Цепочка спрямилась" if shortened else "Критический путь"
         path_cap = (
             f"{path_label}: {len(asis_path)} шагов / {fmt_hours(asis_cp)}"
-            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}"
+            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}. "
+            f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)}. "
+            f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}."
         )
         render_load_and_path(
             tobe_audit,
@@ -1476,6 +1566,7 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
         secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
         st.caption(f"Облачная модель: {cloud_engine_status()}{secrets_note}")
         if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
+            st.session_state["quickstart"] = False
             if not st.session_state["reg_text"].strip():
                 st.warning("Введите текст регламента.")
             else:
@@ -1483,21 +1574,42 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
 
         result = st.session_state.get("result")
         if result and not result["error"]:
-            gen = result["audit"].get("generation", {})
-            engine = gen.get("engine", "—")
-            note = ""
-            if gen.get("fallback") and engine == "semantic-emulator":
-                reasons = gen.get("trace") or ["LLM недоступна"]
-                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
-            elif gen.get("attempts", 1) > 1:
-                note = f" · исправлено со {gen['attempts']}-й попытки"
-            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
-            st.markdown(
-                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
-                unsafe_allow_html=True,
-            )
+            if st.session_state.get("quickstart"):
+                st.markdown(
+                    '<div class="engine">Эталонный процесс подготовлен Groq GPT-OSS 120B · режим быстрого старта</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                gen = result["audit"].get("generation", {})
+                engine = gen.get("engine", "—")
+                note = ""
+                if gen.get("fallback") and engine == "semantic-emulator":
+                    reasons = gen.get("trace") or ["LLM недоступна"]
+                    note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
+                elif gen.get("attempts", 1) > 1:
+                    note = f" · исправлено со {gen['attempts']}-й попытки"
+                xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
+                st.markdown(
+                    f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
+                    unsafe_allow_html=True,
+                )
         if show_downloads:
-            render_downloads("left")
+            render_downloads("left", stacked=True)
+
+
+def _diagram_height(wide: bool) -> int:
+    """Автоподгонка высоты холста по числу дорожек и узлов, чтобы схема не сжималась в точку."""
+    result = st.session_state.get("result") or {}
+    audit = result.get("audit") or {}
+    if st.session_state.get("canvas_variant") == TOBE_LABEL:
+        pack = st.session_state.get("tobe_pack") or {}
+        audit = pack.get("audit") or audit
+    stats = audit.get("stats") or {}
+    lanes = int(stats.get("lanes") or 3)
+    nodes = int(stats.get("nodes") or 12)
+    base = DIAGRAM_HEIGHT_WIDE if wide else DIAGRAM_HEIGHT
+    extra = min(360, max(0, (lanes - 3) * 80 + max(0, nodes - 18) * 8))
+    return int(base + extra)
 
 
 def render_diagram(canvas_height: int) -> None:
@@ -1630,6 +1742,10 @@ def main() -> None:
         with st.spinner("Готовим эталонный пример…"):
             # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
             run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
+            st.session_state["quickstart"] = True
+
+    if "view_mode" not in st.session_state:
+        st.session_state["view_mode"] = VIEW_WIDE
 
     mode_col, _, dl_col = st.columns([5, 1, 5], gap="medium", vertical_alignment="center")
     with mode_col:
@@ -1641,6 +1757,7 @@ def main() -> None:
             label_visibility="collapsed",
         )
     wide = view == VIEW_WIDE
+    canvas_h = _diagram_height(wide)
     if st.session_state.pop("diagram_updated_by_assistant", False):
         st.markdown(
             '<div class="ir-toast">✨ Диаграмма обновлена ассистентом в диалоге</div>',
@@ -1651,13 +1768,13 @@ def main() -> None:
             render_downloads("wide")
         with st.expander("Регламент и настройки", expanded=False):
             render_input_panel(labels, compact=True, show_downloads=False)
-        render_diagram(DIAGRAM_HEIGHT_WIDE)
+        render_diagram(canvas_h)
     else:
         left, right = st.columns([5, 7], gap="large")
         with left:
             render_input_panel(labels)
         with right:
-            render_diagram(DIAGRAM_HEIGHT)
+            render_diagram(canvas_h)
 
     result = st.session_state.get("result")
     if result and not result["error"]:
