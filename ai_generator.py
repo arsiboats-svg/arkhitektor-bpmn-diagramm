@@ -1017,29 +1017,36 @@ def _error_reason(exc: Exception) -> str:
     return f"HTTP {status}: {message}" if message else f"HTTP {status}"
 
 
+# Облачные провайдеры по порядку: OPENAI_* (основной) → FALLBACK_* → FALLBACK2_* …
+# Бесплатные тарифы по отдельности ненадёжны: Groq отвечает 403 с части IP Streamlit Cloud,
+# бесплатный канал OpenRouter бывает перегружен (429) — поэтому цепочка из нескольких.
+CLOUD_PREFIXES = ("OPENAI", "FALLBACK", "FALLBACK2", "FALLBACK3")
+
+
+def _cloud_prefixes() -> List[str]:
+    return [p for p in CLOUD_PREFIXES if os.getenv(f"{p}_API_KEY")]
+
+
 def cloud_engine_status() -> str:
-    """Строка для интерфейса: подключена ли облачная модель (без раскрытия ключа)."""
+    """Строка для интерфейса: подключённые облачные модели по порядку (без раскрытия ключей)."""
     parts = []
-    for prefix in ("OPENAI", "FALLBACK"):
-        if os.getenv(f"{prefix}_API_KEY"):
-            host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE))
-            parts.append(f"{os.getenv(f'{prefix}_MODEL', 'gpt-4o-mini')} · {host}")
+    for prefix in _cloud_prefixes():
+        host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE))
+        parts.append(f"{os.getenv(f'{prefix}_MODEL', 'gpt-4o-mini')} · {host}")
     if not parts:
         return "не подключена (OPENAI_API_KEY не задан)"
-    return parts[0] + (f" · запасная: {parts[1]}" if len(parts) > 1 else "")
+    return parts[0] + "".join(f" · запасная: {p}" for p in parts[1:])
 
 
 def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
     mode = os.getenv("BPMN_AI_MODE", "auto").lower()
     if mode == "emulator":
         return []
-    engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [("ollama", _call_ollama)]
     # Облачные модели отвечают за секунды — они первые; Ollama — офлайн-резерв.
-    # FALLBACK_* — запасной провайдер: Groq бывает недоступен с отдельных IP (HTTP 403).
-    if os.getenv("FALLBACK_API_KEY"):
-        engines.insert(0, ("fallback", lambda prompt: _call_openai(prompt, "FALLBACK")))
-    if os.getenv("OPENAI_API_KEY"):
-        engines.insert(0, ("openai", _call_openai))
+    engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [
+        (prefix.lower(), (lambda prompt, _p=prefix: _call_openai(prompt, _p))) for prefix in _cloud_prefixes()
+    ]
+    engines.append(("ollama", _call_ollama))
     return engines
 
 
@@ -1178,8 +1185,11 @@ def _chat_openai(messages: List[Dict[str, str]], prefix: str) -> Tuple[str, str]
     base = os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
     model = os.getenv(f"{prefix}_MODEL", "gpt-4o-mini")
     payload: Dict[str, Any] = {"model": model, "temperature": 0.2, "messages": messages}
-    if os.getenv(f"{prefix}_REASONING_EFFORT"):
-        payload["reasoning_effort"] = os.getenv(f"{prefix}_REASONING_EFFORT")
+    effort = os.getenv(f"{prefix}_REASONING_EFFORT", "")
+    if effort == "none" and "openrouter.ai" in base:
+        payload["reasoning"] = {"enabled": False}
+    elif effort:
+        payload["reasoning_effort"] = effort
     data = _http_json(
         f"{base}/chat/completions",
         payload,
@@ -1218,10 +1228,8 @@ def _chat_llm(messages: List[Dict[str, str]], trace: List[str]) -> Optional[Tupl
     if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return None
     attempts: List[Tuple[str, Callable[[], Tuple[str, str]]]] = []
-    if os.getenv("OPENAI_API_KEY"):
-        attempts.append(("openai", lambda: _chat_openai(messages, "OPENAI")))
-    if os.getenv("FALLBACK_API_KEY"):
-        attempts.append(("fallback", lambda: _chat_openai(messages, "FALLBACK")))
+    for prefix in _cloud_prefixes():
+        attempts.append((prefix.lower(), lambda _p=prefix: _chat_openai(messages, _p)))
     attempts.append(("ollama", lambda: _chat_ollama(messages)))
     for name, call in attempts:
         try:
