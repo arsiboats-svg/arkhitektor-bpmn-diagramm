@@ -14,6 +14,8 @@
     execute_generated_code(code_str)         -> (bpmn_xml, audit_data, error)
     assistant_chat(...)                      -> диалог (аналитика / правка / реверс)
     generate_process_passport(xml, audit, text) -> Markdown «Паспорт процесса»
+    inspect_task_details(task_name, task_role, process_context) -> операционная карточка
+    build_diagram_catalog(xml, audit, text) -> метаданные узлов для клика по холсту
     PROMPT_TEMPLATE / build_prompt(text)
 
 Модуль не падает при недоступности моделей: при любом сбое сети, таймауте или
@@ -2469,3 +2471,252 @@ def generate_process_passport(xml_str: str, audit_data: dict, regulation_text: s
         lines += ["", f"_Исходная BPMN-модель: {len(xml_str)} символов XML._"]
     lines.append("")
     return "\n".join(lines)
+
+
+# --------------------------- инспектор задачи и каталог кликов по холсту --------------------------- #
+_KIND_RU = {
+    "userTask": "Пользовательская задача",
+    "scriptTask": "Скриптовая / сервисная задача",
+    "task": "Задача",
+    "exclusiveGateway": "Исключающий шлюз (XOR)",
+    "parallelGateway": "Параллельный шлюз (AND)",
+    "inclusiveGateway": "Включающий шлюз (OR)",
+    "startEvent": "Стартовое событие",
+    "endEvent": "Завершающее событие",
+    "subProcess": "Подпроцесс",
+}
+
+_ROLE_QUAL = (
+    ("диспетчер", "IV–V группа по электробезопасности, право ведения оперативных переговоров и переключений."),
+    ("начальник смены", "V группа по электробезопасности, ответственный руководитель работ в электроустановке."),
+    ("служб безопасн", "V группа, контроль нарядов-допусков, проверка состава бригады и удостоверений."),
+    ("ремонтн", "III–IV группа по электробезопасности, допуск к работам в электроустановках до и выше 1000 В."),
+    ("эколог", "Профильная подготовка по охране окружающей среды; допуск к площадке — по наряду."),
+    ("охран труд", "Специалист по ОТ, группа не ниже III, контроль СИЗ и инструктажа."),
+    ("закуп", "Квалификация закупщика / договорной работы; ЭЦП для электронной площадки."),
+    ("бухгалт", "Квалификация бухгалтера энергосбыта / генерирующей компании, доступ к 1С / ERP."),
+)
+
+INSPECT_SYSTEM = """Ты — старший мастер оперативного персонала ПАО «Интер РАО».
+По задаче BPMN составь операционную карточку исполнителя. Ответь ТОЛЬКО JSON без markdown:
+{
+  "role_requirements": "квалификация, разряд, группа допуска по электробезопасности (II–V)",
+  "procedure_steps": ["шаг 1", "шаг 2", "шаг 3", "шаг 4"],
+  "safety_and_tools": "приборы, СИЗ, заземления, ИТ-системы",
+  "input_trigger": "основание начать работы и входные документы",
+  "output_artifact": "результат: акт, журнал, статус"
+}
+Только факты из контекста процесса; 3–4 конкретных технических действия; по-русски; ничего не выдумывай сверх роли и названия шага."""
+
+
+def _role_requirements(role: str) -> str:
+    low = (role or "").lower()
+    for stem, text in _ROLE_QUAL:
+        if stem in low:
+            return text
+    return (
+        f"Исполнитель роли «{role or 'специалист'}»: профильная подготовка, "
+        "группа по электробезопасности не ниже III, допуск к работам по действующему наряду."
+    )
+
+
+def _match_step(task_name: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    name = (task_name or "").lower()
+    best: Dict[str, Any] = {}
+    score = 0
+    for st in ctx.get("steps") or []:
+        title = str(st.get("title") or "").lower()
+        s = 0
+        if title and (title in name or name in title):
+            s = 3
+        else:
+            stems = {w[:6] for w in re.findall(r"[А-Яа-яЁё]{5,}", name)}
+            s = sum(1 for w in stems if w in title)
+        if s > score:
+            score, best = s, st
+    return best
+
+
+def _heuristic_inspect(task_name: str, task_role: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    name = (task_name or "Выполнить действие").strip()
+    role = (task_role or "Исполнитель").strip()
+    low = name.lower()
+    step = _match_step(name, ctx)
+    systems = list(step.get("systems") or [])
+    artifacts = list(step.get("artifacts") or [])
+    if not systems:
+        systems = [i.get("name") for i in (ctx.get("it_systems") or []) if isinstance(i, dict) and i.get("name")]
+    if not artifacts:
+        artifacts = [i.get("name") for i in (ctx.get("artifacts") or []) if isinstance(i, dict) and i.get("name")]
+    sys_txt = ", ".join(str(s) for s in systems[:4]) or "оперативный журнал, ИС/АС предприятия"
+    doc_txt = ", ".join(str(a) for a in artifacts[:4]) or "задание смены / наряд-допуск"
+
+    steps = [f"Получить задание и подтвердить полномочия роли «{role}»."]
+    action = name[:1].lower() + name[1:] if name else "выполнить операцию по регламенту"
+    steps.append(f"Выполнить: {action}.")
+    if any(k in low for k in ("наряд", "допуск", "безопасн", "инструктаж")):
+        steps.append("Проверить наряд-допуск, состав бригады, удостоверения и наличие СИЗ.")
+        steps.append("Допустить персонал к работе или вернуть пакет документов на устранение замечаний.")
+    elif any(k in low for k in ("журнал", "фиксир", "регистр", "заявк")):
+        steps.append(f"Внести запись в {sys_txt}.")
+        steps.append("Сверить статус заявки со смежной ролью и закрыть шаг в системе.")
+    elif any(k in low for k in ("ремонт", "переключ", "вывест", "восстанов", "схем")):
+        steps.append("Выполнить оперативные переключения / работы по бланку, установить переносные заземления.")
+        steps.append("Подтвердить восстановление схемы и снять наряд после осмотра.")
+    elif any(k in low for k in ("осмотр", "диагност", "измер", "тепловиз", "изоляц")):
+        steps.append("Провести измерения приборами (тепловизор, мегаомметр) и зафиксировать дефекты.")
+        steps.append("Передать дефектную ведомость следующей роли по схеме.")
+    else:
+        steps.append("Сверить результат с нормами ПТЭ и локальными инструкциями предприятия.")
+        steps.append("Передать результат следующей роли и зафиксировать статус в учётной системе.")
+
+    if "script" in low or "автомат" in low:
+        safety = f"Автоматизированная операция. Системы: {sys_txt}. Контроль журнала событий, без работ в электроустановке."
+    else:
+        safety = (
+            f"СИЗ: каска, термостойкий комбинезон, диэлектрические перчатки и боты (по наряду). "
+            f"При работах в электроустановке — переносные заземления и запирание коммутационных аппаратов. "
+            f"Системы: {sys_txt}."
+        )
+    trigger = (
+        f"Основание: поступление шага «{name}» роли «{role}» по схеме процесса"
+        + (f"; входные документы: {doc_txt}." if artifacts or doc_txt else ".")
+    )
+    output = (
+        f"Результат шага «{name}»: статус выполнен; "
+        + (f"оформлены {doc_txt}; " if artifacts else "запись в оперативном журнале; ")
+        + "передача следующей роли по BPMN."
+    )
+    return {
+        "role_requirements": _role_requirements(role),
+        "procedure_steps": steps[:4],
+        "safety_and_tools": safety,
+        "input_trigger": trigger,
+        "output_artifact": output,
+        "source": "heuristic",
+    }
+
+
+def inspect_task_details(task_name: str, task_role: str, process_context: dict) -> dict:
+    """Развёрнутая операционная инструкция исполнителя по шагу BPMN.
+
+    Облачная модель (Groq/OpenAI) → эвристики процесса. Всегда возвращает словарь с ключами
+    role_requirements, procedure_steps, safety_and_tools, input_trigger, output_artifact.
+    """
+    ctx = process_context if isinstance(process_context, dict) else {}
+    fallback = _heuristic_inspect(task_name or "", task_role or "", ctx)
+    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
+        return fallback
+    payload = {
+        "task": task_name,
+        "role": task_role,
+        "process": ctx.get("title"),
+        "sla": ctx.get("sla"),
+        "step_match": _match_step(task_name or "", ctx),
+        "it_systems": ctx.get("it_systems"),
+        "artifacts": ctx.get("artifacts"),
+        "critical_path": [c.get("name") for c in (ctx.get("critical_path") or [])][:12],
+    }
+    trace: List[str] = []
+    got = _chat_llm(
+        [
+            {"role": "system", "content": INSPECT_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:6000]},
+        ],
+        trace,
+    )
+    if not got:
+        return fallback
+    raw = got[1]
+    try:
+        m = re.search(r"\{[\s\S]*\}", raw)
+        data = json.loads(m.group(0) if m else raw)
+    except Exception:  # noqa: BLE001
+        return fallback
+    steps = data.get("procedure_steps") if isinstance(data, dict) else None
+    if isinstance(steps, str):
+        steps = [s.strip(" -•") for s in re.split(r"[\n;]+", steps) if s.strip()]
+    if not isinstance(steps, list) or len(steps) < 2:
+        steps = fallback["procedure_steps"]
+    return {
+        "role_requirements": str(data.get("role_requirements") or fallback["role_requirements"]),
+        "procedure_steps": [str(s).strip() for s in steps[:6] if str(s).strip()],
+        "safety_and_tools": str(data.get("safety_and_tools") or fallback["safety_and_tools"]),
+        "input_trigger": str(data.get("input_trigger") or fallback["input_trigger"]),
+        "output_artifact": str(data.get("output_artifact") or fallback["output_artifact"]),
+        "source": got[0],
+    }
+
+
+def live_node_comment(name: str, role: str, kind: str, ctx: Dict[str, Any]) -> str:
+    """Короткий комментарий ИИ для карточки клика: зачем шаг в энергосистеме и где риск задержки."""
+    low = (name or "").lower()
+    crit = {str(c.get("name") or "") for c in (ctx.get("critical_path") or [])}
+    on_crit = name in crit or any(name and name[:18] in (c or "") for c in crit)
+    bus = ctx.get("bus_factor") or {}
+    top = str(bus.get("top_role") or "")
+    loops = ctx.get("rework_loops") or []
+    loop_hit = any(name and name[:12] in str(l.get("from", "")) + str(l.get("to", "")) for l in loops)
+
+    if kind in _GATE_TAGS:
+        why = "Развилка фиксирует решение, от которого зависит допуск, схема или возврат на доработку."
+        risk = "Неподписанная или спорная ветка здесь даёт ложный маршрут и простой бригады."
+    elif kind == "startEvent":
+        why, risk = "Точка входа аварии или заявки в оперативный контур.", "Поздняя фиксация старта съедает весь запас SLA."
+    elif kind == "endEvent":
+        why, risk = "Подтверждение, что схема и документы закрыты.", "Незакрытый конец оставляет «висящий» наряд и открытый SLA."
+    elif kind == "subProcess":
+        why = "Декомпозиция однотипных шагов одной роли — защита от «карты метро»."
+        risk = "Если внутри длинная цепочка без контроля, узкое место прячется в подпроцессе."
+    elif any(k in low for k in ("наряд", "допуск")):
+        why = "Наряд-допуск — юридический и технический барьер перед работой в электроустановке."
+        risk = "Замечания СБ и возврат наряда — типичный цикл, который раздувает SLA."
+    elif any(k in low for k in ("ремонт", "восстанов", "переключ")):
+        why = "Оперативные переключения и ремонт возвращают оборудование в нормальную схему."
+        risk = "Шаг на критическом пути: каждый час простоя — недоотпуск и риск каскада."
+    elif any(k in low for k in ("журнал", "фиксир")):
+        why = "Оперативный журнал — единый источник правды для диспетчера и смены."
+        risk = "Ошибка или задержка записи ломает трассировку аварии и расследование."
+    else:
+        why = f"Шаг роли «{role or 'исполнитель'}» продвигает процесс по регламенту энергосистемы."
+        risk = "Задержка на исполнителе с высокой долей нагрузки повышает bus-factor."
+    if on_crit:
+        risk = "Узел на критическом пути SLA (Беллман — Форд): задержка сдвигает весь срок восстановления."
+    elif loop_hit:
+        risk = "Узел связан с циклом возврата — повторный проход умножает трудозатраты."
+    elif role and role == top and float(bus.get("max_share") or 0) > 0.4:
+        risk = f"Роль «{role}» держит {float(bus.get('max_share') or 0):.0%} шагов — простой ключевого исполнителя останавливает процесс."
+    return f"{why} {risk}"
+
+
+def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) -> Dict[str, Dict[str, Any]]:
+    """id BPMN-элемента → карточка для клика на холсте (роль, критический путь, комментарий ИИ)."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {})
+    catalog: Dict[str, Dict[str, Any]] = {}
+    if not xml_str:
+        return catalog
+    try:
+        struct = parse_bpmn_structure(xml_str)
+    except Exception:  # noqa: BLE001
+        return catalog
+    clickable = _TASK_TAGS | _GATE_TAGS | {"startEvent", "endEvent", "subProcess"}
+    for nid, node in (struct.get("nodes") or {}).items():
+        kind = str(node.get("type") or "")
+        if kind not in clickable:
+            continue
+        name = str(node.get("name") or "").strip() or kind
+        role = str(node.get("lane") or "").strip()
+        crit = any(
+            name == str(c.get("name") or "") or nid == str(c.get("id") or "")
+            for c in (ctx.get("critical_path") or [])
+        )
+        catalog[nid] = {
+            "id": nid,
+            "name": name,
+            "type": _KIND_RU.get(kind, kind),
+            "kind": kind,
+            "role": role or "—",
+            "critical": bool(crit),
+            "comment": live_node_comment(name, role, kind, ctx),
+        }
+    return catalog
