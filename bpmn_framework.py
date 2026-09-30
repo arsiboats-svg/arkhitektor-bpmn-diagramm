@@ -7,13 +7,15 @@
   * ортогональная (Манхэттенская) маршрутизация стрелок с обходом чужих блоков;
   * BPMN in Color (bioc / color) и валидный для bpmn.io XML (MODEL + DI);
   * self-healing: несуществующие ID и межуровневые связи не роняют движок;
-  * бизнес-аудит: bus-factor, тупики, критический путь SLA (Беллман-Форд),
-    циклы возврата на доработку и рекомендации по оптимизации.
+    * бизнес-аудит: bus-factor, тупики, критический путь SLA (Беллман-Форд),
+    циклы возврата на доработку и рекомендации по оптимизации;
+    * методологический линтер нотации BPMN 2.0 (именование, шлюзы, anti-subway, топология).
 """
 
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from html import escape
@@ -150,6 +152,25 @@ def _wrapped_lines(text: str, width: float, char_w: float = 7.2) -> int:
         while cur > width:  # слово длиннее строки bpmn-js переносит посимвольно
             lines, cur = lines + 1, cur - width
     return lines
+
+
+_INFINITIVE_END = ("ть", "ти", "чь")
+_NAME_SKIP = {
+    "и", "в", "на", "по", "для", "с", "к", "от", "о", "об", "при", "над", "под",
+    "параллельно", "одновременно",
+}
+
+
+def _name_is_infinitive_object(name: str) -> bool:
+    """Имя задачи в форме «глагол в инфинитиве + объект» (стандарт Дирекции бизнес-архитектуры)."""
+    words = [re.sub(r"^[«»\"'(]+|[»\"').,;:]+$", "", w) for w in (name or "").split()]
+    words = [w for w in words if w and w.lower() not in _NAME_SKIP]
+    if not words:
+        return False
+    first = words[0].lower()
+    if first.endswith(_INFINITIVE_END):
+        return len(words) >= 2 or len(first) >= 6
+    return False
 
 
 def _task_height(name: str) -> float:
@@ -1248,6 +1269,202 @@ class BPMNDiagramBuilder:
                 )
         return loops
 
+    def check_methodology_compliance(self) -> Dict[str, object]:
+        """Аудит графа по корпоративной нотации BPMN 2.0 ПАО «Интер РАО».
+
+        Возвращает балл 0–100 и четыре проверки: именование, семантика шлюзов,
+        anti-subway (декомпозиция), топология (тупики / сироты).
+        """
+        outgoing: Dict[str, List[SequenceLink]] = defaultdict(list)
+        incoming: Dict[str, List[SequenceLink]] = defaultdict(list)
+        for link in self.links:
+            outgoing[link.source_id].append(link)
+            incoming[link.target_id].append(link)
+
+        def role_of(node: FlowNode) -> str:
+            lane = self.lanes.get(node.lane_id or "")
+            return lane.name if lane else ""
+
+        # --- 1. Naming: глагол в инфинитиве + объект ---
+        work = [n for n in self.nodes.values() if n.kind in WORK_KINDS]
+        named_ok: List[str] = []
+        named_bad: List[str] = []
+        for node in work:
+            if _name_is_infinitive_object(node.name):
+                named_ok.append(node.name)
+            else:
+                named_bad.append(node.name)
+        naming_ratio = (len(named_ok) / len(work)) if work else 1.0
+        naming_pass = naming_ratio >= 0.999 or not work
+
+        # --- 2. Gateway semantics ---
+        gw_issues: List[str] = []
+        xor_or = [n for n in self.nodes.values() if n.kind in ("exclusiveGateway", "inclusiveGateway")]
+        for node in xor_or:
+            outs = outgoing.get(node.id, [])
+            ins = incoming.get(node.id, [])
+            is_split = len(outs) > 1
+            if is_split and "?" not in (node.name or ""):
+                gw_issues.append(f"Шлюз «{node.name or node.id}» без вопросительного знака в названии")
+            if is_split:
+                unlabeled = [lk for lk in outs if not (lk.condition_name or "").strip()]
+                if unlabeled:
+                    gw_issues.append(
+                        f"У шлюза «{node.name or node.id}» {len(unlabeled)} исходящих потока без подписи"
+                    )
+            if len(ins) == 0:
+                gw_issues.append(f"Шлюз «{node.name or node.id}» без входа")
+        par = [n for n in self.nodes.values() if n.kind == "parallelGateway"]
+        for node in par:
+            outs = outgoing.get(node.id, [])
+            ins = incoming.get(node.id, [])
+            if len(outs) <= 1 and len(ins) <= 1:
+                gw_issues.append(f"Параллельный шлюз «{node.name or node.id}» ничего не разветвляет и не сливает")
+        gateway_pass = not gw_issues
+
+        # --- 3. Anti-subway: цепочки >4 шагов одной роли без подпроцесса ---
+        chains: List[str] = []
+        scopes = [self.process_id] + [n.id for n in self.nodes.values() if n.kind == "subProcess"]
+        # корневой процесс может быть process_id пула
+        if self.pools:
+            scopes = [next(iter(self.pools.values())).process_id] + [
+                n.id for n in self.nodes.values() if n.kind == "subProcess"
+            ]
+        seen_scopes: Set[str] = set()
+        for owner in scopes:
+            if owner in seen_scopes:
+                continue
+            seen_scopes.add(owner)
+            kids = [n for n in self._children(owner) if n.kind in WORK_KINDS or n.kind == "subProcess"]
+            start = next((n.id for n in kids if n.kind == "startEvent"), None)
+            if start is None:
+                start = next((n.id for n in self._children(owner) if n.kind == "startEvent"), None)
+            nodes_scope = self._children(owner)
+            back = self._back_links(nodes_scope, start)
+            layers = self._layers(nodes_scope, start, back)
+            ordered = sorted(kids, key=lambda n: (layers.get(n.id, 99), n.y, n.x, n.order))
+            chain: List[FlowNode] = []
+            chain_lane: Optional[str] = None
+            for node in ordered:
+                if node.kind == "subProcess":
+                    chain, chain_lane = [], None
+                    continue
+                if node.kind not in WORK_KINDS:
+                    continue
+                if chain_lane == node.lane_id:
+                    chain.append(node)
+                else:
+                    chain, chain_lane = [node], node.lane_id
+                if len(chain) > 4:
+                    names = " → ".join(c.name for c in chain)
+                    label = f"«{role_of(chain[0])}»: {names}"
+                    if label not in chains:
+                        chains.append(label)
+        subway_pass = not chains
+
+        # --- 4. Topology: тупики и изолированные узлы ---
+        dead: List[str] = []
+        isolated: List[str] = []
+        for node in self.nodes.values():
+            ins = incoming.get(node.id, [])
+            outs = outgoing.get(node.id, [])
+            if node.kind == "endEvent":
+                if not ins:
+                    isolated.append(f"Конец «{node.name}» без входа")
+                continue
+            if node.kind == "startEvent":
+                if not outs:
+                    dead.append(f"Старт «{node.name}» без выхода")
+                continue
+            if not outs:
+                dead.append(f"Тупик «{node.name}» ({node.kind})")
+            if not ins:
+                isolated.append(f"Сирота «{node.name}» без входящего потока")
+        topology_pass = not dead and not isolated
+
+        naming_pts = round(30.0 * naming_ratio, 1)
+        gateway_pts = 25.0 if gateway_pass else max(0.0, 25.0 - 5.0 * min(len(gw_issues), 5))
+        subway_pts = 20.0 if subway_pass else max(0.0, 20.0 - 5.0 * min(len(chains), 4))
+        topo_pts = 25.0 if topology_pass else max(0.0, 25.0 - 6.0 * min(len(dead) + len(isolated), 4))
+        score = int(round(naming_pts + gateway_pts + subway_pts + topo_pts))
+        score = max(0, min(100, score))
+
+        def check(
+            key: str,
+            title: str,
+            passed: bool,
+            weight: int,
+            points: float,
+            detail: str,
+            findings: List[str],
+        ) -> Dict[str, object]:
+            return {
+                "key": key,
+                "title": title,
+                "passed": passed,
+                "weight": weight,
+                "points": round(points, 1),
+                "detail": detail,
+                "findings": findings[:8],
+            }
+
+        checks = [
+            check(
+                "naming",
+                "Naming compliance",
+                naming_pass,
+                30,
+                naming_pts,
+                f"{len(named_ok)} из {len(work)} задач в форме «глагол в инфинитиве + объект» "
+                f"({naming_ratio:.0%}; цель 100%).",
+                [f"«{n}»" for n in named_bad],
+            ),
+            check(
+                "gateway",
+                "Gateway semantics",
+                gateway_pass,
+                25,
+                gateway_pts,
+                "XOR/OR-развилки с «?» в названии и подписями исходящих потоков."
+                if gateway_pass
+                else f"Замечаний по шлюзам: {len(gw_issues)}.",
+                gw_issues,
+            ),
+            check(
+                "subway",
+                "Anti-Subway Index",
+                subway_pass,
+                20,
+                subway_pts,
+                "Нет монотонных цепочек длиннее 4 шагов одной роли без подпроцесса."
+                if subway_pass
+                else f"Цепочек без декомпозиции: {len(chains)}.",
+                chains,
+            ),
+            check(
+                "topology",
+                "Topology check",
+                topology_pass,
+                25,
+                topo_pts,
+                "Тупиков и изолированных узлов нет."
+                if topology_pass
+                else f"Тупиков: {len(dead)}, сирот: {len(isolated)}.",
+                dead + isolated,
+            ),
+        ]
+        return {
+            "score": score,
+            "max_score": 100,
+            "passed": all(bool(c["passed"]) for c in checks),
+            "checks": checks,
+            "naming_ratio": round(naming_ratio, 3),
+            "gateway_issues": len(gw_issues),
+            "long_chains": len(chains),
+            "dead_ends": len(dead),
+            "orphans": len(isolated),
+        }
+
     def analyze_bottlenecks(self) -> Dict[str, object]:
         memo: Dict[str, float] = {}
         root_owner = [p.process_id for p in self.pools.values()][:1] or [self.process_id]
@@ -1424,6 +1641,7 @@ class BPMNDiagramBuilder:
             "auto_healed": list(self.healed),
             "engine_warnings": list(self.warnings),
             "skipped_links": list(self.skipped_links),
+            "methodology": self.check_methodology_compliance(),
             "stats": {
                 "nodes": len(self.nodes),
                 "valid_links": len(self.links),
