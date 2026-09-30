@@ -17,6 +17,9 @@
     inspect_task_details(task_name, task_role, process_context) -> операционная карточка
     build_diagram_catalog(xml, audit, text) -> метаданные узлов для клика по холсту
     build_canvas_copilot(xml, audit, text) -> ответы плавающего ассистента на холсте
+    optimize_process_to_be(text, audit) -> целевой регламент To-Be и дельта SLA
+    generate_raci_matrix(steps, roles) -> матрица ответственности R/A/C/I
+    export_docx_passport(xml, audit, text) -> официальный регламент Microsoft Word
     PROMPT_TEMPLATE / build_prompt(text)
 
 Модуль не падает при недоступности моделей: при любом сбое сети, таймауте или
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import io
 import json
 import os
 import re
@@ -2747,3 +2751,581 @@ def build_canvas_copilot(xml_str: str, audit_data: dict, regulation_text: str) -
             {"id": "roles", "label": "👤 Роли и риски", "q": "Как оптимизировать нагрузку ролей?", "a": roles_a},
         ],
     }
+
+
+# --------------------------- RACI, To-Be, официальный DOCX --------------------------- #
+_ACCOUNTABLE_RE = re.compile(
+    r"начальник|руководител|директор|владелец|главн\w+\s+инженер|начальник смены|зам[\.\s]",
+    re.I,
+)
+_CONSULTED_RE = re.compile(
+    r"безопасност|юрист|правов|эколог|эксперт|согласующ|охрана труда|служба охраны|нормативн",
+    re.I,
+)
+_INFORMED_RE = re.compile(r"диспетчер|заявител|заказчик|потребител|инициатор", re.I)
+_JOURNAL_RE = re.compile(
+    r"фикс\w+|журнал|реестр|регистр\w+|вносит\s+запис|учётн\w+\s+систем|оперативн\w+\s+журнал",
+    re.I,
+)
+_CONTROL_HINT_RE = re.compile(r"входн\w+\s+контрол|комплектност\w+\s+документ", re.I)
+_RACI_STOP = {"выполн", "провод", "оформ", "провер", "принят", "переда", "состав", "оценк"}
+TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
+Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
+1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
+2) Zero-Rework: перед шлюзами согласования добавь шаг входного контроля комплектности;
+   формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
+3) Автоматизация: фиксацию в журналах и реестрах формулируй как действие информационной системы (автоматически).
+Верни ТОЛЬКО текст регламента с нумерованными шагами, без комментариев и markdown."""
+
+
+def _accountable_role(roles: List[str]) -> str:
+    for role in roles or []:
+        if _ACCOUNTABLE_RE.search(role or ""):
+            return role
+    return (roles[0] if roles else "Руководитель процесса") or "Руководитель процесса"
+
+
+def _consulted_roles(roles: List[str]) -> List[str]:
+    return [r for r in (roles or []) if _CONSULTED_RE.search(r or "")]
+
+
+def _informed_roles(roles: List[str]) -> List[str]:
+    return [r for r in (roles or []) if _INFORMED_RE.search(r or "")]
+
+
+def _step_as_row(item: Any, idx: int) -> Dict[str, Any]:
+    if isinstance(item, Step):
+        return {
+            "num": item.num,
+            "title": item.title or "(шлюз решения)",
+            "role": item.role or "",
+            "decision": bool(item.decision),
+            "hours": item.hours,
+            "artifacts": list(item.artifacts or []),
+            "systems": list(item.systems or []),
+        }
+    if isinstance(item, dict):
+        title = item.get("title") or item.get("name") or item.get("action") or ""
+        decision = item.get("decision")
+        return {
+            "num": item.get("num") if item.get("num") is not None else idx,
+            "title": title or "(шаг)",
+            "role": item.get("role") or item.get("lane") or item.get("executor") or "",
+            "decision": bool(decision) if not isinstance(decision, dict) else True,
+            "hours": item.get("hours"),
+            "artifacts": list(item.get("artifacts") or []),
+            "systems": list(item.get("systems") or []),
+        }
+    return {"num": idx, "title": str(item), "role": "", "decision": False, "hours": None, "artifacts": [], "systems": []}
+
+
+def generate_raci_matrix(steps: list, roles: list) -> List[Dict[str, Any]]:
+    """Матрица RACI: строки — шаги, столбцы — роли, на пересечении буквы R/A/C/I."""
+    role_list = [str(r).strip() for r in (roles or []) if str(r).strip()]
+    rows_in = [_step_as_row(s, i + 1) for i, s in enumerate(steps or [])]
+    for row in rows_in:
+        if row["role"] and row["role"] not in role_list:
+            role_list.append(row["role"])
+    if not role_list:
+        role_list = ["Исполнитель"]
+    owner = _accountable_role(role_list)
+    consulted = _consulted_roles(role_list)
+    informed = _informed_roles(role_list)
+    matrix: List[Dict[str, Any]] = []
+    last_idx = len(rows_in) - 1
+    for i, row in enumerate(rows_in):
+        executor = row["role"] or role_list[0]
+        title = str(row["title"] or "")
+        decision = bool(row["decision"]) or bool(re.search(r"соглас|допуск|утверд|экспертиз", title, re.I))
+        milestone = decision or i >= last_idx - 1
+        accountable = executor if _ACCOUNTABLE_RE.search(executor) else owner
+        if decision:
+            accountable = executor
+        cells: Dict[str, List[str]] = {role: [] for role in role_list}
+
+        def _add(role: str, letter: str) -> None:
+            if role not in cells:
+                cells[role] = []
+            if letter not in cells[role]:
+                cells[role].append(letter)
+
+        _add(executor, "R")
+        _add(accountable, "A")
+        if decision or bool(re.search(r"проверк|допуск|наряд|экспертиз|правов", title, re.I)):
+            for role in consulted:
+                if role not in (executor, accountable):
+                    _add(role, "C")
+        if milestone:
+            for role in informed:
+                if role not in (executor, accountable):
+                    _add(role, "I")
+        matrix.append(
+            {
+                "num": row["num"],
+                "title": title,
+                "executor": executor,
+                "assignments": cells,
+            }
+        )
+    return matrix
+
+
+def _independent_steps(a: Step, b: Step) -> bool:
+    if not a.role or not b.role or a.role == b.role:
+        return False
+    if a.decision or b.decision or b.parallel:
+        return False
+    stems_a = {w[:6].lower() for w in re.findall(r"[А-Яа-яЁё]{5,}", a.title or "")}
+    stems_b = {w[:6].lower() for w in re.findall(r"[А-Яа-яЁё]{5,}", b.title or "")}
+    return not ((stems_a & stems_b) - _RACI_STOP)
+
+
+def _automate_journal_body(body: str) -> str:
+    if re.search(r"информационн\w+\s+систем\w+\s+автоматическ", body, re.I):
+        return body
+    text = body.strip()
+    if _DUR_RE.search(text):
+        text = _DUR_RE.sub("(5 минут)", text, count=1)
+    else:
+        text = text.rstrip(" .") + " (5 минут)."
+    if not text.lower().startswith("информационн"):
+        text = "Информационная система автоматически: " + text[:1].lower() + text[1:]
+    return text
+
+
+def _cut_rework_loop(body: str) -> str:
+    """Убирает петлю «вернуть на п.N / на доработку» без слов верну/возврат/доработ/повтор."""
+    text = re.sub(
+        r"(?:иначе\s+)?(?:«[^»]+»\s*[—–-]\s*)?(?:вернуть|возврат(?:ить)?)\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+",
+        "иначе эскалация руководителю процесса",
+        body,
+        flags=re.I,
+    )
+    return re.sub(
+        r"«[^»]*(?:доработ|замечан|повторн)[^»]*»\s*[—–-]\s*(?:вернуть|возврат)\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+",
+        "иначе эскалация руководителю процесса",
+        text,
+        flags=re.I,
+    )
+
+
+def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
+    raw_text = normalize_regulation(regulation_text or "")
+    header, raw_steps = _split_steps(raw_text)
+    try:
+        parsed = parse_regulation(raw_text)
+    except Exception:  # noqa: BLE001
+        return raw_text, []
+    n = min(len(parsed.steps), len(raw_steps))
+    if n < 2:
+        return raw_text, []
+    actions: List[Dict[str, str]] = []
+    bodies = [raw_steps[i]["body"] for i in range(n)]
+    nums = [parsed.steps[i].num for i in range(n)]
+
+    for i in range(n):
+        body = bodies[i]
+        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+            bodies[i] = _automate_journal_body(body)
+            actions.append(
+                {
+                    "kind": "automation",
+                    "detail": f"Шаг {nums[i]} «{parsed.steps[i].title or 'фиксация'}»: scriptTask, фиксация в журнале выполняется системой.",
+                }
+            )
+
+    i = 0
+    while i < n - 1:
+        a, b = parsed.steps[i], parsed.steps[i + 1]
+        already = bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", bodies[i + 1], re.I))
+        if _independent_steps(a, b) and not already:
+            bodies[i + 1] = "Параллельно: " + bodies[i + 1]
+            b.parallel = True
+            actions.append(
+                {
+                    "kind": "parallel",
+                    "detail": f"Шаги {a.num} ({a.role}) и {b.num} ({b.role}) выполняются параллельно.",
+                }
+            )
+            i += 2
+            continue
+        i += 1
+
+    control_at: Dict[int, str] = {}
+    for i in range(n):
+        st = parsed.steps[i]
+        d = st.decision
+        loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
+        if not loops:
+            continue
+        bodies[i] = _cut_rework_loop(bodies[i])
+        prev = bodies[i - 1] if i else ""
+        if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
+            actions.append(
+                {
+                    "kind": "zero_rework",
+                    "detail": f"Шаг {st.num}: петля возврата снята, входной контроль уже есть.",
+                }
+            )
+            continue
+        control_at[i] = (
+            f"{st.role} выполняет входной контроль комплектности документов и исходных данных "
+            f"перед согласованием (15 минут)."
+        )
+        actions.append(
+            {
+                "kind": "zero_rework",
+                "detail": f"Перед шагом {st.num} «{st.title or 'согласование'}» введён входной контроль, цикл доработки заменён эскалацией.",
+            }
+        )
+
+    assembled: List[Tuple[Optional[int], str]] = []
+    for i in range(n):
+        if i in control_at:
+            assembled.append((None, control_at[i]))
+        assembled.append((nums[i], bodies[i]))
+    old_to_new: Dict[int, int] = {}
+    new_bodies: List[str] = []
+    for old_num, body in assembled:
+        new_bodies.append(body)
+        if old_num is not None:
+            old_to_new[old_num] = len(new_bodies)
+
+    def _fn(ref: int) -> int:
+        return old_to_new.get(ref, ref)
+
+    remapped = [_remap(b, _fn) for b in new_bodies]
+    return _join_steps(header, [{"body": b} for b in remapped]), actions
+
+
+def _collect_tobe_actions(old_text: str, new_text: str) -> List[Dict[str, str]]:
+    actions: List[Dict[str, str]] = []
+    _, old_s = _split_steps(normalize_regulation(old_text))
+    _, new_s = _split_steps(normalize_regulation(new_text))
+    old_par = sum(1 for s in old_s if re.match(r"^(?:параллельно|одновременно)", s["body"], re.I))
+    new_par = sum(1 for s in new_s if re.match(r"^(?:параллельно|одновременно)", s["body"], re.I))
+    if new_par > old_par:
+        actions.append({"kind": "parallel", "detail": f"Добавлено параллельных веток: {new_par - old_par}."})
+    old_ctrl = sum(1 for s in old_s if _CONTROL_HINT_RE.search(s["body"]))
+    new_ctrl = sum(1 for s in new_s if _CONTROL_HINT_RE.search(s["body"]))
+    if new_ctrl > old_ctrl:
+        actions.append({"kind": "zero_rework", "detail": f"Введён входной контроль ({new_ctrl - old_ctrl} шаг.). Петли возврата сокращены."})
+    old_auto = sum(1 for s in old_s if re.search(r"автоматическ", s["body"], re.I))
+    new_auto = sum(1 for s in new_s if re.search(r"автоматическ", s["body"], re.I))
+    if new_auto > old_auto:
+        actions.append({"kind": "automation", "detail": f"Автоматизировано шагов фиксации: {new_auto - old_auto}."})
+    if not actions:
+        actions.append({"kind": "reengine", "detail": "Целевой регламент переписан с сохранением ролей и SLA."})
+    return actions
+
+
+def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[str]:
+    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
+        return None
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("FALLBACK_API_KEY")):
+        return None
+    ctx = build_process_context(regulation_text, "", audit_data or {})
+    messages = [
+        {"role": "system", "content": TOBE_SYSTEM},
+        {
+            "role": "user",
+            "content": "АУДИТ AS-IS:\n" + format_context_for_prompt(ctx, max_steps=40)
+            + "\n\nРЕГЛАМЕНТ AS-IS:\n" + (regulation_text or "").strip(),
+        },
+    ]
+    trace: List[str] = []
+    got = _chat_llm(messages, trace)
+    if not got:
+        return None
+    _, raw = got
+    new_text = _strip_markdown(raw).strip()
+    _, old_steps = _split_steps(normalize_regulation(regulation_text))
+    _, new_steps = _split_steps(normalize_regulation(new_text))
+    if len(new_steps) < 2 or abs(len(new_steps) - len(old_steps)) > 8:
+        return None
+    return new_text + ("\n" if not new_text.endswith("\n") else "")
+
+
+def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]], engine: str) -> Dict[str, Any]:
+    old_a, new_a = old_audit or {}, new_audit or {}
+    old_sla = old_a.get("sla") or {}
+    new_sla = new_a.get("sla") or {}
+    before = float(old_sla.get("with_rework_hours") or old_sla.get("critical_path_hours") or 0)
+    after = float(new_sla.get("with_rework_hours") or new_sla.get("critical_path_hours") or 0)
+    saved = max(0.0, before - after)
+    pct = round(100.0 * saved / before, 1) if before else 0.0
+    loops_b = len(old_a.get("rework_loops") or [])
+    loops_a = len(new_a.get("rework_loops") or [])
+    q_b = int((old_a.get("methodology") or {}).get("score") or 0)
+    q_a = int((new_a.get("methodology") or {}).get("score") or 0)
+    return {
+        "sla_before_hours": round(before, 3),
+        "sla_after_hours": round(after, 3),
+        "sla_saved_hours": round(saved, 3),
+        "sla_saved_pct": pct,
+        "rework_before": loops_b,
+        "rework_after": loops_a,
+        "rework_removed": max(0, loops_b - loops_a),
+        "quality_before": q_b,
+        "quality_after": q_a,
+        "quality_gain": max(0, q_a - q_b),
+        "breach_before": bool(old_sla.get("breach")),
+        "breach_after": bool(new_sla.get("breach")),
+        "actions": actions,
+        "engine": engine,
+    }
+
+
+def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
+    """Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация журналов.
+
+    Сначала облачная LLM (если задан ключ), иначе детерминированный семантический оптимизатор.
+    """
+    text = (regulation_text or "").strip()
+    empty = {
+        "sla_before_hours": 0.0, "sla_after_hours": 0.0, "sla_saved_hours": 0.0, "sla_saved_pct": 0.0,
+        "rework_before": 0, "rework_after": 0, "rework_removed": 0,
+        "quality_before": 0, "quality_after": 0, "quality_gain": 0,
+        "breach_before": False, "breach_after": False, "actions": [], "engine": "semantic-optimizer",
+        "tobe_xml": "", "tobe_audit": {}, "tobe_error": "",
+    }
+    if len(text) < 20:
+        return text, empty
+    engine = "semantic-optimizer"
+    optimized = None
+    llm_text = None
+    try:
+        llm_text = _try_llm_optimize_to_be(text, audit_data or {})
+    except Exception:  # noqa: BLE001
+        llm_text = None
+    if llm_text:
+        optimized, engine = llm_text, "llm"
+        actions = _collect_tobe_actions(text, optimized)
+    else:
+        optimized, actions = _heuristic_optimize_to_be(text)
+        if not actions:
+            actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+    xml, new_audit, err = "", {}, ""
+    try:
+        xml, new_audit, err = _rebuild_process(optimized, f"to-be · {engine}", [])
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    delta = _tobe_delta(audit_data or {}, new_audit or {}, actions, engine)
+    delta["tobe_xml"] = xml or ""
+    delta["tobe_audit"] = new_audit or {}
+    delta["tobe_error"] = err or ""
+    return optimized, delta
+
+
+def _docx_shade(cell: Any, fill: str) -> None:
+    from docx.oxml.ns import nsdecls
+    from docx.oxml import parse_xml
+
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_pr.append(parse_xml(f'<w:shd {nsdecls("w")} w:fill="{fill}" w:val="clear"/>'))
+
+
+def _docx_set_cell(cell: Any, text: str, *, header: bool = False, center: bool = False) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor
+
+    cell.text = ""
+    p = cell.paragraphs[0]
+    if center or header:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(str(text if text not in (None, "") else "—"))
+    run.font.size = Pt(9 if not header else 9)
+    run.font.name = "Calibri"
+    run.bold = header
+    if header:
+        run.font.color.rgb = RGBColor(255, 255, 255)
+        _docx_shade(cell, "003366")
+
+
+def export_docx_passport(xml_str: str, audit_data: dict, regulation_text: str) -> bytes:
+    """Официальный регламент Microsoft Word: паспорт, RACI, пошаговый порядок, карта рисков."""
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Cm, Pt, RGBColor
+    except ImportError as exc:
+        raise RuntimeError("Для экспорта .docx установите пакет python-docx>=1.0.0") from exc
+
+    audit = audit_data if isinstance(audit_data, dict) else {}
+    text = regulation_text or ""
+    try:
+        parsed = parse_regulation(normalize_regulation(text)) if text.strip() else ParsedRegulation(
+            title="Бизнес-процесс", sla_hours=None
+        )
+    except Exception:  # noqa: BLE001
+        parsed = ParsedRegulation(title="Бизнес-процесс", sla_hours=None)
+
+    sla = audit.get("sla") or {}
+    stats = audit.get("stats") or {}
+    bus = audit.get("bus_factor") or {}
+    loops = audit.get("rework_loops") or []
+    recs = audit.get("recommendations") or []
+    target = sla.get("target_hours") if sla.get("target_hours") is not None else parsed.sla_hours
+    owner = _process_owner(text, parsed, audit)
+    title = parsed.title or "Бизнес-процесс по регламенту"
+    roles = list(parsed.roles or [x.get("role") for x in (audit.get("lane_load") or []) if x.get("role")])
+    raci = generate_raci_matrix(list(parsed.steps), roles)
+
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Cm(2.0)
+    section.bottom_margin = Cm(1.8)
+    section.left_margin = Cm(2.0)
+    section.right_margin = Cm(1.6)
+    hp = section.header.paragraphs[0]
+    hp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    hr = hp.add_run("ПАО «Интер РАО»  ·  Дирекция бизнес-архитектуры  ·  официальный регламент процесса")
+    hr.bold = True
+    hr.font.size = Pt(9)
+    hr.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+    hr.font.name = "Calibri"
+    fp = section.footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    fr = fp.add_run("Архитектор BPMN-диаграмм  ·  документ сформирован автоматически  ·  конфиденциально")
+    fr.font.size = Pt(8)
+    fr.font.color.rgb = RGBColor(0x45, 0x5A, 0x64)
+    fr.font.name = "Calibri"
+
+    h = doc.add_paragraph()
+    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    r = h.add_run("Регламент бизнес-процесса")
+    r.bold = True
+    r.font.size = Pt(18)
+    r.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+    r.font.name = "Calibri"
+    sub = doc.add_paragraph()
+    sr = sub.add_run(title)
+    sr.bold = True
+    sr.font.size = Pt(13)
+    sr.font.color.rgb = RGBColor(0x15, 0x65, 0xC0)
+    sr.font.name = "Calibri"
+
+    def heading(label: str) -> None:
+        p = doc.add_paragraph()
+        run = p.add_run(label)
+        run.bold = True
+        run.font.size = Pt(13)
+        run.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+        run.font.name = "Calibri"
+
+    heading("1. Паспорт процесса")
+    pass_rows = [
+        ("Наименование", title),
+        ("Владелец процесса", owner),
+        ("Целевой SLA", _fh(float(target)) if target else "не задан"),
+        ("Критический путь", _fh(float(sla["critical_path_hours"])) if sla.get("critical_path_hours") is not None else "—"),
+        ("Срок с учётом возврата", _fh(float(sla["with_rework_hours"])) if sla.get("with_rework_hours") is not None else "—"),
+        ("Срыв SLA", "да" if sla.get("breach") else "нет"),
+        ("Bus-factor", f"{float(bus.get('max_share') or 0):.0%} · {bus.get('top_role') or '—'}"),
+        ("Узлов / ролей / подпроцессов", f"{stats.get('nodes', '—')} / {stats.get('lanes', len(roles))} / {stats.get('subprocesses', '—')}"),
+        ("Quality Score", f"{int((audit.get('methodology') or {}).get('score') or 0)}%"),
+    ]
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    _docx_set_cell(table.rows[0].cells[0], "Параметр", header=True)
+    _docx_set_cell(table.rows[0].cells[1], "Значение", header=True)
+    for k, v in pass_rows:
+        row = table.add_row().cells
+        _docx_set_cell(row[0], k)
+        _docx_set_cell(row[1], v)
+
+    heading("2. Матрица ответственности (RACI)")
+    legend = doc.add_paragraph()
+    lg = legend.add_run("R — Responsible (исполнитель) · A — Accountable (итог) · C — Consulted (эксперт) · I — Informed (уведомление)")
+    lg.font.size = Pt(8)
+    lg.font.color.rgb = RGBColor(0x45, 0x5A, 0x64)
+    cols = ["№", "Шаг", *roles] if roles else ["№", "Шаг"]
+    rtable = doc.add_table(rows=1, cols=len(cols))
+    rtable.style = "Table Grid"
+    for i, name in enumerate(cols):
+        _docx_set_cell(rtable.rows[0].cells[i], name, header=True, center=True)
+    for item in raci:
+        cells = rtable.add_row().cells
+        _docx_set_cell(cells[0], str(item.get("num") or ""), center=True)
+        _docx_set_cell(cells[1], str(item.get("title") or "")[:80])
+        assigns = item.get("assignments") or {}
+        for j, role in enumerate(roles):
+            letters = "".join(assigns.get(role) or [])
+            _docx_set_cell(cells[j + 2], letters or "—", center=True)
+
+    heading("3. Пошаговый операционный регламент")
+    ot = doc.add_table(rows=1, cols=6)
+    ot.style = "Table Grid"
+    for i, name in enumerate(["№", "Роль", "Действие", "Срок", "Системы", "Документы"]):
+        _docx_set_cell(ot.rows[0].cells[i], name, header=True)
+    if parsed.steps:
+        for st in parsed.steps:
+            row = ot.add_row().cells
+            _docx_set_cell(row[0], str(st.num), center=True)
+            _docx_set_cell(row[1], st.role)
+            name = st.title or "(шлюз решения)"
+            if st.stage:
+                name = f"{name} (этап «{st.stage}»)"
+            _docx_set_cell(row[2], name)
+            _docx_set_cell(row[3], _fh(float(st.hours)) if st.hours else "—", center=True)
+            _docx_set_cell(row[4], ", ".join(st.systems) or "—")
+            _docx_set_cell(row[5], ", ".join(st.artifacts) or "—")
+    else:
+        row = ot.add_row().cells
+        _docx_set_cell(row[0], "—")
+        _docx_set_cell(row[1], "—")
+        _docx_set_cell(row[2], "Шаги не распознаны")
+        _docx_set_cell(row[3], "—")
+        _docx_set_cell(row[4], "—")
+        _docx_set_cell(row[5], "—")
+
+    heading("4. Карта рисков и план мероприятий по оптимизации")
+    risk_p = doc.add_paragraph()
+    rp = risk_p.add_run(
+        f"Циклов возврата: {len(loops)}. "
+        f"Худший возврат: {_fh(float(sla.get('rework_hours') or 0))}. "
+        f"Рекомендации движка аудита:"
+    )
+    rp.font.size = Pt(10)
+    rp.font.name = "Calibri"
+    if loops:
+        lt = doc.add_table(rows=1, cols=4)
+        lt.style = "Table Grid"
+        for i, name in enumerate(["Цикл", "Откуда", "Куда", "Стоимость"]):
+            _docx_set_cell(lt.rows[0].cells[i], name, header=True)
+        for loop in loops:
+            row = lt.add_row().cells
+            _docx_set_cell(row[0], str(loop.get("label") or ""))
+            _docx_set_cell(row[1], str(loop.get("from") or ""))
+            _docx_set_cell(row[2], str(loop.get("to") or ""))
+            _docx_set_cell(row[3], _fh(float(loop.get("cycle_hours") or 0)))
+    if recs:
+        for rec in recs:
+            p = doc.add_paragraph(style="List Bullet")
+            run = p.add_run(str(rec))
+            run.font.size = Pt(10)
+            run.font.name = "Calibri"
+    else:
+        p = doc.add_paragraph()
+        run = p.add_run("Существенных узких мест не выявлено: процесс сбалансирован по ролям.")
+        run.font.size = Pt(10)
+        run.font.name = "Calibri"
+    note = doc.add_paragraph()
+    nr = note.add_run(
+        "План To-Be: параллелить независимые шаги разных ролей, ввести входной контроль перед согласованиями, "
+        "автоматизировать фиксацию в журналах (scriptTask). Целевая схема строится во вкладке «Оптимизация As-Is → To-Be»."
+    )
+    nr.italic = True
+    nr.font.size = Pt(9)
+    nr.font.color.rgb = RGBColor(0x15, 0x65, 0xC0)
+    nr.font.name = "Calibri"
+    if xml_str:
+        meta = doc.add_paragraph()
+        mr = meta.add_run(f"Исходная BPMN-модель: {len(xml_str)} символов XML.")
+        mr.font.size = Pt(8)
+        mr.font.color.rgb = RGBColor(0x78, 0x90, 0x9C)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
