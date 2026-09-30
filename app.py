@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import os
 import re
@@ -17,7 +18,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
-from ai_generator import assistant_chat, cloud_engine_status, generate_bpmn_from_text
+from ai_generator import (
+    assistant_chat,
+    cloud_engine_status,
+    generate_bpmn_from_text,
+    generate_process_passport,
+    normalize_regulation,
+)
 
 
 def _secrets_to_env() -> List[str]:
@@ -179,6 +186,8 @@ table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#26323
 .land-empty {{ color:#78909C; font-size:.88rem; font-style:italic; margin:2px 0 6px 0; }}
 .engine {{ font-size:.82rem; color:#455A64; background:#E3F2FD; border-radius:10px; padding:8px 12px; margin:10px 0 6px 0; }}
 .ir-toast {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; border-radius:12px; padding:10px 14px; font-weight:700; margin:8px 0 14px 0; }}
+.file-badge {{ background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; border-radius:12px; padding:8px 12px; font-size:.86rem; margin:8px 0 4px 0; }}
+.file-badge b {{ color:{BLUE}; }}
 section[data-testid="stSidebar"] {{ background:#F7FBFF; }}
 section[data-testid="stSidebar"] .stMarkdown p {{ font-size:.92rem; }}
 </style>
@@ -594,18 +603,129 @@ def on_example_change() -> None:
     if choice in examples:
         st.session_state["reg_text"] = examples[choice]["text"]
         st.session_state["file_stem"] = examples[choice]["stem"]
+        st.session_state.pop("last_uploaded_filename", None)
+        st.session_state.pop("upload_badge", None)
     else:
-        st.session_state["file_stem"] = "custom_process"
+        stem = Path(st.session_state.get("last_uploaded_filename") or "custom_process").stem
+        st.session_state["file_stem"] = re.sub(r"[^\w.\-]+", "_", stem, flags=re.U) or "custom_process"
+    st.session_state["chat_messages"] = []
+    st.session_state.pop("diagram_updated_by_assistant", None)
+
+
+def _read_txt_bytes(data: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "cp1251"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_docx_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        from docx import Document  # type: ignore[import-untyped]
+    except ImportError:
+        return None, "Для чтения .docx установите пакет: `pip install python-docx>=1.0.0`"
+    try:
+        doc = Document(io.BytesIO(data))
+        parts: List[str] = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        text = "\n".join(parts).strip()
+        if not text:
+            return None, "В файле .docx не найден текстовый слой (пустые абзацы и таблицы)."
+        return text, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Не удалось прочитать .docx: {type(exc).__name__}: {exc}"
+
+
+def _read_pdf_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None, "Для чтения .pdf установите пакет: `pip install pypdf>=4.0.0`"
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for page in reader.pages:
+            extracted = page.extract_text() or ""
+            if extracted.strip():
+                pages.append(extracted)
+        text = "\n".join(pages).strip()
+        if not text:
+            return None, "В PDF нет текстового слоя (возможно, скан без OCR)."
+        return text, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Не удалось прочитать .pdf: {type(exc).__name__}: {exc}"
+
+
+def extract_regulation_from_upload(uploaded: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Безопасный разбор .txt / .docx / .pdf → сырой текст или сообщение об ошибке."""
+    try:
+        data = uploaded.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Не удалось прочитать файл: {exc}"
+    name = (getattr(uploaded, "name", "") or "").lower()
+    if name.endswith(".txt"):
+        try:
+            return _read_txt_bytes(data), None
+        except Exception as exc:  # noqa: BLE001
+            return None, f"Не удалось прочитать .txt: {exc}"
+    if name.endswith(".docx"):
+        return _read_docx_bytes(data)
+    if name.endswith(".pdf"):
+        return _read_pdf_bytes(data)
+    return None, "Поддерживаются только файлы .txt, .docx и .pdf."
+
+
+def apply_uploaded_regulation(uploaded: Any) -> None:
+    """State Guard: файл обрабатывается один раз, пока не сменится имя."""
+    if uploaded is None:
+        return
+    name = getattr(uploaded, "name", None)
+    if not name or name == st.session_state.get("last_uploaded_filename"):
+        return
+    raw, err = extract_regulation_from_upload(uploaded)
+    if err:
+        st.warning(err)
+        st.session_state["last_uploaded_filename"] = name  # не крутить предупреждение на каждом rerun
+        return
+    try:
+        text = normalize_regulation(raw or "")
+    except Exception:  # noqa: BLE001 — даже «грязный» текст должен попасть в поле
+        text = (raw or "").strip()
+    if not text.strip():
+        st.warning("После очистки файл оказался пустым — проверьте содержимое.")
+        return
+    stem = re.sub(r"[^\w.\-]+", "_", Path(name).stem, flags=re.U) or "custom_process"
+    st.session_state["reg_text"] = text
+    st.session_state["last_uploaded_filename"] = name
+    st.session_state["file_stem"] = stem
+    st.session_state["example_choice"] = CUSTOM_LABEL
+    st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
     st.session_state.pop("diagram_updated_by_assistant", None)
 
 
 def render_downloads(key: str) -> None:
-    """Скачивание результата: BPMN 2.0 (.bpmn) и векторная диаграмма (.svg) — рядом."""
+    """Скачивание: BPMN 2.0, SVG-картинка и Паспорт процесса (.md) — три равные колонки."""
     result = st.session_state.get("result")
     ok = bool(result and not result["error"])
     stem = st.session_state.get("file_stem", "process")
-    col_bpmn, col_svg = st.columns(2, gap="small")
+    passport = ""
+    if ok:
+        try:
+            passport = generate_process_passport(
+                result.get("xml") or "",
+                result.get("audit") or {},
+                st.session_state.get("reg_text") or "",
+            )
+        except Exception:  # noqa: BLE001 — кнопка просто недоступна, UI не падает
+            passport = ""
+    col_bpmn, col_svg, col_pass = st.columns(3, gap="small")
     with col_bpmn:
         st.download_button(
             "⬇️  Скачать .bpmn",
@@ -624,12 +744,35 @@ def render_downloads(key: str) -> None:
                 components.html(page, height=48, scrolling=False)
         else:
             st.button("⬇️  Скачать .svg", disabled=True, key=f"dl_svg_{key}")
+    with col_pass:
+        st.download_button(
+            "⬇️  Скачать Паспорт (.md)",
+            data=passport or "",
+            file_name=f"{stem}_passport.md",
+            mime="text/markdown",
+            disabled=not (ok and bool(passport)),
+            key=f"dl_passport_{key}",
+        )
 
 
 def render_input_panel(labels: List[str], compact: bool = False, show_downloads: bool = True) -> None:
     """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
     box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
     with box_left:
+        uploaded = st.file_uploader(
+            "Загрузить регламент (.docx, .pdf, .txt)",
+            type=["docx", "pdf", "txt"],
+            key="reg_upload",
+            help="Файл обрабатывается один раз: повторный прогон страницы не затирает правки в поле текста.",
+        )
+        apply_uploaded_regulation(uploaded)
+        badge = st.session_state.get("upload_badge") or {}
+        if badge.get("name"):
+            chars = f"{int(badge.get('chars') or 0):,}".replace(",", " ")
+            st.markdown(
+                f'<div class="file-badge">📄 <b>{esc(badge["name"])}</b> · распознано {chars} символов</div>',
+                unsafe_allow_html=True,
+            )
         st.selectbox(
             "Готовый отраслевой регламент",
             [*labels, CUSTOM_LABEL],
@@ -640,7 +783,7 @@ def render_input_panel(labels: List[str], compact: bool = False, show_downloads:
         st.text_area(
             "Текст регламента (шаги нумеруются; условия — «Если … — перейти к п.N, иначе …»)",
             key="reg_text",
-            height=260 if compact else 400,
+            height=220 if compact else 360,
         )
     with box_right:
         use_llm = st.checkbox(

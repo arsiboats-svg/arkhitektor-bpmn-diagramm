@@ -12,6 +12,8 @@
 Публичный API:
     generate_bpmn_from_text(regulation_text) -> (bpmn_xml, audit_data, error)
     execute_generated_code(code_str)         -> (bpmn_xml, audit_data, error)
+    assistant_chat(...)                      -> диалог (аналитика / правка / реверс)
+    generate_process_passport(xml, audit, text) -> Markdown «Паспорт процесса»
     PROMPT_TEMPLATE / build_prompt(text)
 
 Модуль не падает при недоступности моделей: при любом сбое сети, таймауте или
@@ -2159,3 +2161,280 @@ def assistant_chat(
         return body + _source_note(None, trace), None, None, None
     except Exception as exc:  # noqa: BLE001 — диалог не должен ронять приложение
         return f"Не удалось обработать запрос: {type(exc).__name__}: {exc}. Процесс оставлен без изменений.", None, None, None
+
+
+# --------------------------- Паспорт процесса (обратная выгрузка) --------------------------- #
+def _md_cell(value: Any) -> str:
+    text = "—" if value is None or value == "" else str(value)
+    return text.replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
+def _md_join(items: Any) -> str:
+    if not items:
+        return "—"
+    if isinstance(items, str):
+        return _md_cell(items)
+    names: List[str] = []
+    for it in items:
+        if isinstance(it, dict):
+            name = str(it.get("name") or "").strip()
+            if name:
+                names.append(name)
+        else:
+            s = str(it).strip()
+            if s:
+                names.append(s)
+    return _md_cell(", ".join(dict.fromkeys(names))) if names else "—"
+
+
+def _step_transitions(step: Step) -> str:
+    parts: List[str] = []
+    if step.parallel:
+        parts.append("параллельно с предыдущим шагом")
+    d = step.decision
+    if d is None:
+        return "; ".join(parts) if parts else "—"
+    if d.yes_end:
+        parts.append(f"«{d.yes_label}» → завершение")
+    elif d.yes_ref:
+        parts.append(f"«{d.yes_label}» → п.{d.yes_ref}")
+    else:
+        parts.append(f"«{d.yes_label}» → далее")
+    if d.has_else or d.no_ref or d.no_end or d.no_back:
+        if d.no_end:
+            parts.append(f"«{d.no_label}» → завершение")
+        elif d.no_ref:
+            dest = f"п.{d.no_ref}"
+            if d.no_back:
+                dest += " (возврат)"
+            parts.append(f"«{d.no_label}» → {dest}")
+        else:
+            parts.append(f"«{d.no_label}»")
+    return "; ".join(parts) if parts else "—"
+
+
+def _process_owner(regulation_text: str, parsed: ParsedRegulation, audit: Dict[str, Any]) -> str:
+    m = re.search(r"владелец(?:\s+процесса)?\s*[:—–-]\s*(.+)$", regulation_text or "", re.I | re.M)
+    if m:
+        return m.group(1).strip().rstrip(".") or "—"
+    top = str((audit.get("bus_factor") or {}).get("top_role") or "").strip()
+    if top:
+        return top
+    if parsed.roles:
+        return parsed.roles[0]
+    lanes = audit.get("lane_load") or []
+    if lanes:
+        return str(lanes[0].get("role") or "—")
+    return "—"
+
+
+def generate_process_passport(xml_str: str, audit_data: dict, regulation_text: str) -> str:
+    """Официальный Markdown: паспорт процесса, RACI, операционный регламент, ИТ-ландшафт, риски.
+
+    Все поля аудита читаются через .get() с значениями по умолчанию — KeyError исключён.
+    """
+    audit = audit_data if isinstance(audit_data, dict) else {}
+    text = regulation_text or ""
+    try:
+        parsed = parse_regulation(normalize_regulation(text)) if text.strip() else ParsedRegulation(
+            title="Бизнес-процесс", sla_hours=None
+        )
+    except Exception:  # noqa: BLE001
+        parsed = ParsedRegulation(title="Бизнес-процесс", sla_hours=None)
+
+    sla = audit.get("sla") or {}
+    stats = audit.get("stats") or {}
+    bus = audit.get("bus_factor") or {}
+    load = audit.get("lane_load") or []
+    path = audit.get("critical_path") or []
+    loops = audit.get("rework_loops") or []
+    recs = audit.get("recommendations") or []
+    systems = audit.get("it_systems") or parsed.it_systems
+    artifacts = audit.get("artifacts") or parsed.artifacts
+    threshold = float(bus.get("threshold") or 0.45)
+    target = sla.get("target_hours")
+    if target is None:
+        target = parsed.sla_hours
+    owner = _process_owner(text, parsed, audit)
+    title = parsed.title or "Бизнес-процесс по регламенту"
+    nodes = stats.get("nodes") if stats.get("nodes") is not None else "—"
+    subs = stats.get("subprocesses") if stats.get("subprocesses") is not None else "—"
+    roles_n = stats.get("lanes") if stats.get("lanes") is not None else (len(parsed.roles) or "—")
+
+    lines: List[str] = [
+        "# Паспорт процесса и операционный регламент ПАО «Интер РАО»",
+        "",
+        "*Документ сформирован автоматически модулем «Архитектор BPMN-диаграмм». "
+        "Подлежит согласованию Дирекцией бизнес-архитектуры.*",
+        "",
+        "## 1. Паспорт процесса",
+        "",
+        f"| Параметр | Значение |",
+        f"| --- | --- |",
+        f"| Наименование | {_md_cell(title)} |",
+        f"| Целевой SLA | {_md_cell(_fh(float(target)) if target else 'не задан')} |",
+        f"| Владелец процесса | {_md_cell(owner)} |",
+        f"| Число узлов диаграммы | {_md_cell(nodes)} |",
+        f"| Подпроцессов | {_md_cell(subs)} |",
+        f"| Ролей (дорожек) | {_md_cell(roles_n)} |",
+        f"| Рабочих шагов | {_md_cell(stats.get('work_items') if stats.get('work_items') is not None else len(parsed.steps))} |",
+        "",
+        "## 2. Матрица ролей и ответственности (RACI)",
+        "",
+        "| Роль | Количество задач | Доля нагрузки, % | Статус bus-factor |",
+        "| --- | ---: | ---: | --- |",
+    ]
+    if load:
+        for item in sorted(load, key=lambda it: -float((it or {}).get("share") or 0)):
+            role = (item or {}).get("role") or "—"
+            tasks = (item or {}).get("tasks") or 0
+            share = float((item or {}).get("share") or 0)
+            status = "риск bus-factor" if share > threshold else "норма"
+            if role == (bus.get("top_role") or "") and str(bus.get("status") or "") == "risk":
+                status = "риск bus-factor (ключевой исполнитель)"
+            lines.append(f"| {_md_cell(role)} | {int(tasks)} | {share * 100:.0f} | {status} |")
+    elif parsed.roles:
+        n = len(parsed.steps) or 1
+        counts: Dict[str, int] = {}
+        for st in parsed.steps:
+            counts[st.role] = counts.get(st.role, 0) + 1
+        for role, cnt in sorted(counts.items(), key=lambda kv: -kv[1]):
+            share = cnt / n
+            status = "риск bus-factor" if share > threshold else "норма"
+            lines.append(f"| {_md_cell(role)} | {cnt} | {share * 100:.0f} | {status} |")
+    else:
+        lines.append("| — | 0 | 0 | данных нет |")
+    lines += [
+        "",
+        f"_Порог bus-factor: {threshold:.0%}. Роль выше порога — процесс зависит от одного подразделения._",
+        "",
+        "## 3. Пошаговый операционный регламент",
+        "",
+        "| № | Роль-исполнитель | Наименование действия | Нормативный срок | Входные документы / артефакты | Используемые ИТ-системы | Условия переходов |",
+        "| ---: | --- | --- | --- | --- | --- | --- |",
+    ]
+    if parsed.steps:
+        for st in parsed.steps:
+            dur = _fh(float(st.hours)) if st.hours else "—"
+            name = st.title or "(шлюз решения)"
+            if st.stage:
+                name = f"{name} (этап «{st.stage}»)"
+            lines.append(
+                f"| {st.num} | {_md_cell(st.role)} | {_md_cell(name)} | {_md_cell(dur)} | "
+                f"{_md_join(st.artifacts)} | {_md_join(st.systems)} | {_md_cell(_step_transitions(st))} |"
+            )
+    elif xml_str:
+        try:
+            struct = parse_bpmn_structure(xml_str)
+            work = sorted(
+                (n for n in (struct.get("nodes") or {}).values()
+                 if n.get("type") in _TASK_TAGS or n.get("type") == "subProcess"),
+                key=lambda n: (float(n.get("x") or 0), float(n.get("y") or 0)),
+            )
+            if work:
+                for i, n in enumerate(work, 1):
+                    lines.append(
+                        f"| {i} | {_md_cell(n.get('lane'))} | {_md_cell(n.get('name'))} | — | — | — | — |"
+                    )
+            else:
+                lines.append("| — | — | Шаги не распознаны | — | — | — | — |")
+        except Exception:  # noqa: BLE001
+            lines.append("| — | — | Шаги не распознаны | — | — | — | — |")
+    else:
+        lines.append("| — | — | Шаги не распознаны | — | — | — | — |")
+
+    lines += [
+        "",
+        "## 4. ИТ-ландшафт и документооборот",
+        "",
+        "### 4.1. Реестр ИТ-систем",
+        "",
+        "| Система | Упоминаний | Шаги | Роли |",
+        "| --- | ---: | --- | --- |",
+    ]
+    if systems:
+        for it in systems:
+            item = it if isinstance(it, dict) else {"name": it}
+            steps = item.get("steps") or []
+            roles = item.get("roles") or []
+            lines.append(
+                f"| {_md_cell(item.get('name'))} | {int(item.get('mentions') or 0)} | "
+                f"{_md_cell(', '.join(str(s) for s in steps) if steps else '—')} | {_md_join(roles)} |"
+            )
+    else:
+        lines.append("| — | 0 | — | системы в регламенте не обнаружены |")
+
+    lines += [
+        "",
+        "### 4.2. Реестр документов и артефактов",
+        "",
+        "| Документ | Упоминаний | Шаги | Роли |",
+        "| --- | ---: | --- | --- |",
+    ]
+    if artifacts:
+        for it in artifacts:
+            item = it if isinstance(it, dict) else {"name": it}
+            steps = item.get("steps") or []
+            roles = item.get("roles") or []
+            lines.append(
+                f"| {_md_cell(item.get('name'))} | {int(item.get('mentions') or 0)} | "
+                f"{_md_cell(', '.join(str(s) for s in steps) if steps else '—')} | {_md_join(roles)} |"
+            )
+    else:
+        lines.append("| — | 0 | — | документы в регламенте не обнаружены |")
+
+    crit_h = sla.get("critical_path_hours")
+    rework_h = sla.get("rework_hours")
+    with_rw = sla.get("with_rework_hours")
+    breach = sla.get("breach")
+    path_txt = " → ".join(
+        f"«{(p or {}).get('name') or '—'}» ({_fh(float((p or {}).get('hours') or 0))})"
+        for p in path
+        if (p or {}).get("name")
+    ) or "не рассчитан"
+    lines += [
+        "",
+        "## 5. Карта рисков и рекомендации",
+        "",
+        "### 5.1. Критический путь (алгоритм Беллмана — Форда)",
+        "",
+        f"- Длительность критического пути: **{_md_cell(_fh(float(crit_h)) if crit_h is not None else '—')}**",
+        f"- Целевой SLA: **{_md_cell(_fh(float(target)) if target else 'не задан')}**",
+        f"- Срыв SLA: **{'да' if breach else 'нет'}**",
+        f"- Маршрут: {path_txt}",
+        "",
+        "### 5.2. Стоимость циклов возврата",
+        "",
+        f"- Худший одиночный возврат: **{_md_cell(_fh(float(rework_h)) if rework_h is not None else '0 мин')}**",
+        f"- Срок с учётом худшего возврата: **{_md_cell(_fh(float(with_rw)) if with_rw is not None else '—')}**",
+        f"- Сумма всех циклов (по одному разу): **{_md_cell(_fh(float(sla.get('rework_total_hours') or 0)))}**",
+        "",
+    ]
+    if loops:
+        lines += [
+            "| Цикл | Откуда | Куда | Стоимость, ч |",
+            "| --- | --- | --- | ---: |",
+        ]
+        for loop in loops:
+            item = loop or {}
+            hours = item.get("cycle_hours")
+            cost = f"{float(hours):.1f}" if hours is not None else "—"
+            lines.append(
+                f"| {_md_cell(item.get('label'))} | {_md_cell(item.get('from'))} | "
+                f"{_md_cell(item.get('to'))} | {cost} |"
+            )
+        lines.append("")
+    else:
+        lines.append("_Циклы возврата не обнаружены._")
+        lines.append("")
+
+    lines += ["### 5.3. Меры по оптимизации", ""]
+    if recs:
+        for rec in recs:
+            lines.append(f"- {_md_cell(rec)}")
+    else:
+        lines.append("- Существенных узких мест не выявлено: процесс сбалансирован по ролям.")
+    if xml_str:
+        lines += ["", f"_Исходная BPMN-модель: {len(xml_str)} символов XML._"]
+    lines.append("")
+    return "\n".join(lines)
