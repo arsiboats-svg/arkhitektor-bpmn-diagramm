@@ -337,8 +337,11 @@ def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
         ],
     }
     # Рассуждающие модели (gpt-oss на Groq): low — меньше «мыслей», быстрее и в пределах лимита токенов/мин.
-    if os.getenv(f"{prefix}_REASONING_EFFORT"):
-        payload["reasoning_effort"] = os.getenv(f"{prefix}_REASONING_EFFORT")
+    effort = os.getenv(f"{prefix}_REASONING_EFFORT", "")
+    if effort == "none" and "openrouter.ai" in base:
+        payload["reasoning"] = {"enabled": False}  # OpenRouter: без «размышлений» qwen3 отвечает в ~2 раза быстрее
+    elif effort:
+        payload["reasoning_effort"] = effort
     for attempt in range(2):
         try:
             data = _http_json(
