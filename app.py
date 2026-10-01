@@ -162,13 +162,25 @@ html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMarkdown
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
 }}
 .stApp {{ background: #F4F8FD; color: #0F172A; }}
-.block-container {{ padding-top: 0.85rem; max-width: 1500px; }}
-section[data-testid="stSidebar"] {{
+.block-container, [data-testid="stMainBlockContainer"] {{
+  padding-top: 0.85rem; max-width: 1500px; width: 100%;
+}}
+[data-testid="stMain"] {{ min-width: 0; }}
+/* Ширину 28rem только у открытого сайдбара: иначе transform не вынимает колонку из потока. */
+section[data-testid="stSidebar"][aria-expanded="true"] {{
   min-width: 28rem !important; width: 28rem !important; max-width: 32rem !important;
+}}
+section[data-testid="stSidebar"][aria-expanded="false"] {{
+  min-width: 0 !important; width: 0 !important; max-width: 0 !important;
 }}
 section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
 section[data-testid="stSidebar"] [data-testid="stChatMessage"] {{
   overflow-wrap: anywhere; word-break: break-word; white-space: normal;
+}}
+iframe[srcdoc],
+[data-testid="stIFrame"] iframe,
+[data-testid="stCustomComponentV1"] iframe {{
+  width: 100% !important; max-width: 100% !important;
 }}
 header[data-testid="stHeader"] {{ background: transparent; }}
 #MainMenu, footer {{ visibility: hidden; }}
@@ -431,8 +443,8 @@ def viewer_html(
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
-  html,body {{ margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
-  #wrap {{ position:relative; height:{height}px; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
+  html,body {{ margin:0; height:100%; width:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
+  #wrap {{ position:relative; width:100%; height:{height}px; box-sizing:border-box; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
       background-color:#fff;
       background-image: radial-gradient(circle, #D0DCEB 1.5px, transparent 1.5px);
       background-size: 24px 24px; }}
@@ -648,6 +660,7 @@ def viewer_html(
     fit();
     requestAnimationFrame(fit);
     setTimeout(fit, 120);
+    setTimeout(fit, 340);
     setTimeout(focusStart, 380);
   }}
   {EMPHASIZE_JS}
@@ -898,7 +911,6 @@ def viewer_html(
   document.getElementById('zout').onclick = () => zoomBy(0.8);
   document.getElementById('fit').onclick = fit;
   document.getElementById('one').onclick = () => canvas().zoom(1, 'auto');
-  window.addEventListener('resize', fit);
 
   // ---------------- Панорама на весь экран ----------------
   // Приоритет: Fullscreen API. Если он недоступен/отклонён — гарантированный оверлей:
@@ -908,6 +920,38 @@ def viewer_html(
   const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
   const frameEl = (() => {{ try {{ return window.frameElement; }} catch (e) {{ return null; }} }})();
   const parentDoc = (() => {{ try {{ return window.parent.document; }} catch (e) {{ return null; }} }})();
+
+  (function watchLayout() {{
+    let timer = 0;
+    const kick = () => {{
+      clearTimeout(timer);
+      timer = setTimeout(() => {{ fitSoon(); }}, 40);
+    }};
+    window.addEventListener('resize', kick);
+    try {{
+      if (window.ResizeObserver) {{
+        const ro = new ResizeObserver(kick);
+        ro.observe(wrap);
+        if (document.documentElement) ro.observe(document.documentElement);
+      }}
+    }} catch (e) {{}}
+    try {{
+      if (!parentDoc || !window.MutationObserver) return;
+      const side = parentDoc.querySelector('[data-testid="stSidebar"]');
+      if (side) {{
+        new MutationObserver(kick).observe(side, {{
+          attributes: true,
+          attributeFilter: ['aria-expanded', 'style', 'class'],
+        }});
+      }}
+      parentDoc.addEventListener('click', ev => {{
+        const hit = ev.target && ev.target.closest && ev.target.closest(
+          '[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapseButton"]'
+        );
+        if (hit) kick();
+      }}, true);
+    }} catch (e) {{}}
+  }})();
 
   function setPanoUi(on) {{
     wrap.classList.toggle('pano', on);
@@ -2142,7 +2186,7 @@ def render_diagram(canvas_height: int) -> None:
             catalog_tobe=catalog_tb,
         )
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
-            st.iframe(page, height=canvas_height + 16)
+            st.iframe(page, width="stretch", height=canvas_height + 16)
         else:
             components.html(page, height=canvas_height + 16, scrolling=False)
     render_downloads("under_canvas")
@@ -2214,7 +2258,7 @@ def main() -> None:
         page_title="Архитектор BPMN — Интер РАО",
         page_icon="⚡",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
     st.markdown(CSS, unsafe_allow_html=True)
     render_assistant()
