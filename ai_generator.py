@@ -1973,7 +1973,7 @@ CHAT_SYSTEM = """Ты — «AI-Ассистент Бизнес-Архитект�
 Правила:
 - Отвечай по-русски, не более 10 строк. Сначала вывод с цифрой из блока ФАКТЫ, затем шаги и роли, в конце одна команда в «ёлочках», если уместна правка.
 - Часы, проценты и число циклов бери ТОЛЬКО из ФАКТОВ. Не выдумывай числа.
-- На SLA / As-Is/To-Be / циклы / bus-factor: если путь с возвратами стал короче, не пиши «Без ускорения». Рост голого критического пути — цена входного контроля.
+- На SLA / As-Is/To-Be / циклы / bus-factor: цифры только из ФАКТОВ. «Без ускорения» — только если не укоротились ни голый путь, ни путь с возвратами.
 - На «сравни as-is / to-be»: путь с возвратами, циклы N → M, голый КП.
 - Предлог «со» перед творительным на с, з, ж, ш, щ («со службой экологии», не «с службой»).
 - Не начинай с заглушки «N шагов / M узлов». Если данных нет — так и скажи.
@@ -2094,7 +2094,8 @@ def process_facts(audit: Optional[Dict[str, Any]] = None, tobe_delta: Optional[d
     loops_after = int(la) if la is not None else (0 if tobe_ready else None)
 
     rw_saved = round(rw_before - float(rw_after or 0), 1) if tobe_ready else 0.0
-    speedup = bool(tobe_ready and (loops_before - int(loops_after or 0)) > 0 and rw_saved > 0)
+    cp_ok = cp_after is None or float(cp_after) <= float(cp_before) + 0.05
+    speedup = bool(tobe_ready and rw_saved > 0 and cp_ok)
     return {
         "critical_path_hours": round(cp, 1),
         "with_rework_hours": round(rw, 1),
@@ -2288,7 +2289,9 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
             f"  quality_score_to_be: {ctx.get('quality_score_to_be')}",
         ]
         if facts.get("speedup_via_rework"):
-            lines.append("  НЕ говорить «Без ускорения»: путь с возвратами короче, рост голого КП — цена входного контроля.")
+            lines.append("  НЕ говорить «Без ускорения»: путь с возвратами короче, голый КП не длиннее As-Is.")
+        elif facts.get("cp_grew"):
+            lines.append("  Голый КП вырос — не выдавай это за оптимум To-Be.")
         for act in (ctx.get("tobe_actions") or [])[:6]:
             lines.append(f"  действие To-Be [{act.get('kind')}]: {act.get('detail')}")
         lines.append(f"  rework_hours_as_is: {ctx.get('rework_hours_as_is')}")
@@ -2490,14 +2493,12 @@ def _analysis_tobe(ctx: Dict[str, Any]) -> str:
     else:
         out.append(f"**To-Be: путь с возвратами {_fh(rw_b)} → {_fh(rw_a)}, циклы {rb} → {ra}.**")
     if f.get("cp_grew"):
-        out.append(
-            f"Голый критический путь {_fh(cp_b)} → {_fh(cp_a)} — цена входного контроля, не отказ от ускорения."
-        )
+        out.append(f"Голый критический путь {_fh(cp_b)} → {_fh(cp_a)} — не оптимален, если есть кандидат без удлинения.")
     else:
         out.append(f"Голый критический путь: {_fh(cp_b)} → {_fh(cp_a)}.")
     kinds = {str(a.get("kind")) for a in (ctx.get("tobe_actions") or [])}
     if "zero_rework" in kinds:
-        out.append("Zero-Rework: входной контроль вместо петель «вернуть на п.N».")
+        out.append("Zero-Rework: циклы заменены эскалацией на исключительной ветке, не на счастливом пути.")
     if "parallel" in kinds:
         out.append("Параллель: независимые роли идут одновременно, если нет стоп-листа охраны труда.")
     if "automation" in kinds:
@@ -2651,8 +2652,7 @@ def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
     f = ctx.get("facts") or {}
     if f.get("cp_grew"):
         out.append(
-            f"   Голый путь {_fh(float(f.get('cp_before') or 0))} → {_fh(float(f.get('cp_after') or 0))} "
-            "— цена входного контроля."
+            f"   Голый путь {_fh(float(f.get('cp_before') or 0))} → {_fh(float(f.get('cp_after') or 0))}."
         )
     loops = sorted(ctx.get("rework_loops") or [], key=lambda x: -float((x or {}).get("cycle_hours") or 0))
     for item in loops[:3]:
@@ -4049,8 +4049,7 @@ def _copilot_tobe(ctx: Dict[str, Any]) -> str:
         f"**Экономия пути с возвратами: {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))} "
         f"(−{int(f.get('rw_saved_pct') or 0)}%).**",
         f"Циклы {rb} → {ra}.",
-        f"Голый путь {_fh(float(f['cp_before']))} → {_fh(float(f['cp_after']))}"
-        + (" — цена входного контроля." if f.get("cp_grew") else "."),
+        f"Голый путь {_fh(float(f['cp_before']))} → {_fh(float(f['cp_after']))}.",
     ]
     heavy = (f.get("critical_path") or ctx.get("critical_path") or [])[:1]
     if heavy:
@@ -4168,9 +4167,22 @@ _JOURNAL_RE = re.compile(
 )
 _CONTROL_HINT_RE = re.compile(r"входн\w+\s+контрол|комплектност\w+\s+документ", re.I)
 _OT_STOP_RE = re.compile(
-    r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+    r"допуск|наряд[\s-]*допуск|инструктаж|"
+    r"проверк\w+\s+отсутств\w+\s+напряжен|"
+    r"установ\w+\s+заземлен|налож\w+\s+заземлен|включ\w+\s+заземляющ|"
+    r"(?<!зон[ауиеы]\s)отключен|"
+    r"разрешен|согласован|утвержден",
     re.I,
 )
+_PPE_PREPARE_RE = re.compile(
+    r"(?:подготов|готов\w*).{0,80}(?:сиз|инструмент|переносн\w+\s+заземлен)",
+    re.I,
+)
+_INSTALL_GROUND_RE = re.compile(
+    r"установ\w+\s+заземлен|налож\w+\s+заземлен|включ\w+\s+заземляющ",
+    re.I,
+)
+_TOBE_MINUTE = 1.0 / 60.0
 _REPAIR_WORK_RE = re.compile(
     r"аварийн\w+\s+ремонт|выполн\w+\s+.{0,40}ремонт|ремонт\s+оборудован|"
     r"строительно-монтаж|производств\w+\s+работ|выполн\w+\s+работ",
@@ -4186,11 +4198,14 @@ _CAUSAL_RE = re.compile(
 TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
 Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
 1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
-   СТОП-ЛИСТ охраны труда — НЕ ставь «Параллельно:», если шаг содержит:
-   допуск, наряд-допуск, инструктаж, проверк, заземлен, отключен, разрешен, согласован, утвержден.
+   СТОП-ЛИСТ охраны труда — НЕ ставь «Параллельно:», если шаг — допуск, наряд-допуск, целевой инструктаж,
+   отключение, проверка отсутствия напряжения, УСТАНОВКА заземлений (установить/наложить, ножи).
+   Подготовка СИЗ, инструмента и переносных заземлений («подготовить … заземления») — НЕ стоп-лист, её можно
+   параллелить с оперативными переключениями диспетчера.
    Фактический ремонт / выполнение работ — СТРОГО ПОСЛЕ допуска и инструктажа, никогда параллельно с ними.
-2) Zero-Rework: перед шлюзами согласования добавь шаг «Роль проводит предварительный входной контроль … перед шагом N»;
-   формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
+2) Zero-Rework: цикл замени эскалацией на ИСКЛЮЧИТЕЛЬНОЙ ветке, не на счастливом пути.
+   Входной контроль — параллельно независимому шагу ИЛИ не длиннее 5 минут (не 15 минут на критическом пути).
+   Формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
    Не начинай шаг с существительного («Входной контроль…») — только роль + глагол.
 3) Автоматизация: фиксацию в журналах пиши БЕЗ двоеточия после системы:
    «Информационная система автоматически регистрирует … (5 минут)».
@@ -4325,9 +4340,19 @@ def _ot_blob(step: Step, body: str = "") -> str:
     return f"{step.title or ''} {body or ''}"
 
 
+def _is_prepare_ppe_ground(blob: str) -> bool:
+    """«Готовит СИЗ, инструмент и переносные заземления» — подготовка, не установка заземлений."""
+    return bool(_PPE_PREPARE_RE.search(blob or "")) and not _INSTALL_GROUND_RE.search(blob or "")
+
+
 def _ot_sensitive(step: Step, body: str = "") -> bool:
-    """Стоп-лист охраны труда: допуск, инструктаж, заземление, отключения не распараллеливаются."""
-    return bool(_OT_STOP_RE.search(_ot_blob(step, body)))
+    """Стоп-лист ОТ. Существительное «заземления» в шаге «подготовить» стоп-лист не включает."""
+    blob = _ot_blob(step, body)
+    if _is_prepare_ppe_ground(blob):
+        return False
+    if _INSTALL_GROUND_RE.search(blob):
+        return True
+    return bool(_OT_STOP_RE.search(blob))
 
 
 def _is_repair_work(step: Step, body: str = "") -> bool:
@@ -4335,12 +4360,25 @@ def _is_repair_work(step: Step, body: str = "") -> bool:
 
 
 def _forbid_parallel(a: Step, b: Step, body_a: str = "", body_b: str = "") -> bool:
-    """AND запрещён, если шаг из стоп-листа ОТ либо ремонт идёт параллельно допуску/инструктажу."""
-    if _ot_sensitive(a, body_a) or _ot_sensitive(b, body_b):
-        return True
+    """AND запрещён между шагами стоп-листа ОТ; ремонт не параллелен допуску/инструктажу.
+
+    Подготовка СИЗ/инструмента/переносных заземлений может идти параллельно переключениям диспетчера.
+    """
+    a_ppe = _is_prepare_ppe_ground(_ot_blob(a, body_a))
+    b_ppe = _is_prepare_ppe_ground(_ot_blob(b, body_b))
+    a_ot, b_ot = _ot_sensitive(a, body_a), _ot_sensitive(b, body_b)
     a_repair, b_repair = _is_repair_work(a, body_a), _is_repair_work(b, body_b)
-    a_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(a, body_a), re.I))
-    b_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(b, body_b), re.I))
+    a_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(a, body_a), re.I)) and not a_ppe
+    b_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(b, body_b), re.I)) and not b_ppe
+    if (a_ppe and (b_repair or b_permit)) or (b_ppe and (a_repair or a_permit)):
+        return True
+    if a_ppe or b_ppe:
+        return False
+    if a_ot and b_ot:
+        return True
+    if a_ot or b_ot:
+        if a_repair or b_repair or a_permit or b_permit:
+            return True
     if (a_repair and b_permit) or (b_repair and a_permit):
         return True
     return False
@@ -4385,7 +4423,110 @@ def _cut_rework_loop(body: str) -> str:
     )
 
 
-def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
+def _is_parallel_body(body: str) -> bool:
+    return bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", body or "", re.I))
+
+
+def _tobe_metrics(audit: Optional[dict], text: str) -> Dict[str, float]:
+    data = audit or {}
+    sla = data.get("sla") or {}
+    cp = float(sla.get("critical_path_hours") or 0)
+    rw = float(sla.get("with_rework_hours") or cp)
+    _, steps = _split_steps(normalize_regulation(text or ""))
+    return {
+        "cp": cp,
+        "rw": rw,
+        "loops": float(len(data.get("rework_loops") or [])),
+        "q": float(int((data.get("methodology") or {}).get("score") or 0)),
+        "n": float(len(steps)),
+    }
+
+
+def _ppe_parallel_preserved(asis_text: str, tobe_text: str) -> bool:
+    """Подготовка СИЗ/инструмента/переносных заземлений остаётся параллельной, как в As-Is."""
+    _, asis_s = _split_steps(normalize_regulation(asis_text or ""))
+    asis_ppe = [s["body"] for s in asis_s if _is_prepare_ppe_ground(s["body"])]
+    if not asis_ppe or not any(_is_parallel_body(b) for b in asis_ppe):
+        return True
+    _, tobe_s = _split_steps(normalize_regulation(tobe_text or ""))
+    tobe_ppe = [s["body"] for s in tobe_s if _is_prepare_ppe_ground(s["body"])]
+    return bool(tobe_ppe) and any(_is_parallel_body(b) for b in tobe_ppe)
+
+
+def _ot_order_ok(text: str) -> bool:
+    """Ремонт после допуска/инструктажа; установка заземлений и допуск не параллельны; СИЗ-подготовка может быть AND."""
+    raw = normalize_regulation(text or "")
+    try:
+        parsed = parse_regulation(raw)
+        _, steps = _split_steps(raw)
+    except Exception:  # noqa: BLE001
+        return False
+    n = min(len(parsed.steps), len(steps))
+    if n == 0:
+        return True
+    bodies = [steps[i]["body"] for i in range(n)]
+    idx_repair = next((i for i in range(n) if _is_repair_work(parsed.steps[i], bodies[i])), None)
+    idx_brief = next(
+        (i for i in range(n) if re.search(r"инструктаж", _ot_blob(parsed.steps[i], bodies[i]), re.I)),
+        None,
+    )
+    idx_permit = next(
+        (
+            i
+            for i in range(n)
+            if re.search(r"наряд[\s-]*допуск|\bдопуск", _ot_blob(parsed.steps[i], bodies[i]), re.I)
+            and not _is_prepare_ppe_ground(_ot_blob(parsed.steps[i], bodies[i]))
+        ),
+        None,
+    )
+    if idx_repair is not None:
+        if _is_parallel_body(bodies[idx_repair]):
+            return False
+        if idx_permit is not None and idx_repair < idx_permit:
+            return False
+        if idx_brief is not None and idx_repair < idx_brief:
+            return False
+    for i in range(n):
+        if not _is_parallel_body(bodies[i]):
+            continue
+        blob = _ot_blob(parsed.steps[i], bodies[i])
+        if _is_prepare_ppe_ground(blob):
+            if i and _forbid_parallel(parsed.steps[i - 1], parsed.steps[i], bodies[i - 1], bodies[i]):
+                return False
+            continue
+        if _ot_sensitive(parsed.steps[i], bodies[i]) or _is_repair_work(parsed.steps[i], bodies[i]):
+            return False
+        if i and _forbid_parallel(parsed.steps[i - 1], parsed.steps[i], bodies[i - 1], bodies[i]):
+            return False
+    return True
+
+
+def _tobe_feasible(asis: Dict[str, float], cand: Dict[str, float], asis_text: str, cand_text: str) -> bool:
+    """Жёсткие ограничения + лексикографические откаты (голый путь, возвраты, циклы, quality, ОТ)."""
+    if cand["cp"] > asis["cp"] + _TOBE_MINUTE:
+        return False
+    if asis["loops"] > 0 and cand["rw"] >= asis["rw"] - 1e-9:
+        return False
+    if cand["loops"] > asis["loops"]:
+        return False
+    if cand["q"] + 1e-9 < asis["q"]:
+        return False
+    if not _ot_order_ok(cand_text):
+        return False
+    if not _ppe_parallel_preserved(asis_text, cand_text):
+        return False
+    return True
+
+
+def _heuristic_optimize_to_be(
+    regulation_text: str,
+    *,
+    do_auto: bool = True,
+    do_parallel: bool = True,
+    do_safety: bool = True,
+    do_loops: bool = True,
+    do_control: bool = False,
+) -> Tuple[str, List[Dict[str, str]]]:
     raw_text = normalize_regulation(regulation_text or "")
     header, raw_steps = _split_steps(raw_text)
     try:
@@ -4395,91 +4536,126 @@ def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str,
     n = min(len(parsed.steps), len(raw_steps))
     if n < 2:
         return raw_text, []
+    if not (do_auto or do_parallel or do_safety or do_loops or do_control):
+        return raw_text, []
     actions: List[Dict[str, str]] = []
     bodies = [raw_steps[i]["body"] for i in range(n)]
     nums = [parsed.steps[i].num for i in range(n)]
 
-    for i in range(n):
-        body = bodies[i]
-        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
-            bodies[i] = _automate_journal_body(body)
-            actions.append(
-                {
-                    "kind": "automation",
-                    "detail": f"Шаг {nums[i]} «{parsed.steps[i].title or 'фиксация'}»: scriptTask, фиксация в журнале выполняется системой.",
-                }
-            )
+    if do_auto:
+        for i in range(n):
+            body = bodies[i]
+            if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+                bodies[i] = _automate_journal_body(body)
+                actions.append(
+                    {
+                        "kind": "automation",
+                        "detail": (
+                            f"Шаг {nums[i]} «{parsed.steps[i].title or 'фиксация'}»: "
+                            "scriptTask, фиксация в журнале выполняется системой."
+                        ),
+                    }
+                )
 
-    i = 0
-    while i < n - 1:
-        a, b = parsed.steps[i], parsed.steps[i + 1]
-        already = bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", bodies[i + 1], re.I))
-        if (
-            not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
-            and _independent_steps(a, b, bodies[i], bodies[i + 1])
-            and not already
-        ):
-            bodies[i + 1] = "Параллельно: " + bodies[i + 1]
-            b.parallel = True
-            actions.append(
-                {
-                    "kind": "parallel",
-                    "detail": f"Шаги {a.num} ({a.role}) и {b.num} ({b.role}) выполняются параллельно.",
-                }
-            )
-            i += 2
-            continue
-        i += 1
+    if do_parallel:
+        i = 0
+        while i < n - 1:
+            a, b = parsed.steps[i], parsed.steps[i + 1]
+            already = _is_parallel_body(bodies[i + 1])
+            if (
+                not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
+                and _independent_steps(a, b, bodies[i], bodies[i + 1])
+                and not already
+            ):
+                bodies[i + 1] = "Параллельно: " + bodies[i + 1]
+                b.parallel = True
+                actions.append(
+                    {
+                        "kind": "parallel",
+                        "detail": f"Шаги {a.num} ({a.role}) и {b.num} ({b.role}) выполняются параллельно.",
+                    }
+                )
+                i += 2
+                continue
+            i += 1
 
-    for i in range(n):
-        st = parsed.steps[i]
-        if not (_ot_sensitive(st, bodies[i]) or _is_repair_work(st, bodies[i])):
-            continue
-        stripped = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", bodies[i], flags=re.I)
-        if stripped != bodies[i]:
-            bodies[i] = stripped
-            st.parallel = False
-            actions.append(
-                {
-                    "kind": "safety_seq",
-                    "detail": (
-                        f"Шаг {nums[i]} «{st.title or 'работы'}» оставлен строго последовательным: "
-                        "допуск / инструктаж / заземление нельзя выполнять параллельно с ремонтом."
-                    ),
-                }
-            )
+    if do_safety:
+        for i in range(n):
+            st = parsed.steps[i]
+            if _is_prepare_ppe_ground(_ot_blob(st, bodies[i])):
+                continue
+            if not (_ot_sensitive(st, bodies[i]) or _is_repair_work(st, bodies[i])):
+                continue
+            stripped = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", bodies[i], flags=re.I)
+            if stripped != bodies[i]:
+                bodies[i] = stripped
+                st.parallel = False
+                actions.append(
+                    {
+                        "kind": "safety_seq",
+                        "detail": (
+                            f"Шаг {nums[i]} «{st.title or 'работы'}» оставлен строго последовательным: "
+                            "допуск / инструктаж / установка заземлений не параллельны ремонту."
+                        ),
+                    }
+                )
 
     control_at: Dict[int, str] = {}
-    for i in range(n):
-        st = parsed.steps[i]
-        d = st.decision
-        loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
-        if not loops:
-            continue
-        bodies[i] = _cut_rework_loop(bodies[i])
-        prev = bodies[i - 1] if i else ""
-        if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
+    if do_loops:
+        for i in range(n):
+            st = parsed.steps[i]
+            d = st.decision
+            loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
+            if not loops:
+                continue
+            bodies[i] = _cut_rework_loop(bodies[i])
+            prev = bodies[i - 1] if i else ""
+            if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
+                actions.append(
+                    {
+                        "kind": "zero_rework",
+                        "detail": f"Шаг {st.num}: петля возврата снята эскалацией, входной контроль уже есть.",
+                    }
+                )
+                continue
+            inserted = False
+            if do_control and i:
+                prev_st = parsed.steps[i - 1]
+                prev_role = prev_st.role or ""
+                ctrl_role = next(
+                    (s.role for s in parsed.steps if s.role and s.role not in {st.role, prev_role}),
+                    "",
+                )
+                ctrl_body = (
+                    f"Параллельно: {ctrl_role} проводит предварительный входной контроль "
+                    f"комплектности документов и исходных данных перед шагом {st.num} (5 минут)."
+                )
+                ctrl_step = Step(
+                    idx=-1,
+                    num=0,
+                    role=ctrl_role,
+                    title="проводит предварительный входной контроль комплектности документов",
+                    parallel=True,
+                    hours=5.0 / 60.0,
+                )
+                if (
+                    ctrl_role
+                    and not _forbid_parallel(prev_st, ctrl_step, bodies[i - 1], ctrl_body)
+                    and not _ot_sensitive(prev_st, bodies[i - 1])
+                    and not _is_repair_work(prev_st, bodies[i - 1])
+                ):
+                    control_at[i] = ctrl_body
+                    inserted = True
             actions.append(
                 {
                     "kind": "zero_rework",
-                    "detail": f"Шаг {st.num}: петля возврата снята, входной контроль уже есть.",
+                    "detail": (
+                        f"Шаг {st.num} «{st.title or 'согласование'}»: цикл заменён эскалацией "
+                        "на исключительной ветке"
+                        + (", входной контроль параллелен независимому шагу (5 минут)." if inserted else ".")
+                    ),
                 }
             )
-            continue
-        prev_role = parsed.steps[i - 1].role if i else ""
-        ctrl_role = prev_role if prev_role and prev_role != st.role else next(
-            (s.role for s in parsed.steps if s.role and s.role != st.role), st.role
-        )
-        control_at[i] = (
-            f"{ctrl_role} проводит предварительный входной контроль комплектности документов "
-            f"и исходных данных перед шагом {st.num} (15 минут)."
-        )
-        actions.append(
-            {
-                "kind": "zero_rework",
-                "detail": f"Перед шагом {st.num} «{st.title or 'согласование'}» введён входной контроль, цикл доработки заменён эскалацией.",
-            }
-        )
 
     assembled: List[Tuple[Optional[int], str]] = []
     for i in range(n):
@@ -4587,45 +4763,98 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
 
 
 def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
-    """Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация журналов.
+    """Реинжиниринг As-Is → To-Be: поиск оптимума с откатом ходов, нарушающих ОТ или удлиняющих голый путь.
 
-    По умолчанию — детерминированный семантический оптимизатор (~0.05 с).
-    Облачная LLM включается только переменной BPMN_TOBE_LLM=1.
+    Лексикография после жёстких ограничений: короче путь с возвратами, затем короче голый КП, затем меньше шагов.
+    Если ни один кандидат не принят — возвращается As-Is.
+    Облачная LLM включается только переменной BPMN_TOBE_LLM=1 и проходит ту же проверку.
     """
     text = (regulation_text or "").strip()
     empty = {
         "sla_before_hours": 0.0, "sla_after_hours": 0.0, "sla_saved_hours": 0.0, "sla_saved_pct": 0.0,
         "rework_before": 0, "rework_after": 0, "rework_removed": 0,
         "rework_hours_before": 0.0, "rework_hours_after": 0.0,
+        "with_rework_before": 0.0, "with_rework_after": 0.0,
         "quality_before": 0, "quality_after": 0, "quality_gain": 0,
         "breach_before": False, "breach_after": False, "actions": [], "engine": "semantic-optimizer",
         "tobe_xml": "", "tobe_audit": {}, "tobe_error": "",
     }
     if len(text) < 20:
         return text, empty
-    engine = "semantic-optimizer"
-    optimized = None
+
+    asis_audit = audit_data or {}
+    asis_m = _tobe_metrics(asis_audit, text)
+    flagsets: List[Dict[str, bool]] = [
+        {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": False},
+        {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": True},
+        {"do_auto": True, "do_parallel": False, "do_safety": True, "do_loops": True, "do_control": False},
+        {"do_auto": False, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": False},
+        {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": False, "do_control": False},
+        {"do_auto": True, "do_parallel": False, "do_safety": False, "do_loops": True, "do_control": False},
+        {"do_auto": False, "do_parallel": False, "do_safety": True, "do_loops": True, "do_control": False},
+    ]
+    seen: set = set()
+    best: Optional[Tuple[Tuple[float, float, float], str, List[Dict[str, str]], str, dict, str]] = None
+
+    def _consider(cand_text: str, cand_actions: List[Dict[str, str]], cand_engine: str) -> None:
+        nonlocal best
+        key = normalize_regulation(cand_text or "")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        try:
+            xml, new_audit, err = _rebuild_process(cand_text, f"to-be · {cand_engine}", [], use_llm=(cand_engine == "llm"))
+        except Exception as exc:  # noqa: BLE001
+            xml, new_audit, err = "", {}, f"{type(exc).__name__}: {exc}"
+        if err or not new_audit:
+            return
+        metrics = _tobe_metrics(new_audit, cand_text)
+        if not _tobe_feasible(asis_m, metrics, text, cand_text):
+            return
+        score = (metrics["rw"], metrics["cp"], metrics["n"])
+        pack = (score, cand_text, cand_actions or [], xml, new_audit, cand_engine)
+        if best is None or pack[0] < best[0]:
+            best = pack
+
     llm_text = None
     try:
-        llm_text = _try_llm_optimize_to_be(text, audit_data or {})
+        llm_text = _try_llm_optimize_to_be(text, asis_audit)
     except Exception:  # noqa: BLE001
         llm_text = None
     if llm_text:
-        optimized, engine = llm_text, "llm"
-        actions = _collect_tobe_actions(text, optimized)
-    else:
-        optimized, actions = _heuristic_optimize_to_be(text)
+        _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm")
+
+    for flags in flagsets:
+        opt_text, actions = _heuristic_optimize_to_be(text, **flags)
         if not actions:
-            actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
-    xml, new_audit, err = "", {}, ""
-    try:
-        xml, new_audit, err = _rebuild_process(optimized, f"to-be · {engine}", [], use_llm=(engine == "llm"))
-    except Exception as exc:  # noqa: BLE001
-        err = f"{type(exc).__name__}: {exc}"
-    delta = _tobe_delta(audit_data or {}, new_audit or {}, actions, engine)
+            continue
+        _consider(opt_text, actions, "semantic-optimizer")
+
+    engine = "semantic-optimizer"
+    if best is None:
+        optimized = text
+        actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+        xml, new_audit, err = "", asis_audit, ""
+        if asis_audit.get("sla"):
+            pass
+        else:
+            try:
+                xml, new_audit, err = _rebuild_process(text, "to-be · as-is", [], use_llm=False)
+            except Exception as exc:  # noqa: BLE001
+                err = f"{type(exc).__name__}: {exc}"
+        delta = _tobe_delta(asis_audit, new_audit or asis_audit, actions, engine)
+        delta["tobe_xml"] = xml or ""
+        delta["tobe_audit"] = new_audit or asis_audit
+        delta["tobe_error"] = err or ""
+        return optimized, delta
+
+    _score, optimized, actions, xml, new_audit, engine = best
+    if not actions:
+        actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+    delta = _tobe_delta(asis_audit, new_audit or {}, actions, engine)
     delta["tobe_xml"] = xml or ""
     delta["tobe_audit"] = new_audit or {}
-    delta["tobe_error"] = err or ""
+    delta["tobe_error"] = ""
     return optimized, delta
 
 

@@ -1788,7 +1788,8 @@ def render_tobe_tab() -> None:
     tobe_rw = float(delta.get("with_rework_after") or (tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
     rw_saved = asis_rw - tobe_rw
     minute = 1.0 / 60.0
-    if removed > 0 and rw_saved >= minute:
+    naked_ok = tobe_cp <= asis_cp + minute
+    if rw_saved >= minute and naked_ok:
         rw_pct = round(100.0 * rw_saved / asis_rw) if asis_rw else 0
         hours_txt = fmt_hours(rw_saved).replace(".", ",")
         eco_value = f"Экономия до {hours_txt} (−{rw_pct:.0f}%) за счёт устранения возвратов"

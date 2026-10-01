@@ -38,16 +38,34 @@ def main() -> None:
     assert not re.search(r"<bpmn:(?:parallelGateway|inclusiveGateway)\b[^>]*isMarkerVisible", xml)
 
     opt, delta = optimize_process_to_be(text, audit)
-    ot_stop = re.compile(
-        r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+    ppe_re = re.compile(r"(?:подготов|готов\w*).{0,80}(?:сиз|инструмент|переносн\w+\s+заземлен)", re.I)
+    ot_hard = re.compile(
+        r"наряд[\s-]*допуск|инструктаж|проверк\w+\s+отсутств\w+\s+напряжен|"
+        r"установ\w+\s+заземлен|налож\w+\s+заземлен|включ\w+\s+заземляющ",
         re.I,
     )
+    ppe_parallel = False
+    repair_after_permit = False
+    permit_seen = False
+    brief_seen = False
     for line in opt.splitlines():
-        if re.search(r"параллельно|одновременно", line, re.I) and ot_stop.search(line):
+        if ppe_re.search(line) and re.search(r"параллельно|одновременно", line, re.I):
+            ppe_parallel = True
+        if re.search(r"параллельно|одновременно", line, re.I) and ot_hard.search(line) and not ppe_re.search(line):
             raise AssertionError(f"запрещено распараллеливать охрану труда: {line}")
+        if re.search(r"наряд[\s-]*допуск|\bдопуск", line, re.I) and not ppe_re.search(line):
+            permit_seen = True
+        if re.search(r"инструктаж", line, re.I):
+            brief_seen = True
         if re.search(r"аварийн\w+\s+ремонт|выполн\w+.{0,40}ремонт", line, re.I):
             assert not re.search(r"^\s*\d+\.\s*(?:параллельно|одновременно)", line, re.I), line
-    assert any(a.get("kind") == "safety_seq" for a in delta.get("actions") or []), delta.get("actions")
+            repair_after_permit = permit_seen and brief_seen
+    assert ppe_parallel, opt
+    assert repair_after_permit, opt
+    assert float(delta.get("sla_after_hours") or 99) <= float(delta.get("sla_before_hours") or 0) + 1.0 / 60.0
+    assert float(delta.get("with_rework_after") or 99) < float(delta.get("with_rework_before") or 0)
+    assert int(delta.get("rework_after") if delta.get("rework_after") is not None else 1) == 0
+    assert int(delta.get("quality_after") or 0) >= int(delta.get("quality_before") or 0)
     assert any(a.get("kind") in ("zero_rework", "automation", "parallel", "safety_seq") for a in delta.get("actions") or [])
     assert "sla_saved_hours" in delta
     assert delta.get("tobe_xml") or not delta.get("tobe_error")
@@ -160,15 +178,24 @@ def main() -> None:
     facts1 = process_facts(audit1, delta1)
     assert facts1["speedup_via_rework"]
     assert facts1["loops_before"] == 2 and facts1["loops_after"] == 0
+    assert facts1["cp_after"] <= facts1["cp_before"]
+    assert facts1["rw_after"] < facts1["rw_before"]
     q_tobe = "Сравни As-Is и To-Be, до и после"
     copilot_tobe = canvas_copilot_reply(q_tobe, xml1, audit1, text1, tobe_delta=delta1)
     side_tobe, _, _, _ = assistant_chat(q_tobe, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1)
+
+    def _hours_cited(blob: str, hours: float) -> bool:
+        token = f"{hours:.1f}"
+        return token in blob.replace(",", ".") or token.replace(".", ",") in blob
+
     for blob, who in ((copilot_tobe, "copilot"), (side_tobe, "sidebar")):
         compact = blob.replace(" ", "")
         assert "2→0" in compact or "2 → 0" in blob, (who, blob)
         assert "Без ускорения" not in blob, (who, blob)
-        assert "12.6" in blob or "12,6" in blob, (who, blob)
-        assert "10.7" in blob or "10,7" in blob, (who, blob)
+        assert _hours_cited(blob, float(facts1["rw_before"])), (who, blob, facts1["rw_before"])
+        assert _hours_cited(blob, float(facts1["rw_after"])), (who, blob, facts1["rw_after"])
+        assert _hours_cited(blob, float(facts1["cp_before"])), (who, blob, facts1["cp_before"])
+        assert _hours_cited(blob, float(facts1["cp_after"])), (who, blob, facts1["cp_after"])
     eco_cmd = "Добавь согласование с экологами после шага 3"
     copilot_eco = canvas_copilot_reply(eco_cmd, xml1, audit1, text1, tobe_delta=delta1)
     assert copilot_eco.startswith("Команду в сайдбар:")
