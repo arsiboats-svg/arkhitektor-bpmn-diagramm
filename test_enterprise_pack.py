@@ -82,6 +82,26 @@ def main() -> None:
     ppe = next(s for s in parsed.steps if s.num == 12)
     assert ppe.title == "Подготовить СИЗ, инструмент и переносные заземления"
     assert ppe.role == "Ремонтная бригада"
+
+    import app as bpmn_app
+
+    opened = bpmn_app.prepare_regulation(text, use_llm=False)
+    opened_facts = opened["facts"]
+    assert not opened["error"], opened["error"]
+    assert opened_facts["cp_before"] == 9.7
+    assert opened_facts["rw_before"] == 12.6
+    assert opened_facts["cp_after"] <= 9.6
+    assert opened_facts["rw_after"] <= 9.6
+    assert opened_facts["loops_before"] == 2 and opened_facts["loops_after"] == 0
+    assert opened_facts["quality_before"] == 100 and opened_facts["quality_after"] == 100
+    headline = bpmn_app.tobe_card_headline(opened_facts)
+    assert headline == "Экономия пути с возвратами: 12.6 ч → 9.6 ч (−24%)", headline
+    assert "Без ускорения" not in headline
+    assert "узких мест" not in " ".join(str(a.get("detail") or "") for a in opened["delta"].get("actions") or [])
+    assert opened["tobe_ok"] and opened_facts.get("show_steps")
+    opened_ppe = next(s for s in parse_regulation(opened["asis_text"]).steps if s.num == 12)
+    assert opened_ppe.title == ppe.title and opened_ppe.role == "Ремонтная бригада"
+
     matrix = generate_raci_matrix(parsed.steps, parsed.roles)
     assert matrix, "пустая матрица RACI"
     assert all(any("A" in (row["assignments"].get(r) or []) for r in parsed.roles) for row in matrix)

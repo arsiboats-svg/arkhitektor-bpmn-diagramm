@@ -34,6 +34,7 @@ from ai_generator import (
     optimize_process_to_be,
     parse_bpmn_structure,
     parse_regulation,
+    process_facts,
 )
 
 
@@ -1540,25 +1541,144 @@ def render_details(audit: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # Приложение
 # --------------------------------------------------------------------------- #
+def _tobe_accepted(facts: Dict[str, Any]) -> bool:
+    """Кандидат длиннее голого As-Is или с живыми циклами на вкладку не попадает."""
+    if not facts.get("tobe_ready"):
+        return False
+    cp_before = float(facts.get("cp_before") or 0)
+    cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
+    if cp_after > cp_before + 1.0 / 60.0:
+        return False
+    loops_before = int(facts.get("loops_before") or 0)
+    loops_after = int(facts.get("loops_after") or 0)
+    if loops_after > loops_before:
+        return False
+    if loops_before > 0 and loops_after > 0:
+        return False
+    return True
+
+
+def tobe_card_headline(facts: Dict[str, Any]) -> str:
+    """Подпись карточки экономии. «Без ускорения» не используется, когда путь с возвратами короче."""
+    if not facts.get("speedup_via_rework"):
+        return ""
+    rw_before = float(facts.get("rw_before") or 0)
+    rw_after = float(facts.get("rw_after") or 0)
+    pct = int(facts.get("rw_saved_pct") or 0)
+    return f"Экономия пути с возвратами: {fmt_hours(rw_before)} → {fmt_hours(rw_after)} (−{pct}%)"
+
+
+def _annotate_tobe_facts(
+    facts: Dict[str, Any],
+    asis_audit: Dict[str, Any],
+    tobe_audit: Dict[str, Any],
+    *,
+    show_steps: bool,
+) -> Dict[str, Any]:
+    view = dict(facts)
+    view["path_n_before"] = len(_path_tasks_only(asis_audit.get("critical_path")))
+    view["show_steps"] = bool(show_steps and tobe_audit.get("critical_path"))
+    if view["show_steps"]:
+        later = process_facts(tobe_audit, None)
+        view["path_n_after"] = len(_path_tasks_only(tobe_audit.get("critical_path")))
+        view["bus_share_after"] = later.get("bus_share") or 0
+        view["bus_role_after"] = later.get("bus_role") or ""
+        view["bus_status_after"] = later.get("bus_status") or ""
+    else:
+        view["path_n_after"] = view["path_n_before"]
+        view["bus_share_after"] = view.get("bus_share") or 0
+        view["bus_role_after"] = view.get("bus_role") or ""
+        view["bus_status_after"] = view.get("bus_status") or ""
+    return view
+
+
+def prepare_regulation(
+    text: str,
+    use_llm: bool = False,
+    previous: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Общий вход кнопки «Сгенерировать», быстрого старта первого примера и тестов.
+
+    As-Is и To-Be считаются одним проходом. Кандидат, который длиннее голого пути
+    или не снял циклы, не попадает в список шагов: остаётся предыдущий допустимый To-Be.
+    """
+    xml, audit, error = generate_bpmn_from_text(text or "", use_llm=bool(use_llm))
+    audit = audit or {}
+    pack: Dict[str, Any] = {
+        "xml": xml or "",
+        "audit": audit,
+        "error": error or "",
+        "asis_text": text or "",
+        "use_llm": bool(use_llm),
+        "tobe_text": "",
+        "tobe_xml": "",
+        "tobe_audit": {},
+        "delta": {},
+        "tobe_ok": False,
+    }
+    if error or not audit.get("sla"):
+        pack["facts"] = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
+        return pack
+    opt_text, delta = optimize_process_to_be(text, audit)
+    facts = process_facts(audit, delta)
+    tobe_audit = dict(delta.get("tobe_audit") or {})
+    tobe_xml = str(delta.get("tobe_xml") or "")
+    accepted = _tobe_accepted(facts) and bool(tobe_xml)
+    if not accepted:
+        prev = previous or {}
+        same_text = (prev.get("asis_text") or "") == (text or "")
+        if prev.get("tobe_ok") and prev.get("tobe_xml") and same_text:
+            pack["tobe_text"] = prev.get("tobe_text") or ""
+            pack["tobe_xml"] = prev.get("tobe_xml") or ""
+            pack["tobe_audit"] = prev.get("tobe_audit") or {}
+            pack["delta"] = prev.get("delta") or {}
+            pack["tobe_ok"] = True
+            facts = process_facts(audit, pack["delta"])
+            pack["facts"] = _annotate_tobe_facts(facts, audit, pack["tobe_audit"], show_steps=True)
+            return pack
+        pack["delta"] = delta or {}
+        pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+        return pack
+    pack["tobe_text"] = opt_text or ""
+    pack["tobe_xml"] = tobe_xml
+    pack["tobe_audit"] = tobe_audit
+    pack["delta"] = delta or {}
+    pack["tobe_ok"] = True
+    pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
+    return pack
+
+
+def _store_regulation_pack(pack: Dict[str, Any]) -> None:
+    st.session_state["result"] = {
+        "xml": pack.get("xml") or "",
+        "audit": pack.get("audit") or {},
+        "error": pack.get("error") or "",
+    }
+    st.session_state["tobe_pack"] = {
+        "source_xml": pack.get("xml") or "",
+        "text": pack.get("tobe_text") or "",
+        "delta": pack.get("delta") or {},
+        "xml": pack.get("tobe_xml") or "",
+        "audit": pack.get("tobe_audit") or {},
+        "error": "",
+        "facts": pack.get("facts") or {},
+        "tobe_ok": bool(pack.get("tobe_ok")),
+        "asis_text": pack.get("asis_text") or "",
+    }
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+
+
 def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None:
-    key = _reg_hash(text, bool(use_llm))
-    mem = st.session_state.get("_gen_mem")
-    if isinstance(mem, dict) and mem.get("key") == key and mem.get("result"):
-        st.session_state["result"] = mem["result"]
-        return
     progress = st.progress(0, text="Запуск конвейера…") if show_progress else None
     if progress:
-        progress.progress(45, text="Генерация BPMN 2.0 (кэш по sha256 регламента)…")
-    xml, audit, error = cached_generate_bpmn(key, text, bool(use_llm))
+        progress.progress(45, text="Генерация BPMN 2.0…")
+    previous = st.session_state.get("tobe_pack")
+    pack = prepare_regulation(text, use_llm=bool(use_llm), previous=previous if isinstance(previous, dict) else None)
     if progress:
         progress.progress(100, text="Аудит узких мест готов")
         progress.empty()
-    result = {"xml": xml, "audit": audit, "error": error}
-    st.session_state["result"] = result
-    st.session_state["_gen_mem"] = {"key": key, "result": result}
-    st.session_state.pop("inspector_cache", None)
-    st.session_state.pop("inspector_choice", None)
-    st.session_state.pop("tobe_pack", None)
+    _store_regulation_pack(pack)
 
 
 def on_example_change() -> None:
@@ -1737,44 +1857,56 @@ def render_downloads(key: str) -> None:
 
 
 def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
-    """Строит (и кэширует) целевой процесс To-Be для активного As-Is."""
+    """To-Be для уже посчитанного As-Is. Повторно схему не генерирует и LLM не включает."""
     result = st.session_state.get("result")
     if not result or result.get("error"):
         return None
     src = result.get("xml") or ""
     cached = st.session_state.get("tobe_pack")
-    if cached and cached.get("source_xml") == src:
+    if cached and cached.get("source_xml") == src and cached.get("facts"):
         return cached
     text = st.session_state.get("reg_text") or ""
-    asis_audit = result.get("audit") or {}
-    asis_core = {
-        "sla": asis_audit.get("sla") or {},
-        "methodology": asis_audit.get("methodology") or {},
-        "rework_loops": asis_audit.get("rework_loops") or [],
-    }
-    tobe_key = _reg_hash(text, "tobe", json.dumps(_audit_cache_slice(asis_audit), ensure_ascii=False, sort_keys=True))
-    mem = st.session_state.get("_tobe_mem")
-    if isinstance(mem, dict) and mem.get("key") == tobe_key and mem.get("pack") and mem["pack"].get("source_xml") == src:
-        st.session_state["tobe_pack"] = mem["pack"]
-        return mem["pack"]
-    with st.spinner("Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация…"):
-        opt_text, delta = cached_optimize_to_be(tobe_key, text, asis_core)
-    xml = str((delta or {}).get("tobe_xml") or "")
-    audit = (delta or {}).get("tobe_audit") or {}
-    err = str((delta or {}).get("tobe_error") or "")
-    if not xml:
-        xml, audit, err = cached_generate_bpmn(_reg_hash(opt_text, False), opt_text, False)
+    audit = result.get("audit") or {}
+    if not audit.get("sla"):
+        pack = prepare_regulation(text, use_llm=False, previous=cached if isinstance(cached, dict) else None)
+        _store_regulation_pack(pack)
+        return st.session_state.get("tobe_pack")
+    opt_text, delta = optimize_process_to_be(text, audit)
+    facts = process_facts(audit, delta)
+    tobe_xml = str((delta or {}).get("tobe_xml") or "")
+    tobe_audit = dict((delta or {}).get("tobe_audit") or {})
     pack = {
-        "source_xml": src,
-        "text": opt_text,
-        "delta": delta or {},
-        "xml": xml,
+        "xml": src,
         "audit": audit,
-        "error": err,
+        "error": "",
+        "asis_text": text,
+        "use_llm": False,
+        "tobe_text": "",
+        "tobe_xml": "",
+        "tobe_audit": {},
+        "delta": delta or {},
+        "tobe_ok": False,
     }
-    st.session_state["tobe_pack"] = pack
-    st.session_state["_tobe_mem"] = {"key": tobe_key, "pack": pack}
-    return pack
+    if _tobe_accepted(facts) and tobe_xml:
+        pack["tobe_text"] = opt_text or ""
+        pack["tobe_xml"] = tobe_xml
+        pack["tobe_audit"] = tobe_audit
+        pack["tobe_ok"] = True
+        pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
+    else:
+        prev = cached if isinstance(cached, dict) else {}
+        if prev.get("tobe_ok") and prev.get("tobe_xml") and (prev.get("asis_text") or "") == text:
+            pack["tobe_text"] = prev.get("tobe_text") or ""
+            pack["tobe_xml"] = prev.get("tobe_xml") or ""
+            pack["tobe_audit"] = prev.get("tobe_audit") or {}
+            pack["delta"] = prev.get("delta") or {}
+            pack["tobe_ok"] = True
+            kept = process_facts(audit, pack["delta"])
+            pack["facts"] = _annotate_tobe_facts(kept, audit, pack["tobe_audit"], show_steps=True)
+        else:
+            pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+    _store_regulation_pack(pack)
+    return st.session_state.get("tobe_pack")
 
 
 def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
@@ -1799,66 +1931,64 @@ def render_tobe_tab() -> None:
         st.info("Сначала сгенерируйте диаграмму As-Is.")
         return
     delta = pack.get("delta") or {}
+    facts = pack.get("facts") or process_facts(
+        (st.session_state.get("result") or {}).get("audit") or {},
+        delta,
+    )
     if pack.get("error") and not pack.get("xml"):
         st.warning(f"Целевую диаграмму построить не удалось: {pack['error']}")
-    saved_h = float(delta.get("sla_saved_hours") or 0)
-    before_h = float(delta.get("sla_before_hours") or 0)
-    after_h = float(delta.get("sla_after_hours") or 0)
-    asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
-    tobe_audit = pack.get("audit") or {}
-    asis_cp = before_h or float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
-    tobe_cp = after_h or float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
-    saved_h = asis_cp - tobe_cp
-    saved_pct = round(100.0 * max(0.0, saved_h) / asis_cp, 1) if asis_cp and saved_h > 0 else 0.0
-    removed = int(delta.get("rework_removed") or 0)
-    q_gain = int(delta.get("quality_gain") or 0)
-    asis_rw = float(delta.get("with_rework_before") or (asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
-    tobe_rw = float(delta.get("with_rework_after") or (tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
-    rw_saved = asis_rw - tobe_rw
-    minute = 1.0 / 60.0
-    naked_ok = tobe_cp <= asis_cp + minute
-    if rw_saved >= minute and naked_ok:
-        rw_pct = round(100.0 * rw_saved / asis_rw) if asis_rw else 0
-        hours_txt = fmt_hours(rw_saved).replace(".", ",")
-        eco_value = f"Экономия до {hours_txt} (−{rw_pct:.0f}%) за счёт устранения возвратов"
-    elif saved_h >= minute:
-        eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
-    else:
-        eco_value = "Без ускорения"
-    eco_sub = (
-        f"КП без возвратов: {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
-        f"rework: {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
+    cp_before = float(facts.get("cp_before") or 0)
+    cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
+    rw_before = float(facts.get("rw_before") or 0)
+    rw_after = float(facts.get("rw_after") if facts.get("rw_after") is not None else rw_before)
+    loops_before = int(facts.get("loops_before") or 0)
+    loops_after = int(facts.get("loops_after") or 0)
+    quality_before = int(facts.get("quality_before") or 0)
+    quality_after = int(facts.get("quality_after") or 0)
+    eco_value = tobe_card_headline(facts) or (
+        f"Путь с возвратами: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
     )
+    eco_sub = (
+        f"КП без возвратов: {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
+        f"rework: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
+    )
+    removed = max(0, loops_before - loops_after)
     st.markdown(
         f'<div class="tobe-grid">'
         f'<div class="tobe-card"><div class="k">Экономия SLA</div>'
         f'<div class="v">{esc(eco_value)}</div>'
         f'<div class="s">{esc(eco_sub)}</div></div>'
         f'<div class="tobe-card"><div class="k">Циклы доработки</div>'
-        f'<div class="v">{int(delta.get("rework_before") or 0)} → {int(delta.get("rework_after") or 0)}</div>'
+        f'<div class="v">{loops_before} → {loops_after}</div>'
         f'<div class="s">устранено петель: {removed}</div></div>'
         f'<div class="tobe-card"><div class="k">Качество нотации</div>'
-        f'<div class="v">+{q_gain} п.п.</div>'
-        f'<div class="s">{int(delta.get("quality_before") or 0)}% → {int(delta.get("quality_after") or 0)}%</div></div>'
+        f'<div class="v">{quality_before}% → {quality_after}%</div>'
+        f'<div class="s">quality {quality_before} → {quality_after}</div></div>'
         f"</div>",
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
-        f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
+        f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
+        f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
     )
     engine = delta.get("engine") or "semantic-optimizer"
     st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
-    st.markdown('<div class="ir-title" style="margin-top:8px">Применённые мероприятия</div>', unsafe_allow_html=True)
-    for act in delta.get("actions") or []:
-        st.markdown(f'<div class="tobe-act">{esc(act.get("detail") or act.get("kind"))}</div>', unsafe_allow_html=True)
+    actions = [
+        act for act in (facts.get("tobe_actions") or delta.get("actions") or [])
+        if "узких мест" not in str(act.get("detail") or "")
+        and act.get("kind") != "stable"
+    ]
+    if actions:
+        st.markdown('<div class="ir-title" style="margin-top:8px">Применённые мероприятия</div>', unsafe_allow_html=True)
+        for act in actions:
+            st.markdown(f'<div class="tobe-act">{esc(act.get("detail") or act.get("kind"))}</div>', unsafe_allow_html=True)
 
     asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_audit = pack.get("audit") or {}
-    if tobe_audit.get("lane_load") or tobe_audit.get("critical_path"):
-        asis_bus = asis_audit.get("bus_factor") or {}
-        tobe_bus = tobe_audit.get("bus_factor") or {}
-        threshold = _bus_threshold(tobe_bus or asis_bus)
+    if facts.get("show_steps") and (tobe_audit.get("lane_load") or tobe_audit.get("critical_path")):
+        threshold = float(facts.get("bus_threshold") or 0.45)
+        before_share = float(facts.get("bus_share") or 0)
+        after_share = float(facts.get("bus_share_after") if facts.get("bus_share_after") is not None else before_share)
         prev_shares = _share_by_role(asis_audit.get("lane_load") or [])
         relieved = [
             str(item.get("role") or "")
@@ -1866,28 +1996,20 @@ def render_tobe_tab() -> None:
             if prev_shares.get(str(item.get("role") or ""), 0) > threshold
             and float(item.get("share") or 0) <= threshold
         ]
-        before_share = float(asis_bus.get("max_share") or 0)
-        after_share = float(tobe_bus.get("max_share") or 0)
-        load_bits = []
-        if before_share or after_share:
-            load_bits.append(f"Bus-factor {before_share:.0%} → {after_share:.0%}")
+        load_bits = [f"Bus-factor {before_share:.0%} → {after_share:.0%}"]
         if relieved:
             load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
-        elif tobe_bus.get("status") == "ok":
+        elif facts.get("bus_status_after") == "ok" or facts.get("bus_status") == "ok":
             load_bits.append("нагрузка сбалансирована")
-        asis_path = _path_tasks_only(asis_audit.get("critical_path") or [])
-        tobe_path = _path_tasks_only(tobe_audit.get("critical_path") or [])
-        asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
-        tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
-        asis_rw = float((asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
-        tobe_rw = float((tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
-        shortened = len(tobe_path) < len(asis_path) or tobe_cp + 1e-6 < asis_cp
+        path_n_before = int(facts.get("path_n_before") or 0)
+        path_n_after = int(facts.get("path_n_after") or 0)
+        shortened = path_n_after < path_n_before or cp_after + 1e-6 < cp_before
         path_label = "Цепочка спрямилась" if shortened else "Критический путь"
         path_cap = (
-            f"{path_label}: {len(asis_path)} шагов / {fmt_hours(asis_cp)}"
-            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}. "
-            f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)}. "
-            f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}."
+            f"{path_label}: {path_n_before} шагов / {fmt_hours(cp_before)}"
+            f" → {path_n_after} шагов / {fmt_hours(cp_after)}. "
+            f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)}. "
+            f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}."
         )
         render_load_and_path(
             tobe_audit,
@@ -2020,8 +2142,9 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
     with box_right:
         use_llm = st.checkbox(
             "Использовать LLM (Ollama / OpenAI), если доступна",
-            value=True,
-            help="Если модель недоступна, автоматически включается встроенный семантический эмулятор.",
+            value=False,
+            help="По умолчанию выключено: первый пример при открытии страницы считает эмулятор. "
+            "Включите, чтобы кнопка генерации сходила в облако.",
         )
         # Имена секретов — только если ключа нет (диагностика настройки), иначе строка для жюри лишняя.
         secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
@@ -2261,9 +2384,20 @@ def main() -> None:
         st.session_state["example_choice"] = first
         st.session_state["reg_text"] = examples[first]["text"] if labels else ""
         st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
-    if "result" not in st.session_state and st.session_state["reg_text"].strip():
+    first_text = examples[labels[0]]["text"] if labels else ""
+    on_first = bool(first_text) and st.session_state.get("reg_text") == first_text
+    stored_engine = str(
+        (((st.session_state.get("result") or {}).get("audit") or {}).get("generation") or {}).get("engine") or ""
+    )
+    pack_now = st.session_state.get("tobe_pack") or {}
+    need_emulator = on_first and (
+        "result" not in st.session_state
+        or not pack_now.get("facts")
+        or (st.session_state.get("quickstart") and stored_engine not in ("", "semantic-emulator"))
+    )
+    if need_emulator and st.session_state["reg_text"].strip():
         with st.spinner("Готовим эталонный пример…"):
-            # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
+            # Эталон при открытии — эмулятором: галочка LLM не подменяет первую схему.
             run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
             st.session_state["quickstart"] = True
 
