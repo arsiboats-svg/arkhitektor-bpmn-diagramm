@@ -1090,6 +1090,11 @@ def _match_inverted_role(text: str) -> Optional[Tuple[str, str, str]]:
     head = action.split()[0].lower().strip("«»\"'")
     if any(rx.search(head) for rx, _ in _ROLE_RE):
         return None
+    # Прямой порядок «Ремонтная бригада готовит СИЗ…»: роль из нескольких слов стоит до глагола —
+    # это не инверсия, иначе объект после глагола («СИЗ») становится ролью.
+    lead = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", action.lower())
+    if any(rx.match(lead) for rx, _ in _ROLE_RE):
+        return None
     role: Optional[str] = None
     for regex, name in _ROLE_RE:
         mm = regex.search(tail[:90])
