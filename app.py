@@ -66,10 +66,10 @@ ASIS_LABEL = "Текущий процесс (As-Is)"
 TOBE_LABEL = "Целевой оптимизированный (To-Be)"
 
 QUICK_PROMPTS = [
-    ("🔍 Разбор узких мест SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
-    ("⚡ Как ускорить процесс?", "Как ускорить процесс? Что даст наибольший эффект?"),
-    ("📝 Регламент для исполнителя", "Составь должностную инструкцию для самой загруженной роли по текущей схеме."),
-    ("🔮 Предложить следующий шаг", "Предложи следующий шаг процесса: чего не хватает в регламенте?"),
+    ("🔍 Срыв SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
+    ("⚡ As-Is / To-Be", "Сравни As-Is и To-Be, до и после"),
+    ("⏱ Как сократили время", "Как мы сократили время? Объясни подробнее"),
+    ("🌿 Экологи после шага 3", "Добавь согласование с экологами после шага 3"),
 ]
 
 BLUE_DARK, BLUE = "#003366", "#1565C0"
@@ -163,6 +163,13 @@ html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMarkdown
 }}
 .stApp {{ background: #F4F8FD; color: #0F172A; }}
 .block-container {{ padding-top: 0.85rem; max-width: 1500px; }}
+section[data-testid="stSidebar"] {{
+  min-width: 28rem !important; width: 28rem !important; max-width: 32rem !important;
+}}
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+section[data-testid="stSidebar"] [data-testid="stChatMessage"] {{
+  overflow-wrap: anywhere; word-break: break-word; white-space: normal;
+}}
 header[data-testid="stHeader"] {{ background: transparent; }}
 #MainMenu, footer {{ visibility: hidden; }}
 button, a, [role="button"], [data-baseweb="tab"], [data-baseweb="select"],
@@ -1000,25 +1007,32 @@ def viewer_html(
   }}
   function copilotAnswer(msg) {{
     const q = (msg || '').trim();
-    if (!q) return 'Напишите вопрос о процессе — SLA, сравнение As-Is/To-Be, роли или читаемость.';
+    if (!q) return 'Спросите про блок на схеме, SLA или As-Is/To-Be.';
     const low = q.toLowerCase();
+    if (/\b(добав\w*|вставь\w*|удал\w*|убер\w*|исключ\w*|сдела\w+\s+параллел)/.test(low)) {{
+      return 'Команду в сайдбар: «' + q.replace(/\s+/g, ' ').replace(/[.]+$/, '') + '»';
+    }}
+    const cardOpen = tip && tip.style.display === 'block';
+    const sel = (cardOpen && selectedId && CATALOG[selectedId]) || null;
+    if (sel && sel.copilot && /этот|выбран|блок|почему|критич|цикл|путь|возврат/.test(low)) {{
+      return sel.copilot;
+    }}
     const chips = COPILOT.chips || [];
     const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
     if (exact) return exact.a;
-    if (/quality|качеств|почему.*(?:score|балл|нотац|линтер)|(?:упал|изменил).*quality/.test(low))
-      return COPILOT.quality || COPILOT.readability || COPILOT.fallback;
-    if (/как\\s+(?:мы\\s+)?сократ|за сч[её]т|за счет чего|объясни подробн|почему.*(?:сократ|ускор|экономи)|в ч[её]м причина.*(?:сократ|экономи)/.test(low))
-      return COPILOT.why || chipBy('tobe') || COPILOT.fallback;
-    if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев/.test(low))
+    if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев|ускор|экономи/.test(low))
       return chipBy('tobe') || COPILOT.compare || COPILOT.fallback;
-    if (/читаем|метро|анти-метро|подпроцесс|методолог/.test(low))
-      return COPILOT.readability || chipBy('tobe') || COPILOT.fallback;
-    if (/ускор|оптимиз|быстрее|параллел/.test(low)) return chipBy('speed') || COPILOT.fallback;
-    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) return chipBy('sla') || COPILOT.fallback;
-    if (/цикл|возврат|доработ|rework/.test(low)) return COPILOT.loops || COPILOT.fallback;
-    if (/систем|it\b|ит-|документ|ландшафт/.test(low)) return COPILOT.landscape || COPILOT.fallback;
+    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) {{
+      if (sel && sel.copilot) return sel.copilot;
+      return chipBy('sla') || COPILOT.fallback;
+    }}
+    if (/цикл|возврат|доработ|rework/.test(low)) {{
+      if (sel && sel.copilot) return sel.copilot;
+      return COPILOT.loops || COPILOT.fallback;
+    }}
     if (/роль|нагруз|bus|риск|исполнител|диспетчер|загруж/.test(low)) return chipBy('roles') || COPILOT.fallback;
-    return COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — тогда отвечу по метрикам.';
+    if (sel && sel.copilot) return sel.copilot;
+    return COPILOT.compare || COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — отвечу по схеме.';
   }}
   function ask(text) {{
     const q = (text || '').trim();
@@ -2195,7 +2209,12 @@ def render_assistant() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Архитектор BPMN — Интер РАО", page_icon="⚡", layout="wide")
+    st.set_page_config(
+        page_title="Архитектор BPMN — Интер РАО",
+        page_icon="⚡",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     st.markdown(CSS, unsafe_allow_html=True)
     render_assistant()
     # Часть виджетов не рисуется в отдельных режимах — не даём Streamlit стереть их состояние.

@@ -12,7 +12,9 @@
 Публичный API:
     generate_bpmn_from_text(regulation_text) -> (bpmn_xml, audit_data, error)
     execute_generated_code(code_str)         -> (bpmn_xml, audit_data, error)
-    assistant_chat(...)                      -> диалог (аналитика / правка / реверс)
+    assistant_chat(...)                      -> диалог сайдбара (аналитика / правка / реверс)
+    process_facts(audit, tobe_delta)         -> общие цифры SLA/циклов/bus-factor/To-Be
+    canvas_copilot_reply(...)                -> локальный ответ плавающего копайлота (без XML)
     generate_process_passport(xml, audit, text) -> Markdown «Паспорт процесса»
     inspect_task_details(task_name, task_role, process_context) -> операционная карточка
     build_diagram_catalog(xml, audit, text) -> метаданные узлов для клика по холсту
@@ -1969,18 +1971,12 @@ _GATE_TAGS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway", "eventB
 
 CHAT_SYSTEM = """Ты — «AI-Ассистент Бизнес-Архитектора» ПАО «Интер РАО». Собеседник — эксперт Дирекции бизнес-архитектуры.
 Правила:
-- Отвечай по-русски, по делу, не более 12 строк, Markdown. Опирайся ТОЛЬКО на данные процесса ниже; числа и названия не выдумывай.
-- Причины и рекомендации подкрепляй конкретными шагами, ролями и цифрами из данных (срок, доля нагрузки, циклы возврата).
-- Если в данных есть блок «СРАВНЕНИЕ AS-IS / TO-BE», на вопросы «сравни», «as-is / to-be», «до и после»
-  отвечай цифрами: дельта SLA (часы и %), петли возврата до/после, замена журналов на scriptTask, Quality Score.
-- На «как сократили / за счёт чего / объясни подробнее» дай декомпозицию экономии To-Be:
-  1) петли доработки (часы циклов до/после), 2) параллелизация с номерами шагов, 3) автоматизация journal→scriptTask.
-- На «почему Quality Score / упал балл нотации»: если 100% — стандарты соблюдены полностью; если был перепад —
-  объясни, что добавлены AND-шлюзы и входной контроль, а правило «глагол + объект» сохранено. Это НЕ ответ про «метро Токио».
-- Не начинай каждый ответ одной и той же заглушкой «N шагов / M узлов». Отвечай на заданный вопрос.
-- Если предлагаешь изменить процесс, заверши ответ ГОТОВОЙ командой в кавычках «…», которую пользователь может отправить
-  в чат, например: «Сделай шаги 4 и 5 параллельными» или «Добавь согласование с экологами после шага 3».
-- Если данных для ответа нет — так и скажи.
+- Отвечай по-русски, не более 10 строк. Сначала вывод с цифрой из блока ФАКТЫ, затем шаги и роли, в конце одна команда в «ёлочках», если уместна правка.
+- Часы, проценты и число циклов бери ТОЛЬКО из ФАКТОВ. Не выдумывай числа.
+- На SLA / As-Is/To-Be / циклы / bus-factor: если путь с возвратами стал короче, не пиши «Без ускорения». Рост голого критического пути — цена входного контроля.
+- На «сравни as-is / to-be»: путь с возвратами, циклы N → M, голый КП.
+- Предлог «со» перед творительным на с, з, ж, ш, щ («со службой экологии», не «с службой»).
+- Не начинай с заглушки «N шагов / M узлов». Если данных нет — так и скажи.
 
 ДАННЫЕ АКТИВНОГО ПРОЦЕССА:
 """
@@ -2069,6 +2065,69 @@ def _fh(hours: float) -> str:
     return f"{hours:.0f} ч (≈ {hours / 8:.0f} раб. дн.)"
 
 
+def process_facts(audit: Optional[Dict[str, Any]] = None, tobe_delta: Optional[dict] = None) -> Dict[str, Any]:
+    """Единый набор цифр для копайлота и сайдбара: КП, срок с возвратами, циклы, bus-factor, To-Be."""
+    data = audit or {}
+    sla = data.get("sla") or {}
+    bus = data.get("bus_factor") or {}
+    loops = list(data.get("rework_loops") or [])
+    delta = tobe_delta if isinstance(tobe_delta, dict) else {}
+    if not delta:
+        cmp = data.get("tobe_compare")
+        delta = cmp if isinstance(cmp, dict) else {}
+
+    cp = float(sla.get("critical_path_hours") or 0)
+    rw = float(sla.get("with_rework_hours") or cp)
+    cp_b = delta.get("sla_before_hours")
+    cp_a = delta.get("sla_after_hours")
+    rw_b = delta.get("with_rework_before")
+    rw_a = delta.get("with_rework_after")
+    lb = delta.get("rework_before")
+    la = delta.get("rework_after")
+    tobe_ready = cp_a is not None or rw_a is not None or lb is not None
+
+    cp_before = round(float(cp_b if cp_b is not None else cp), 1)
+    rw_before = round(float(rw_b if rw_b is not None else rw), 1)
+    loops_before = int(lb if lb is not None else len(loops))
+    cp_after = round(float(cp_a), 1) if cp_a is not None else (round(cp_before, 1) if tobe_ready else None)
+    rw_after = round(float(rw_a), 1) if rw_a is not None else (round(rw_before, 1) if tobe_ready else None)
+    loops_after = int(la) if la is not None else (0 if tobe_ready else None)
+
+    rw_saved = round(rw_before - float(rw_after or 0), 1) if tobe_ready else 0.0
+    speedup = bool(tobe_ready and (loops_before - int(loops_after or 0)) > 0 and rw_saved > 0)
+    return {
+        "critical_path_hours": round(cp, 1),
+        "with_rework_hours": round(rw, 1),
+        "rework_loops_n": len(loops),
+        "rework_loops": loops,
+        "critical_path": list(data.get("critical_path") or []),
+        "lane_load": list(data.get("lane_load") or []),
+        "bus_role": str(bus.get("top_role") or ""),
+        "bus_share": float(bus.get("max_share") or 0),
+        "bus_threshold": float(bus.get("threshold") or 0.45),
+        "bus_status": str(bus.get("status") or ""),
+        "tobe_ready": bool(tobe_ready),
+        "cp_before": cp_before,
+        "cp_after": cp_after,
+        "rw_before": rw_before,
+        "rw_after": rw_after,
+        "loops_before": loops_before,
+        "loops_after": loops_after,
+        "rw_saved_hours": rw_saved,
+        "rw_saved_pct": int(round(100.0 * rw_saved / rw_before)) if tobe_ready and rw_before else 0,
+        "speedup_via_rework": speedup,
+        "cp_grew": bool(tobe_ready and cp_after is not None and cp_after > cp_before),
+        "quality_before": int(delta.get("quality_before") or (data.get("methodology") or {}).get("score") or 0),
+        "quality_after": int(delta.get("quality_after") or 0),
+        "tobe_actions": [a for a in (delta.get("actions") or []) if isinstance(a, dict)],
+    }
+
+
+def _limit_lines(text: str, n: int) -> str:
+    lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+    return "\n".join(lines[:n])
+
+
 def build_process_context(
     current_text: str,
     current_xml: str,
@@ -2122,62 +2181,44 @@ def build_process_context(
         "quality_score_as_is": None,
         "quality_score_to_be": None,
         "tobe_actions": [],
+        "facts": {},
+        "cp_hours_as_is": None,
+        "cp_hours_to_be": None,
     }
+    facts = process_facts(audit, tobe_delta)
+    ctx["facts"] = facts
     _attach_tobe_compare(ctx, audit, tobe_delta)
     return ctx
 
 
 def _attach_tobe_compare(ctx: Dict[str, Any], audit: Dict[str, Any], tobe_delta: Optional[dict]) -> None:
-    """Пишет в контекст sla_hours_as_is / sla_hours_to_be и соседние поля, если To-Be уже посчитан."""
-    d = tobe_delta or (audit or {}).get("tobe_compare") or {}
-    if not isinstance(d, dict) or not d:
-        return
-    if d.get("sla_after_hours") is None and d.get("sla_hours_to_be") is None:
-        return
+    """Пишет в контекст цифры To-Be из process_facts: срок с возвратами отдельно от голого КП."""
+    facts = ctx.get("facts") or process_facts(audit, tobe_delta)
+    ctx["facts"] = facts
     sla = (audit or {}).get("sla") or {}
     meth = (audit or {}).get("methodology") or {}
-    as_is = d.get("sla_hours_as_is")
-    if as_is is None:
-        as_is = d.get("sla_before_hours")
-    if as_is is None:
-        as_is = sla.get("with_rework_hours") or sla.get("critical_path_hours") or 0
-    to_be = d.get("sla_hours_to_be")
-    if to_be is None:
-        to_be = d.get("sla_after_hours") or 0
-    pct = d.get("delta_sla_percent")
-    if pct is None:
-        pct = d.get("sla_saved_pct") or 0
-    q_as = d.get("quality_score_as_is")
-    if q_as is None:
-        q_as = d.get("quality_before")
+    d = tobe_delta if isinstance(tobe_delta, dict) else {}
+    if not facts.get("tobe_ready"):
+        return
+    ctx["tobe_ready"] = True
+    ctx["sla_hours_as_is"] = facts["rw_before"]
+    ctx["sla_hours_to_be"] = facts["rw_after"]
+    ctx["delta_sla_percent"] = facts["rw_saved_pct"]
+    ctx["sla_saved_hours"] = facts["rw_saved_hours"]
+    ctx["cp_hours_as_is"] = facts["cp_before"]
+    ctx["cp_hours_to_be"] = facts["cp_after"]
+    ctx["rework_loops_as_is"] = facts["loops_before"]
+    ctx["rework_loops_to_be"] = facts["loops_after"]
+    q_as = d.get("quality_before")
     if q_as is None:
         q_as = int(meth.get("score") or 0)
-    q_to = d.get("quality_score_to_be")
-    if q_to is None:
-        q_to = d.get("quality_after")
+    q_to = d.get("quality_after")
     if q_to is None:
         q_to = q_as
-    rw_as = d.get("rework_loops_as_is")
-    if rw_as is None:
-        rw_as = d.get("rework_before")
-    if rw_as is None:
-        rw_as = len((audit or {}).get("rework_loops") or [])
-    rw_to = d.get("rework_loops_to_be")
-    if rw_to is None:
-        rw_to = d.get("rework_after")
-    if rw_to is None:
-        rw_to = rw_as
-    ctx["tobe_ready"] = True
-    ctx["sla_hours_as_is"] = round(float(as_is or 0), 3)
-    ctx["sla_hours_to_be"] = round(float(to_be or 0), 3)
-    ctx["delta_sla_percent"] = round(float(pct or 0), 1)
-    ctx["rework_loops_as_is"] = int(rw_as or 0)
-    ctx["rework_loops_to_be"] = int(rw_to or 0)
     ctx["quality_score_as_is"] = int(q_as or 0)
     ctx["quality_score_to_be"] = int(q_to or 0)
-    ctx["tobe_actions"] = [a for a in (d.get("actions") or []) if isinstance(a, dict)]
-    ctx["sla_saved_hours"] = round(float(d.get("sla_saved_hours") or max(0.0, float(as_is or 0) - float(to_be or 0))), 3)
-    ctx["rework_hours_as_is"] = round(float(d.get("rework_hours_before") or 0), 3)
+    ctx["tobe_actions"] = facts.get("tobe_actions") or []
+    ctx["rework_hours_as_is"] = round(float(d.get("rework_hours_before") or sla.get("rework_hours") or 0), 3)
     ctx["rework_hours_to_be"] = round(float(d.get("rework_hours_after") or 0), 3)
 
 
@@ -2229,17 +2270,25 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
         for chk in (meth.get("checks") or [])[:4]:
             mark = "ok" if chk.get("passed") else "fail"
             lines.append(f"  [{mark}] {chk.get('title')}: {chk.get('detail')}")
+    facts = ctx.get("facts") or {}
+    if facts:
+        lines.append(
+            f"ФАКТЫ: КП {_fh(float(facts.get('critical_path_hours') or 0))}; "
+            f"с возвратами {_fh(float(facts.get('with_rework_hours') or 0))}; "
+            f"циклов {int(facts.get('rework_loops_n') or 0)}; "
+            f"bus-factor «{facts.get('bus_role') or '—'}» {float(facts.get('bus_share') or 0):.0%}"
+        )
     if ctx.get("tobe_ready"):
         lines += [
             "СРАВНЕНИЕ AS-IS / TO-BE:",
-            f"  sla_hours_as_is: {ctx.get('sla_hours_as_is')}",
-            f"  sla_hours_to_be: {ctx.get('sla_hours_to_be')}",
-            f"  delta_sla_percent: {ctx.get('delta_sla_percent')}",
-            f"  rework_loops_as_is: {ctx.get('rework_loops_as_is')}",
-            f"  rework_loops_to_be: {ctx.get('rework_loops_to_be')}",
+            f"  путь_с_возвратами: {ctx.get('sla_hours_as_is')} → {ctx.get('sla_hours_to_be')} ч (−{ctx.get('delta_sla_percent')}%)",
+            f"  голый_критический_путь: {ctx.get('cp_hours_as_is')} → {ctx.get('cp_hours_to_be')} ч",
+            f"  циклы: {ctx.get('rework_loops_as_is')} → {ctx.get('rework_loops_to_be')}",
             f"  quality_score_as_is: {ctx.get('quality_score_as_is')}",
             f"  quality_score_to_be: {ctx.get('quality_score_to_be')}",
         ]
+        if facts.get("speedup_via_rework"):
+            lines.append("  НЕ говорить «Без ускорения»: путь с возвратами короче, рост голого КП — цена входного контроля.")
         for act in (ctx.get("tobe_actions") or [])[:6]:
             lines.append(f"  действие To-Be [{act.get('kind')}]: {act.get('detail')}")
         lines.append(f"  rework_hours_as_is: {ctx.get('rework_hours_as_is')}")
@@ -2421,44 +2470,44 @@ def _analysis_summary(ctx: Dict[str, Any]) -> str:
 
 
 def _analysis_tobe(ctx: Dict[str, Any]) -> str:
-    if not ctx.get("tobe_ready"):
+    f = ctx.get("facts") or {}
+    if not f.get("tobe_ready"):
         sla = ctx.get("sla") or {}
         loops = ctx.get("rework_loops") or []
-        meth = ctx.get("methodology") or {}
         return (
-            "**As-Is пока без посчитанного To-Be.** Откройте вкладку «Оптимизация As-Is → To-Be» — "
-            "оптимизатор параллелит независимые роли, снимает петли возврата (Zero-Rework) и переводит журналы в scriptTask.\n"
-            f"Сейчас: путь {_fh(float(sla.get('with_rework_hours') or sla.get('critical_path_hours') or 0))}, "
-            f"петель возврата {len(loops)}, Quality Score {int(meth.get('score') or 0)}%."
+            f"**As-Is: срок с возвратами {_fh(float(sla.get('with_rework_hours') or sla.get('critical_path_hours') or 0))}, "
+            f"циклов {len(loops)}.** To-Be ещё не посчитан — откройте вкладку оптимизации."
         )
-    as_h = float(ctx.get("sla_hours_as_is") or 0)
-    to_h = float(ctx.get("sla_hours_to_be") or 0)
-    pct = float(ctx.get("delta_sla_percent") or 0)
-    saved = float(ctx.get("sla_saved_hours") or max(0.0, as_h - to_h))
-    rb, ra = int(ctx.get("rework_loops_as_is") or 0), int(ctx.get("rework_loops_to_be") or 0)
-    qb, qa = int(ctx.get("quality_score_as_is") or 0), int(ctx.get("quality_score_to_be") or 0)
-    stats = ctx.get("stats") or {}
-    out = [
-        f"**As-Is → To-Be для «{ctx.get('title')}».**",
-        f"SLA (с учётом возвратов): **{_fh(as_h)} → {_fh(to_h)}** (экономия {_fh(saved)}, **−{pct:g}%**).",
-        f"Петли возврата: **{rb} → {ra}** (ликвидировано {max(0, rb - ra)}).",
-        f"Quality Score нотации: **{qb}% → {qa}%**.",
-    ]
+    rw_b, rw_a = float(f.get("rw_before") or 0), float(f.get("rw_after") or 0)
+    cp_b, cp_a = float(f.get("cp_before") or 0), float(f.get("cp_after") or 0)
+    rb, ra = int(f.get("loops_before") or 0), int(f.get("loops_after") or 0)
+    pct = int(f.get("rw_saved_pct") or 0)
+    out: List[str] = []
+    if f.get("speedup_via_rework") or rw_a < rw_b:
+        out.append(
+            f"**Экономия пути с возвратами: {_fh(rw_b)} → {_fh(rw_a)} (−{pct}%), циклы {rb} → {ra}.**"
+        )
+    else:
+        out.append(f"**To-Be: путь с возвратами {_fh(rw_b)} → {_fh(rw_a)}, циклы {rb} → {ra}.**")
+    if f.get("cp_grew"):
+        out.append(
+            f"Голый критический путь {_fh(cp_b)} → {_fh(cp_a)} — цена входного контроля, не отказ от ускорения."
+        )
+    else:
+        out.append(f"Голый критический путь: {_fh(cp_b)} → {_fh(cp_a)}.")
     kinds = {str(a.get("kind")) for a in (ctx.get("tobe_actions") or [])}
-    if "parallel" in kinds:
-        out.append("Параллелизация: независимые шаги разных ролей идут одновременно, а не цепочкой.")
     if "zero_rework" in kinds:
-        out.append("Zero-Rework: перед согласованиями входной контроль, возвраты заменены эскалацией.")
+        out.append("Zero-Rework: входной контроль вместо петель «вернуть на п.N».")
+    if "parallel" in kinds:
+        out.append("Параллель: независимые роли идут одновременно, если нет стоп-листа охраны труда.")
     if "automation" in kinds:
-        out.append("Автоматизация: фиксация в журналах/реестрах переведена в scriptTask, а не ручной userTask.")
-    for act in (ctx.get("tobe_actions") or [])[:4]:
-        if act.get("detail"):
-            out.append(f"- {act['detail']}")
-    subs = int(stats.get("subprocesses") or 0)
-    out.append(
-        f"Читаемость: {'подпроцессы уже режут «метро Токио»' if subs else 'длинные цепочки лучше упаковать в subprocess'}; "
-        "снятие возвратных стрелок убирает пересечения как на карте метро."
-    )
+        out.append("Журналы переведены в scriptTask.")
+    bus_role = f.get("bus_role")
+    if bus_role:
+        out.append(f"Bus-factor: «{bus_role}» держит {float(f.get('bus_share') or 0):.0%} шагов.")
+    heavy = (ctx.get("critical_path") or [])[:2]
+    if heavy:
+        out.append("На схеме: " + "; ".join(f"«{c.get('name')}» ({c.get('role')})" for c in heavy) + ".")
     return "\n".join(out)
 
 
@@ -2519,9 +2568,11 @@ def _analysis_open(message: str, ctx: Dict[str, Any]) -> str:
         l0 = max(loops, key=lambda x: float((x or {}).get("cycle_hours") or 0))
         out.append(f"Дороже всего цикл «{l0.get('label')}»: {_fh(float(l0.get('cycle_hours') or 0))}.")
     if ctx.get("tobe_ready"):
+        f = ctx.get("facts") or {}
         out.append(
-            f"To-Be уже есть: SLA {_fh(float(ctx.get('sla_hours_as_is') or 0))} → "
-            f"{_fh(float(ctx.get('sla_hours_to_be') or 0))} (−{ctx.get('delta_sla_percent')}%)."
+            f"To-Be: путь с возвратами {_fh(float(f.get('rw_before') or ctx.get('sla_hours_as_is') or 0))} → "
+            f"{_fh(float(f.get('rw_after') or ctx.get('sla_hours_to_be') or 0))} "
+            f"(циклы {f.get('loops_before')} → {f.get('loops_after')})."
         )
     if recs:
         out.append("Что делать архитектору:")
@@ -2542,6 +2593,31 @@ _WHY_SAVED_RE = re.compile(
     r"в ч[её]м причина.{0,30}(сократ|экономи|to-be|tobe)",
     re.I,
 )
+_FACT_OVERRIDE_RE = re.compile(
+    r"sla|срок|срыв|as-is|as is|to-be|tobe|цикл|возврат|bus.?factor|ускор|экономи",
+    re.I,
+)
+
+
+def _suggested_command(ctx: Dict[str, Any]) -> str:
+    loops = ctx.get("rework_loops") or []
+    steps = ctx.get("steps") or []
+    if loops:
+        return "Добавь входной контроль перед возвратом на доработку"
+    if len(steps) >= 5:
+        return "Сделай шаги 4 и 5 параллельными"
+    return "Добавь согласование с экологами после шага 3"
+
+
+def _sidebar_shape(body: str, ctx: Dict[str, Any], intent: str) -> str:
+    """Сайдбар: вывод → шаги/роли → одна команда в ёлочках. Не больше 10 строк."""
+    lines = [ln.rstrip() for ln in (body or "").splitlines() if ln.strip() and not ln.strip().startswith("<sub>")]
+    if intent in ("analysis", "next_step"):
+        lines = lines[:9]
+        if not any("«" in ln and "»" in ln for ln in lines):
+            lines.append(f"«{_suggested_command(ctx)}»")
+        return "\n".join(lines[:10])
+    return "\n".join(lines[:12])
 
 
 def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
@@ -2572,6 +2648,12 @@ def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
         f"(снято {max(0, rb - ra)} цикл.). Экономия циклов: **{_fh(loop_saved)}** "
         f"(худший возврат {_fh(rw_h_as)} → {_fh(rw_h_to)}).",
     ]
+    f = ctx.get("facts") or {}
+    if f.get("cp_grew"):
+        out.append(
+            f"   Голый путь {_fh(float(f.get('cp_before') or 0))} → {_fh(float(f.get('cp_after') or 0))} "
+            "— цена входного контроля."
+        )
     loops = sorted(ctx.get("rework_loops") or [], key=lambda x: -float((x or {}).get("cycle_hours") or 0))
     for item in loops[:3]:
         out.append(f"   - цикл As-Is «{item.get('label')}»: {_fh(float(item.get('cycle_hours') or 0))}")
@@ -2774,6 +2856,12 @@ def _default_duration(steps: List[Dict[str, Any]]) -> str:
     return "(1 рабочий день)" if median >= 8 else ("(2 часа)" if median >= 1 else "(30 минут)")
 
 
+def _so_or_s(word: str) -> str:
+    """Предлог «со» перед творительным на с, з, ж, ш, щ; иначе «с»."""
+    ch = (word or "").lstrip().lower()[:1]
+    return "со" if ch in "сзжшщ" else "с"
+
+
 def _role_instrumental(role: str) -> str:
     """«Служба экологии» → «службой экологии» (творительный для «с …»)."""
     words = role.split()
@@ -2809,6 +2897,8 @@ def _build_new_step(content: str, anchor_role: str, duration: str) -> str:
             if m_with:
                 prep = m_with.group(1).lower()
                 whom = _role_instrumental(extra_role) if prep in ("с", "со") else extra_role[:1].lower() + extra_role[1:]
+                if prep in ("с", "со"):
+                    prep = _so_or_s(whom)
                 with_whom = f"{prep} {whom}"
                 rest = (lead[: m_with.start()] + " " + content[re_:]).strip()
                 extra_role = None
@@ -3083,8 +3173,18 @@ def _audit_delta(old: Dict[str, Any], new: Dict[str, Any]) -> str:
     try:
         o, n = old.get("sla") or {}, new.get("sla") or {}
         lines = []
+        facts_o = process_facts(old)
+        facts_n = process_facts(new)
         if o and n:
-            lines.append(f"- критический путь: {_fh(float(o['critical_path_hours']))} → **{_fh(float(n['critical_path_hours']))}**")
+            lines.append(
+                f"- срок с возвратами: {_fh(facts_o['with_rework_hours'])} → **{_fh(facts_n['with_rework_hours'])}**"
+            )
+            lines.append(
+                f"- критический путь: {_fh(float(o['critical_path_hours']))} → **{_fh(float(n['critical_path_hours']))}**"
+            )
+            lines.append(
+                f"- циклы возврата: {facts_o['rework_loops_n']} → **{facts_n['rework_loops_n']}**"
+            )
             if bool(o.get("breach")) != bool(n.get("breach")):
                 lines.append(f"- срыв SLA: {'да' if o.get('breach') else 'нет'} → **{'да' if n.get('breach') else 'нет'}**")
         ob, nb = old.get("bus_factor") or {}, new.get("bus_factor") or {}
@@ -3318,8 +3418,7 @@ def assistant_chat(
             reply = "✨ **Диаграмма обновлена ассистентом в диалоге.**\n\n" + "\n".join(f"- {c}" for c in changes)
             if delta:
                 reply += "\n\n**Влияние на метрики:**\n" + delta
-            reply += f"\n\n<sub>Правка: {label}; диаграмма перестроена через execute_generated_code</sub>"
-            return reply, new_text, xml, new_audit
+            return _limit_lines(reply, 12), new_text, xml, new_audit
 
         # ---- режим 3: реверс-генерация инструкции ----
         if intent == "instruction":
@@ -3342,15 +3441,18 @@ def assistant_chat(
 
         # ---- режим 1: аналитика ----
         if intent == "next_step" and not use_llm:
-            return suggest_next_steps(ctx) + _source_note(None, trace), None, None, None
-        force_local = bool(_QUALITY_Q_RE.search(message.lower()) or _WHY_SAVED_RE.search(message.lower()))
+            return _sidebar_shape(suggest_next_steps(ctx), ctx, intent), None, None, None
+        low = message.lower()
+        force_local = bool(
+            _QUALITY_Q_RE.search(low) or _WHY_SAVED_RE.search(low) or _FACT_OVERRIDE_RE.search(low)
+        )
         if use_llm and not force_local:
             system = CHAT_SYSTEM + format_context_for_prompt(ctx)
             got = _chat_llm([{"role": "system", "content": system}, *hist, {"role": "user", "content": message}], trace)
             if got:
-                return got[1].strip() + _source_note(got[0], trace), None, None, None
+                return _sidebar_shape(got[1].strip(), ctx, intent), None, None, None
         body = suggest_next_steps(ctx) if intent == "next_step" else heuristic_analysis(message, ctx)
-        return body + _source_note(None, trace), None, None, None
+        return _sidebar_shape(body, ctx, intent), None, None, None
     except Exception as exc:  # noqa: BLE001 — диалог не должен ронять приложение
         return f"Не удалось обработать запрос: {type(exc).__name__}: {exc}. Процесс оставлен без изменений.", None, None, None
 
@@ -3901,8 +4003,117 @@ def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) 
             "role": role or "—",
             "critical": bool(crit),
             "comment": live_node_comment(name, role, kind, ctx),
+            "copilot": _copilot_node_brief(name, role, kind, ctx),
         }
     return catalog
+
+
+def _copilot_node_brief(name: str, role: str, kind: str, ctx: Dict[str, Any]) -> str:
+    """До 6 строк: вывод, блок/роль на схеме, одна причина (критический путь или цикл)."""
+    f = ctx.get("facts") or {}
+    crit_names = {str(c.get("name") or "") for c in (f.get("critical_path") or ctx.get("critical_path") or [])}
+    on_crit = bool(name) and (name in crit_names or any(name[:16] in (c or "") for c in crit_names))
+    loops = f.get("rework_loops") or ctx.get("rework_loops") or []
+    hit = next(
+        (l for l in loops if name and name[:12] in str(l.get("from", "")) + str(l.get("to", ""))),
+        None,
+    )
+    lines: List[str] = []
+    if on_crit:
+        lines.append(f"**На критическом пути:** «{name}» ({role or '—'}).")
+        lines.append(f"Голый КП {_fh(float(f.get('critical_path_hours') or 0))} без этого шага не сходится.")
+    elif hit:
+        lines.append(f"**В цикле возврата** «{hit.get('label')}»: «{name}» ({role or '—'}).")
+        lines.append(f"Повтор добавляет {_fh(float(hit.get('cycle_hours') or 0))} к сроку с возвратами.")
+    else:
+        lines.append(f"**«{name}»** — {role or 'исполнитель'}, не на узком месте SLA.")
+        lines.append(f"Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}.")
+    if f.get("speedup_via_rework"):
+        lines.append(
+            f"To-Be снимает возвраты: {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))}, "
+            f"циклы {f.get('loops_before')} → {f.get('loops_after')}."
+        )
+    return _limit_lines("\n".join(lines), 6)
+
+
+def _copilot_tobe(ctx: Dict[str, Any]) -> str:
+    f = ctx.get("facts") or {}
+    if not f.get("tobe_ready"):
+        return _limit_lines(
+            f"**As-Is.** Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}, "
+            f"циклов {int(f.get('rework_loops_n') or 0)}.\nTo-Be ещё не посчитан.",
+            6,
+        )
+    rb, ra = int(f.get("loops_before") or 0), int(f.get("loops_after") or 0)
+    lines = [
+        f"**Экономия пути с возвратами: {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))} "
+        f"(−{int(f.get('rw_saved_pct') or 0)}%).**",
+        f"Циклы {rb} → {ra}.",
+        f"Голый путь {_fh(float(f['cp_before']))} → {_fh(float(f['cp_after']))}"
+        + (" — цена входного контроля." if f.get("cp_grew") else "."),
+    ]
+    heavy = (f.get("critical_path") or ctx.get("critical_path") or [])[:1]
+    if heavy:
+        c = heavy[0]
+        lines.append(f"На схеме: «{c.get('name')}» ({c.get('role')}).")
+    return _limit_lines("\n".join(lines), 6)
+
+
+def canvas_copilot_reply(
+    message: str,
+    xml_str: str = "",
+    audit_data: Optional[Dict[str, Any]] = None,
+    regulation_text: str = "",
+    tobe_delta: Optional[dict] = None,
+    selected_id: Optional[str] = None,
+    catalog: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Локальный копайлот холста: не вызывает облако, не меняет XML/регламент."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {}, tobe_delta=tobe_delta)
+    msg = (message or "").strip()
+    if not msg:
+        return "Спросите про блок на схеме, SLA или As-Is/To-Be."
+    if classify_intent(msg) == "edit":
+        cmd = re.sub(r"\s+", " ", msg).strip(" .")
+        return f"Команду в сайдбар: «{cmd}»"
+    cat = catalog or {}
+    if selected_id and selected_id in cat:
+        packed = cat[selected_id].get("copilot")
+        if packed and re.search(r"этот|выбран|блок|почему|критич|цикл|путь|возврат", msg, re.I):
+            return packed
+    low = msg.lower()
+    f = ctx.get("facts") or {}
+    if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|ускор|экономи", low):
+        return _copilot_tobe(ctx)
+    if re.search(r"sla|срок|срыв|критич|длительн", low):
+        return _limit_lines(
+            f"**Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}**, "
+            f"голый КП {_fh(float(f.get('critical_path_hours') or 0))}.\n"
+            f"Циклов {int(f.get('rework_loops_n') or 0)}. "
+            + (f"Узкое место — «{(f.get('critical_path') or [{}])[0].get('name', '—')}»." if f.get("critical_path") else ""),
+            6,
+        )
+    if re.search(r"цикл|возврат|доработ|rework", low):
+        n = int(f.get("rework_loops_n") or 0)
+        if f.get("tobe_ready"):
+            return _limit_lines(
+                f"**Циклы {f.get('loops_before')} → {f.get('loops_after')}.**\n"
+                f"Путь с возвратами {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))}.",
+                6,
+            )
+        return _limit_lines(f"**Циклов возврата: {n}.** " + (f.get("rework_loops") or [{}])[0].get("label", ""), 6)
+    if re.search(r"роль|нагруз|bus|исполнител", low):
+        return _limit_lines(
+            f"**Bus-factor: «{f.get('bus_role') or '—'}» {float(f.get('bus_share') or 0):.0%} шагов.**\n"
+            "На схеме эта дорожка держит процесс.",
+            6,
+        )
+    if selected_id and selected_id in cat:
+        return cat[selected_id].get("copilot") or _copilot_tobe(ctx)
+    return _copilot_tobe(ctx) if f.get("tobe_ready") else _limit_lines(
+        f"**«{ctx.get('title')}».** Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}.",
+        6,
+    )
 
 
 def build_canvas_copilot(
@@ -3911,24 +4122,14 @@ def build_canvas_copilot(
     regulation_text: str,
     tobe_delta: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Пакет для плавающего ассистента на холсте: чипы и ответы по аудиту + сравнение As-Is/To-Be."""
+    """Пакет для плавающего ассистента на холсте: чипы и локальные ответы. Облако не вызывается."""
     ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {}, tobe_delta=tobe_delta)
     title = str(ctx.get("title") or "Бизнес-процесс")
-    try:
-        sla_a = heuristic_analysis("В чём причина срыва SLA?", ctx)
-        speed_a = heuristic_analysis("Как ускорить процесс?", ctx)
-        roles_a = _analysis_load(ctx, [])
-        compare_a = heuristic_analysis("Сравни As-Is и To-Be, до и после", ctx)
-        read_a = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx)
-        why_a = heuristic_analysis("Как мы сократили время? Объясни подробнее", ctx)
-        qual_a = heuristic_analysis("Почему изменился Quality Score?", ctx)
-        loops_a = heuristic_analysis("Циклы возврата на доработку", ctx)
-        land_a = heuristic_analysis("ИТ-ландшафт и документы процесса", ctx)
-        fallback = _analysis_open("краткий архитектурный разбор", ctx)
-    except Exception:  # noqa: BLE001 — холст не должен падать
-        sla_a = speed_a = roles_a = compare_a = read_a = why_a = qual_a = loops_a = land_a = fallback = (
-            "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
-        )
+    sla_a = canvas_copilot_reply("В чём причина срыва SLA?", xml_str, audit_data, regulation_text, tobe_delta)
+    speed_a = canvas_copilot_reply("Как ускорить процесс?", xml_str, audit_data, regulation_text, tobe_delta)
+    roles_a = canvas_copilot_reply("Как оптимизировать нагрузку ролей?", xml_str, audit_data, regulation_text, tobe_delta)
+    compare_a = canvas_copilot_reply("Сравни As-Is и To-Be", xml_str, audit_data, regulation_text, tobe_delta)
+    loops_a = canvas_copilot_reply("Циклы возврата на доработку", xml_str, audit_data, regulation_text, tobe_delta)
     chips = [
         {"id": "speed", "label": "⚡ Как ускорить?", "q": "Как ускорить процесс?", "a": speed_a},
         {"id": "sla", "label": "🔍 Анализ SLA", "q": "В чём причина срыва SLA?", "a": sla_a},
@@ -3938,16 +4139,15 @@ def build_canvas_copilot(
     return {
         "title": title,
         "greeting": (
-            f"Я ассистент процесса «{title}». Спросите про SLA, сравнение As-Is/To-Be, "
-            "читаемость или роли — отвечаю по цифрам аудита, в том числе в панораме."
+            f"Копайлот схемы «{title}»: объясняю то, что на холсте. Правки — в сайдбар."
         ),
-        "fallback": fallback,
+        "fallback": sla_a,
         "compare": compare_a,
-        "readability": read_a,
-        "why": why_a,
-        "quality": qual_a,
         "loops": loops_a,
-        "landscape": land_a,
+        "why": speed_a,
+        "quality": roles_a,
+        "readability": sla_a,
+        "landscape": roles_a,
         "chips": chips,
     }
 

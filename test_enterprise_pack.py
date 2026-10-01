@@ -149,6 +149,41 @@ def main() -> None:
     assert "осмотр" in title0 or "осмотреть" in title0
     assert inverted.steps[1].role == "Диспетчер"
 
+    from ai_generator import assistant_chat, canvas_copilot_reply, process_facts
+
+    text1 = (Path(__file__).resolve().parent / "examples" / "example_1_substation_repair.txt").read_text(
+        encoding="utf-8"
+    )
+    xml1, audit1, err1 = generate_bpmn_from_text(text1, use_llm=False)
+    assert not err1, err1
+    _, delta1 = optimize_process_to_be(text1, audit1)
+    facts1 = process_facts(audit1, delta1)
+    assert facts1["speedup_via_rework"]
+    assert facts1["loops_before"] == 2 and facts1["loops_after"] == 0
+    q_tobe = "Сравни As-Is и To-Be, до и после"
+    copilot_tobe = canvas_copilot_reply(q_tobe, xml1, audit1, text1, tobe_delta=delta1)
+    side_tobe, _, _, _ = assistant_chat(q_tobe, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1)
+    for blob, who in ((copilot_tobe, "copilot"), (side_tobe, "sidebar")):
+        compact = blob.replace(" ", "")
+        assert "2→0" in compact or "2 → 0" in blob, (who, blob)
+        assert "Без ускорения" not in blob, (who, blob)
+        assert "12.6" in blob or "12,6" in blob, (who, blob)
+        assert "10.7" in blob or "10,7" in blob, (who, blob)
+    eco_cmd = "Добавь согласование с экологами после шага 3"
+    copilot_eco = canvas_copilot_reply(eco_cmd, xml1, audit1, text1, tobe_delta=delta1)
+    assert copilot_eco.startswith("Команду в сайдбар:")
+    assert xml1  # копайлот XML не возвращает и не меняет
+    side_eco, new_text, new_xml, new_audit = assistant_chat(
+        eco_cmd, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1
+    )
+    assert new_xml and new_xml != xml1, "сайдбар должен перестроить XML"
+    assert new_text and "со службой" in new_text, new_text
+    new_step = next((ln for ln in new_text.splitlines() if "со службой" in ln), "")
+    assert new_step, new_text
+    print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
+    print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
+    print("NEW_STEP", new_step)
+
     print(
         "ok",
         f"steps={len(parsed.steps)}",
