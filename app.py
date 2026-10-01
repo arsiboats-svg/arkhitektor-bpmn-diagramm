@@ -28,6 +28,7 @@ from ai_generator import (
     generate_bpmn_from_text,
     generate_process_passport,
     generate_raci_matrix,
+    read_docx_regulation,
     inspect_task_details,
     normalize_regulation,
     optimize_process_to_be,
@@ -1592,24 +1593,7 @@ def _read_txt_bytes(data: bytes) -> str:
 
 
 def _read_docx_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        from docx import Document  # type: ignore[import-untyped]
-    except ImportError:
-        return None, "Для чтения .docx установите пакет: `pip install python-docx>=1.0.0`"
-    try:
-        doc = Document(io.BytesIO(data))
-        parts: List[str] = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                if cells:
-                    parts.append(" | ".join(cells))
-        text = "\n".join(parts).strip()
-        if not text:
-            return None, "В файле .docx не найден текстовый слой (пустые абзацы и таблицы)."
-        return text, None
-    except Exception as exc:  # noqa: BLE001
-        return None, f"Не удалось прочитать .docx: {type(exc).__name__}: {exc}"
+    return read_docx_regulation(data)
 
 
 def _read_pdf_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:

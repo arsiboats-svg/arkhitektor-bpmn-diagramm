@@ -40,7 +40,7 @@ import re
 import time
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 from validate_bpmn import xsd_errors_xml
@@ -636,6 +636,30 @@ def _promote_lettered_parallels(text: str) -> str:
         s = raw.strip()
         num_m = re.match(r"^(\d+)[.)]\s+(.*)$", s)
         if not num_m:
+            if _PAR_WORD_RE.search(s) and _is_parallel_fork_intro(s):
+                kids: List[str] = []
+                j = i + 1
+                skipped_blank = 0
+                while j < len(raw_lines):
+                    stripped = raw_lines[j].strip()
+                    if not stripped:
+                        skipped_blank += 1
+                        j += 1
+                        continue
+                    lb = _letter_line_body(stripped)
+                    if lb is None:
+                        j -= skipped_blank
+                        break
+                    kids.append(lb)
+                    skipped_blank = 0
+                    j += 1
+                if len(kids) >= 2:
+                    for k, kid in enumerate(kids):
+                        mark = "Параллельно*: " if k == 0 else "Параллельно: "
+                        let = _CYR_SUB_LETTERS[k] if k < len(_CYR_SUB_LETTERS) else _LAT_SUB_LETTERS[min(k, 25)]
+                        out.append(f"{let}) {mark}{kid}")
+                    i = j
+                    continue
             out.append(raw)
             i += 1
             continue
@@ -825,7 +849,10 @@ def _merge_homogeneous(parts: List[str]) -> List[str]:
 
 
 def _atomize_step_body(text: str) -> List[str]:
-    """Смысловые шаги: ; / после чего / затем / смена роли. Не дробит «если» и однородные «и»."""
+    """Смысловые шаги: ; / после чего / затем / смена роли. Не дробит «если» и однородные «и».
+
+    Несколько длительностей в одном абзаце остаются на своих предложениях и не суммируются.
+    """
     t = re.sub(r"\s+", " ", (text or "").strip())
     if not t:
         return []
@@ -833,11 +860,26 @@ def _atomize_step_body(text: str) -> List[str]:
         return [t]
     if _CASE_RE.search(t):
         return [t]
+    owned = _split_owned_durations(t)
+    if owned:
+        return owned
     parts: List[str] = []
     for seq in _split_seq_conjunctions(t):
         parts.extend(_split_role_handoff(seq))
     merged = _merge_homogeneous(parts)
     return [p for p in merged if len(p.strip()) > 8] or [t]
+
+
+def _split_owned_durations(text: str) -> Optional[List[str]]:
+    """«(5 минут). … (30 мин).» → два шага. Чужой срок в этот шаг не входит."""
+    parts = [p.strip(" ;") for p in _SENTENCE_SPLIT_RE.split(text or "") if len(p.strip(" ;")) > 8]
+    if len(parts) < 2:
+        return None
+    if any(_CASE_RE.search(p) or _RETURN_RE.search(p) for p in parts[1:]):
+        return None
+    if sum(1 for p in parts if _DUR_RE.search(p)) < 2:
+        return None
+    return parts
 
 
 def _atomize_numbered_lines(text: str) -> str:
@@ -898,6 +940,8 @@ def _segment_unnumbered_prose(text: str) -> str:
     src = (text or "").strip()
     if not src or _count_explicit_numbers(src) >= 2:
         return src
+    if re.search(r"(?m)^[а-яёa-z]\)\s+", src, re.I):
+        return src
     headers: List[str] = []
     body: List[str] = []
     for line in src.splitlines():
@@ -941,6 +985,155 @@ def _segment_unnumbered_prose(text: str) -> str:
     return "\n".join([*headers, *numbered]).strip()
 
 
+_WML = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _docx_style_numbering(zf: Any) -> Dict[str, Tuple[str, str]]:
+    """styleId → (numId, ilvl). Автонумерация часто висит на стиле, а не на абзаце."""
+    direct: Dict[str, Tuple[str, str]] = {}
+    based: Dict[str, str] = {}
+    if "word/styles.xml" not in zf.namelist():
+        return direct
+    root = _ET.fromstring(zf.read("word/styles.xml"))
+    for style in root.findall(f"{_WML}style"):
+        sid = style.get(f"{_WML}styleId") or ""
+        based_el = style.find(f"{_WML}basedOn")
+        if based_el is not None and based_el.get(f"{_WML}val"):
+            based[sid] = based_el.get(f"{_WML}val") or ""
+        p_pr = style.find(f"{_WML}pPr")
+        num_pr = p_pr.find(f"{_WML}numPr") if p_pr is not None else None
+        if num_pr is None:
+            continue
+        num_id_el = num_pr.find(f"{_WML}numId")
+        if num_id_el is None or not num_id_el.get(f"{_WML}val"):
+            continue
+        ilvl_el = num_pr.find(f"{_WML}ilvl")
+        direct[sid] = (
+            num_id_el.get(f"{_WML}val") or "",
+            (ilvl_el.get(f"{_WML}val") if ilvl_el is not None else None) or "0",
+        )
+
+    resolved: Dict[str, Tuple[str, str]] = {}
+
+    def walk(sid: str, seen: Tuple[str, ...]) -> Optional[Tuple[str, str]]:
+        if sid in resolved:
+            return resolved[sid]
+        if sid in direct:
+            resolved[sid] = direct[sid]
+            return direct[sid]
+        parent = based.get(sid)
+        if not parent or parent in seen:
+            return None
+        found = walk(parent, seen + (sid,))
+        if found:
+            resolved[sid] = found
+        return found
+
+    for sid in set(direct) | set(based):
+        walk(sid, ())
+    return resolved
+
+
+def _docx_numbering_maps(
+    data: bytes,
+) -> Tuple[Dict[str, str], Dict[Tuple[str, str], Tuple[int, str]], Dict[str, Tuple[str, str]]]:
+    """numId → abstractNumId, (abstract, ilvl) → (start, fmt), styleId → (numId, ilvl)."""
+    import zipfile
+
+    num_to_abs: Dict[str, str] = {}
+    levels: Dict[Tuple[str, str], Tuple[int, str]] = {}
+    styles: Dict[str, Tuple[str, str]] = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            styles = _docx_style_numbering(zf)
+            if "word/numbering.xml" not in zf.namelist():
+                return num_to_abs, levels, styles
+            root = _ET.fromstring(zf.read("word/numbering.xml"))
+    except Exception:  # noqa: BLE001
+        return num_to_abs, levels, styles
+    for abstract in root.findall(f"{_WML}abstractNum"):
+        aid = abstract.get(f"{_WML}abstractNumId") or ""
+        for lvl in abstract.findall(f"{_WML}lvl"):
+            ilvl = lvl.get(f"{_WML}ilvl") or "0"
+            start_el = lvl.find(f"{_WML}start")
+            fmt_el = lvl.find(f"{_WML}numFmt")
+            start = int(start_el.get(f"{_WML}val") or "1") if start_el is not None else 1
+            fmt = (fmt_el.get(f"{_WML}val") if fmt_el is not None else None) or "decimal"
+            levels[(aid, ilvl)] = (start, fmt)
+    for num in root.findall(f"{_WML}num"):
+        nid = num.get(f"{_WML}numId") or ""
+        abs_el = num.find(f"{_WML}abstractNumId")
+        if nid and abs_el is not None:
+            num_to_abs[nid] = abs_el.get(f"{_WML}val") or ""
+    return num_to_abs, levels, styles
+
+
+def _docx_num_pr(paragraph: Any, styles: Dict[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    p_pr = getattr(paragraph._p, "pPr", None)
+    if p_pr is not None and p_pr.numPr is not None:
+        num_pr = p_pr.numPr
+        num_id = num_pr.numId.val if num_pr.numId is not None else None
+        if num_id is not None and str(num_id) != "0":
+            ilvl = num_pr.ilvl.val if num_pr.ilvl is not None and num_pr.ilvl.val is not None else 0
+            return str(num_id), str(ilvl)
+    style = getattr(paragraph, "style", None)
+    sid = getattr(style, "style_id", None) if style is not None else None
+    found = styles.get(sid or "")
+    if found and found[0] != "0":
+        return found
+    return None
+
+
+def _docx_next_label(
+    num_id: str,
+    ilvl: str,
+    counters: Dict[Tuple[str, str], int],
+    num_to_abs: Dict[str, str],
+    levels: Dict[Tuple[str, str], Tuple[int, str]],
+) -> str:
+    key = (num_id, ilvl)
+    for deeper in [k for k in counters if k[0] == num_id and int(k[1]) > int(ilvl)]:
+        counters.pop(deeper, None)
+    start, _fmt = levels.get((num_to_abs.get(num_id, ""), ilvl), (1, "decimal"))
+    if key not in counters:
+        counters[key] = start
+    else:
+        counters[key] += 1
+    return f"{counters[key]}. "
+
+
+def read_docx_regulation(data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """Текст .docx. Автонумерация Word не лежит в абзаце — номер берётся из numbering и пишется перед пунктом."""
+    try:
+        from docx import Document  # type: ignore[import-untyped]
+    except ImportError:
+        return None, "Для чтения .docx установите пакет: `pip install python-docx>=1.0.0`"
+    try:
+        doc = Document(io.BytesIO(data))
+        num_to_abs, levels, styles = _docx_numbering_maps(data)
+        counters: Dict[Tuple[str, str], int] = {}
+        parts: List[str] = []
+        for paragraph in doc.paragraphs:
+            raw = (paragraph.text or "").strip()
+            if not raw:
+                continue
+            num = _docx_num_pr(paragraph, styles)
+            if num and not re.match(r"^\d+[.)]\s+", raw):
+                raw = _docx_next_label(num[0], num[1], counters, num_to_abs, levels) + raw
+            parts.append(raw)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        text = "\n".join(parts).strip()
+        if not text:
+            return None, "В файле .docx не найден текстовый слой (пустые абзацы и таблицы)."
+        return text, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Не удалось прочитать .docx: {type(exc).__name__}: {exc}"
+
+
 def normalize_regulation(text: str) -> str:
     """Чистит текст, скопированный из PDF/Word, до вида «шаг на строке».
 
@@ -968,8 +1161,10 @@ def normalize_regulation(text: str) -> str:
         text = _MULTI_NUM_RE.sub(lambda m: mapping[m.group(1)] + ". " if m.group(1) in mapping else m.group(0), text)
         for num in sorted(mapping, key=len, reverse=True):
             text = re.sub(r"(?<![\d.])" + re.escape(num) + r"(?![\d])", mapping[num], text)
+    text = _promote_lettered_parallels(text)
+    text = _expand_corporate_numbering(text)
     text = _segment_unnumbered_prose(text)
-    return _atomize_numbered_lines(_expand_corporate_numbering(_promote_lettered_parallels(text)))
+    return _atomize_numbered_lines(text)
 
 
 def _to_hours(value: str, unit: str) -> float:
@@ -1294,13 +1489,31 @@ def _derive_no_label(clause: str) -> str:
     return "Иначе"
 
 
+def _explicit_alternative(src: str) -> Optional[re.Match]:
+    """«либо … либо» и «или … или/иначе» — развилка. Одиночное «или» шлюзом не становится."""
+    for word in ("либо", "или"):
+        m = re.search(rf"\b{word}\b", src or "", re.I)
+        if not m:
+            continue
+        rest = src[m.end():]
+        if re.search(rf"\b(?:{word}|иначе|в противном случае)\b", rest, re.I):
+            return m
+    return None
+
+
 def _parse_decision(text: str) -> Tuple[str, Optional[Decision]]:
     src = text or ""
     m = _CASE_RE.search(src)
+    if m is None:
+        m = _explicit_alternative(src)
     if m:
         action = src[: m.start()].strip(" .;,—–-")
         rest = src[m.end():]
-        else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае)\b[,:]?", rest, re.I)
+        opener = m.group(0).lower()
+        if opener in ("либо", "или"):
+            else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае|либо|или)\b[,:]?", rest, re.I)
+        else:
+            else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае)\b[,:]?", rest, re.I)
         yes_part = rest[: else_m.start()] if else_m else rest
         no_part = rest[else_m.end():] if else_m else ""
         pieces = re.split(r"\s+[—–-]\s+|,\s+|:\s+", yes_part.strip(), maxsplit=1)
@@ -1579,11 +1792,23 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
         ):
             j += 1
         run = blocks[i:j]
-        if len(run) > 3:  # строго больше 3 действий подразделения → подпроцесс
-            pieces = 1 if len(run) <= 7 else -(-len(run) // 5)
-            size = -(-len(run) // pieces)
-            for k in range(0, len(run), size):
-                chunk = run[k:k + size]
+        role = blocks[i].role
+        ahead = 0
+        if j < len(blocks) and blocks[j].kind == "decision" and blocks[j].role == role:
+            ahead = 1
+        visible_tail = 0
+        for prev in reversed(merged):
+            if prev.kind == "subprocess" or prev.role != role or prev.kind not in ("step", "decision"):
+                break
+            visible_tail += 1
+        # Линтер не сбрасывает цепочку на шлюзе: задача развилки той же роли входит в неё.
+        glue = len(run) + ahead + visible_tail
+        if len(run) > 4 or (glue > 4 and len(run) >= 2):
+            chunks = [run] if len(run) <= 4 else [run[k:k + 4] for k in range(0, len(run), 4)]
+            for chunk in chunks:
+                if len(chunk) < 2:
+                    merged.extend(chunk)
+                    continue
                 chunk_steps = [b.steps[0] for b in chunk]
                 stage = next((s.stage for s in chunk_steps if s.stage), None)
                 name = stage or f"{chunk[0].role}: {chunk_steps[0].title[:38].rstrip('…')}"
@@ -4922,6 +5147,10 @@ def _heuristic_optimize_to_be(
     do_safety: bool = True,
     do_loops: bool = True,
     do_control: bool = False,
+    only_auto: Optional[Set[int]] = None,
+    only_parallel: Optional[Set[int]] = None,
+    only_loops: Optional[Set[int]] = None,
+    only_control: Optional[Set[int]] = None,
 ) -> Tuple[str, List[Dict[str, str]]]:
     raw_text = normalize_regulation(regulation_text or "")
     header, raw_steps = _split_steps(raw_text)
@@ -4940,6 +5169,8 @@ def _heuristic_optimize_to_be(
 
     if do_auto:
         for i in range(n):
+            if only_auto is not None and i not in only_auto:
+                continue
             body = bodies[i]
             if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
                 bodies[i] = _automate_journal_body(body)
@@ -4957,6 +5188,9 @@ def _heuristic_optimize_to_be(
         i = 0
         while i < n - 1:
             a, b = parsed.steps[i], parsed.steps[i + 1]
+            if only_parallel is not None and i not in only_parallel:
+                i += 1
+                continue
             already = _is_parallel_body(bodies[i + 1])
             if (
                 not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
@@ -5004,6 +5238,8 @@ def _heuristic_optimize_to_be(
             loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
             if not loops:
                 continue
+            if only_loops is not None and i not in only_loops:
+                continue
             bodies[i] = _cut_rework_loop(bodies[i])
             prev = bodies[i - 1] if i else ""
             if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
@@ -5015,7 +5251,7 @@ def _heuristic_optimize_to_be(
                 )
                 continue
             inserted = False
-            if do_control and i:
+            if do_control and i and (only_control is None or i in only_control):
                 prev_st = parsed.steps[i - 1]
                 prev_role = prev_st.role or ""
                 ctrl_role = next(
@@ -5158,11 +5394,99 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
     }
 
 
+def _catalog_tobe_moves(regulation_text: str) -> Tuple[List[int], List[int], List[int]]:
+    """Индексы отдельных ходов: автоматизация, соседняя параллель, снятие цикла."""
+    raw_text = normalize_regulation(regulation_text or "")
+    try:
+        parsed = parse_regulation(raw_text)
+        _, raw_steps = _split_steps(raw_text)
+    except Exception:  # noqa: BLE001
+        return [], [], []
+    n = min(len(parsed.steps), len(raw_steps))
+    bodies = [raw_steps[i]["body"] for i in range(n)]
+    autos: List[int] = []
+    pairs: List[int] = []
+    loops: List[int] = []
+    for i in range(n):
+        body = bodies[i]
+        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+            autos.append(i)
+        d = parsed.steps[i].decision
+        if d and (d.no_back or (d.no_ref is not None and d.no_ref < parsed.steps[i].num)):
+            loops.append(i)
+    for i in range(n - 1):
+        a, b = parsed.steps[i], parsed.steps[i + 1]
+        if _is_parallel_body(bodies[i + 1]):
+            continue
+        if _forbid_parallel(a, b, bodies[i], bodies[i + 1]):
+            continue
+        if _independent_steps(a, b, bodies[i], bodies[i + 1]):
+            pairs.append(i)
+    return autos, pairs, loops
+
+
+def _iter_tobe_selections(
+    autos: Sequence[int],
+    pairs: Sequence[int],
+    loops: Sequence[int],
+) -> List[Tuple[Set[int], Set[int], Set[int], Set[int]]]:
+    """Сочетания ходов. У цикла три состояния: не трогать, снять, снять и добавить контроль."""
+    auto_l, pair_l, loop_l = list(autos), list(pairs), list(loops)
+    count = (2 ** len(auto_l)) * (2 ** len(pair_l)) * (3 ** len(loop_l))
+    selections: List[Tuple[Set[int], Set[int], Set[int], Set[int]]] = []
+
+    def add(auto_idx: Sequence[int], pair_idx: Sequence[int], loop_states: Sequence[int]) -> None:
+        chosen_loops = {loop_l[i] for i, state in enumerate(loop_states) if state}
+        chosen_ctrl = {loop_l[i] for i, state in enumerate(loop_states) if state == 2}
+        selections.append((set(auto_idx), set(pair_idx), chosen_loops, chosen_ctrl))
+
+    if count <= 256 and count:
+        for amask in range(2 ** len(auto_l)):
+            auto_idx = [auto_l[i] for i in range(len(auto_l)) if amask & (1 << i)]
+            for pmask in range(2 ** len(pair_l)):
+                pair_idx = [pair_l[i] for i in range(len(pair_l)) if pmask & (1 << i)]
+                states = [0] * len(loop_l)
+                if not loop_l:
+                    add(auto_idx, pair_idx, states)
+                    continue
+                for lmask in range(3 ** len(loop_l)):
+                    value = lmask
+                    for i in range(len(loop_l)):
+                        states[i] = value % 3
+                        value //= 3
+                    add(auto_idx, pair_idx, states)
+        return selections
+
+    full_states = [1] * len(loop_l)
+    ctrl_states = [2] * len(loop_l)
+    add(auto_l, pair_l, full_states)
+    add(auto_l, pair_l, ctrl_states)
+    add([], [], full_states)
+    for i in range(len(auto_l)):
+        add([auto_l[i]], [], [0] * len(loop_l))
+        add([a for k, a in enumerate(auto_l) if k != i], pair_l, full_states)
+    for i in range(len(pair_l)):
+        add([], [pair_l[i]], [0] * len(loop_l))
+        add(auto_l, [p for k, p in enumerate(pair_l) if k != i], full_states)
+    for i in range(len(loop_l)):
+        alone = [0] * len(loop_l)
+        alone[i] = 1
+        add([], [], alone)
+        with_ctrl = [0] * len(loop_l)
+        with_ctrl[i] = 2
+        add([], [], with_ctrl)
+        rest = [1] * len(loop_l)
+        rest[i] = 0
+        add(auto_l, pair_l, rest)
+    return selections
+
+
 def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
     """Реинжиниринг As-Is → To-Be: поиск оптимума с откатом ходов, нарушающих ОТ или удлиняющих голый путь.
 
     Лексикография после жёстких ограничений: короче путь с возвратами, затем короче голый КП, затем меньше шагов.
-    Если ни один кандидат не принят — возвращается As-Is.
+    Сначала считаются прежние наборы классов ходов — это текущий To-Be. Затем перебираются сочетания отдельных ходов.
+    Сочетание заменяет текущий To-Be только если оно строго лучше. Если ни один кандидат не принят — возвращается As-Is.
     Облачная LLM включается только переменной BPMN_TOBE_LLM=1 и проходит ту же проверку.
     """
     text = (regulation_text or "").strip()
@@ -5222,6 +5546,26 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
 
     for flags in flagsets:
         opt_text, actions = _heuristic_optimize_to_be(text, **flags)
+        if not actions:
+            continue
+        _consider(opt_text, actions, "semantic-optimizer")
+
+    autos, pairs, loops = _catalog_tobe_moves(text)
+    for auto_idx, pair_idx, loop_idx, ctrl_idx in _iter_tobe_selections(autos, pairs, loops):
+        if not (auto_idx or pair_idx or loop_idx or ctrl_idx):
+            continue
+        opt_text, actions = _heuristic_optimize_to_be(
+            text,
+            do_auto=bool(auto_idx),
+            do_parallel=bool(pair_idx),
+            do_safety=True,
+            do_loops=bool(loop_idx),
+            do_control=bool(ctrl_idx),
+            only_auto=auto_idx,
+            only_parallel=pair_idx,
+            only_loops=loop_idx,
+            only_control=ctrl_idx,
+        )
         if not actions:
             continue
         _consider(opt_text, actions, "semantic-optimizer")

@@ -16,6 +16,8 @@ from ai_generator import (
     build_process_context,
     optimize_process_to_be,
     parse_regulation,
+    read_docx_regulation,
+    _build_blocks,
 )
 
 
@@ -25,6 +27,11 @@ def main() -> None:
     )
     xml, audit, err = generate_bpmn_from_text(text, use_llm=False)
     assert not err, err
+    assert audit["sla"]["critical_path_hours"] == 9.7
+    assert audit["sla"]["with_rework_hours"] == 12.55
+    assert len(audit["rework_loops"]) == 2
+    assert audit["methodology"]["score"] == 100
+    assert 'name="СИЗ"' not in xml
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
     xor_ids = set(re.findall(r'<bpmn:exclusiveGateway\b[^>]*\bid="([^"]+)"', xml))
     other_ids = set(re.findall(r'<bpmn:(?:parallelGateway|inclusiveGateway)\b[^>]*\bid="([^"]+)"', xml))
@@ -72,6 +79,9 @@ def main() -> None:
     assert int(delta.get("rework_after") or 0) <= int(delta.get("rework_before") or 0)
 
     parsed = parse_regulation(text)
+    ppe = next(s for s in parsed.steps if s.num == 12)
+    assert ppe.title == "Подготовить СИЗ, инструмент и переносные заземления"
+    assert ppe.role == "Ремонтная бригада"
     matrix = generate_raci_matrix(parsed.steps, parsed.roles)
     assert matrix, "пустая матрица RACI"
     assert all(any("A" in (row["assignments"].get(r) or []) for r in parsed.roles) for row in matrix)
@@ -101,6 +111,11 @@ def main() -> None:
     after = float(delta_g["sla_after_hours"])
     assert abs(saved - (before - after)) < 1e-6, (saved, before, after)
     assert before > after
+    xml_g, audit_g_full, err_g_full = generate_bpmn_from_text(grid, use_llm=False)
+    assert not err_g_full, err_g_full
+    assert audit_g_full["sla"]["critical_path_hours"] == 400.3
+    assert audit_g_full["sla"]["with_rework_hours"] == 584.4
+    assert audit_g_full["methodology"]["score"] == 100
 
     proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
         encoding="utf-8"
@@ -112,6 +127,8 @@ def main() -> None:
     q_before = int(delta_p.get("quality_before") or 0)
     assert q_before == 100, q_before
     assert q_after == 100, (q_after, (delta_p.get("tobe_audit") or {}).get("methodology"))
+    assert audit_p["sla"]["critical_path_hours"] == 528.3
+    assert audit_p["sla"]["with_rework_hours"] == 856.5
     assert "автоматически:" not in opt_p.lower()
     assert "проводит предварительный входной контроль" in opt_p or "входной контроль" in opt_p.lower()
     ctx_p = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
@@ -288,6 +305,110 @@ DIAGRAM.add_link(a, ROOT_END_TASK_ID)
     assert not audit_h.get("dead_ends")
     assert not audit_h.get("orphans_without_incoming")
     assert audit_h.get("xsd_valid") is not False
+
+    from io import BytesIO
+    from docx import Document
+
+    doc = Document()
+    for item in ("Принять сообщение", "Зафиксировать аварию", "Оценить масштаб"):
+        doc.add_paragraph(item, style="List Number")
+    buf = BytesIO()
+    doc.save(buf)
+    docx_text, docx_err = read_docx_regulation(buf.getvalue())
+    assert not docx_err, docx_err
+    docx_lines = [ln.strip() for ln in (docx_text or "").splitlines() if ln.strip()]
+    assert docx_lines == [
+        "1. Принять сообщение",
+        "2. Зафиксировать аварию",
+        "3. Оценить масштаб",
+    ], docx_lines
+
+    glued = (
+        "1. Диспетчер принимает сообщение (5 минут). Диспетчер фиксирует журнал (30 мин).\n"
+        "2. Начальник смены оценивает масштаб (2 часа).\n"
+        "3. Служба безопасности проверяет допуск (1,5 ч).\n"
+    )
+    owned = parse_regulation(glued)
+    assert [round(s.hours, 4) for s in owned.steps] == [round(5 / 60, 4), 0.5, 2.0, 1.5], [
+        (s.hours, s.title) for s in owned.steps
+    ]
+
+    parallel = (
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Параллельно: Ремонтная бригада проводит осмотр (3 часа).\n"
+    )
+    xml_par, audit_par, err_par = generate_bpmn_from_text(parallel, use_llm=False)
+    assert not err_par, err_par
+    assert audit_par["sla"]["critical_path_hours"] == 3.0, audit_par["sla"]
+    assert "parallelGateway" in xml_par
+
+    lettered = (
+        "1. Параллельно:\n"
+        "а) Ремонтная бригада готовит инструмент (1 час).\n"
+        "б) Служба безопасности проводит осмотр площадки (3 часа).\n"
+    )
+    xml_let, audit_let, err_let = generate_bpmn_from_text(lettered, use_llm=False)
+    assert not err_let, err_let
+    assert audit_let["sla"]["critical_path_hours"] == 3.0, audit_let["sla"]
+    assert "parallelGateway" in xml_let
+
+    either = (
+        "1. Служба безопасности проверяет допуск (10 минут). "
+        "Либо комплект полный — перейти к п.2, либо отказ — завершить процесс.\n"
+        "2. Диспетчер закрывает заявку (20 минут).\n"
+    )
+    xml_xor, _, err_xor = generate_bpmn_from_text(either, use_llm=False)
+    assert not err_xor, err_xor
+    assert "exclusiveGateway" in xml_xor
+    casual = (
+        "1. Диспетчер сверяет схему или журнал (10 минут).\n"
+        "2. Начальник смены закрывает наряд (20 минут).\n"
+    )
+    xml_or, _, err_or = generate_bpmn_from_text(casual, use_llm=False)
+    assert not err_or, err_or
+    assert "exclusiveGateway" not in xml_or
+
+    chain = "\n".join(
+        [
+            "Регламент: Цепочка одной роли",
+            "1. Диспетчер принимает заявку (10 минут).",
+            "2. Диспетчер фиксирует журнал (10 минут).",
+            "3. Диспетчер сверяет схему (10 минут).",
+            "4. Диспетчер готовит бланк переключений (10 минут).",
+            "5. Диспетчер передаёт смену (10 минут).",
+            "6. Диспетчер закрывает заявку (10 минут).",
+        ]
+    )
+    chain_blocks, _ = _build_blocks(parse_regulation(chain))
+    assert [(b.kind, len(b.steps)) for b in chain_blocks] == [("subprocess", 4), ("subprocess", 2)]
+    _, audit_chain, err_chain = generate_bpmn_from_text(chain, use_llm=False)
+    assert not err_chain, err_chain
+    assert audit_chain["methodology"]["score"] == 100
+    assert not audit_chain["methodology"]["long_chains"]
+
+    bare = """
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+a = DIAGRAM.add_user_task("Принять заявку диспетчера", lanes[0])
+b = DIAGRAM.add_user_task("Зафиксировать запись в журнале", lanes[0])
+c = DIAGRAM.add_user_task("Сверить оперативную схему", lanes[0])
+d = DIAGRAM.add_user_task("Подготовить бланк переключений", lanes[0])
+e = DIAGRAM.add_user_task("Передать смену диспетчеру", lanes[0])
+f = DIAGRAM.add_user_task("Закрыть оперативную заявку", lanes[0])
+DIAGRAM.add_link(ROOT_START_TASK_ID, a)
+DIAGRAM.add_link(a, b)
+DIAGRAM.add_link(b, c)
+DIAGRAM.add_link(c, d)
+DIAGRAM.add_link(d, e)
+DIAGRAM.add_link(e, f)
+DIAGRAM.add_link(f, ROOT_END_TASK_ID)
+"""
+    _, audit_bare, err_bare = execute_generated_code(bare, "Цепочка без разрезания")
+    assert not err_bare, err_bare
+    assert audit_bare["methodology"]["long_chains"], audit_bare["methodology"]
+    assert audit_bare["methodology"]["score"] < 100
+
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
     print("NEW_STEP", new_step)
