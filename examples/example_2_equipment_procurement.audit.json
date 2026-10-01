@@ -165,7 +165,7 @@
     },
     {
       "id": "Activity_12",
-      "name": "Определить победителя и утвердить протокол",
+      "name": "Определить победителя и утверждать протокол",
       "kind": "userTask",
       "role": "Тендерный комитет",
       "hours": 16.0
@@ -221,6 +221,54 @@
   "auto_healed": [],
   "engine_warnings": [],
   "skipped_links": [],
+  "methodology": {
+    "score": 100,
+    "max_score": 100,
+    "passed": true,
+    "checks": [
+      {
+        "key": "naming",
+        "title": "Стандарт названий задач (Глагол + Объект)",
+        "passed": true,
+        "weight": 30,
+        "points": 30.0,
+        "detail": "13 из 13 задач в форме «глагол в инфинитиве + объект» (100%; цель 100%).",
+        "findings": []
+      },
+      {
+        "key": "gateway",
+        "title": "Корректность развилок и условий",
+        "passed": true,
+        "weight": 25,
+        "points": 25.0,
+        "detail": "XOR/OR-развилки с «?» в названии и подписями исходящих потоков.",
+        "findings": []
+      },
+      {
+        "key": "subway",
+        "title": "Индекс декомпозиции (Анти-метро)",
+        "passed": true,
+        "weight": 20,
+        "points": 20.0,
+        "detail": "Нет монотонных цепочек длиннее 4 шагов одной роли без подпроцесса.",
+        "findings": []
+      },
+      {
+        "key": "topology",
+        "title": "Топологическая связность графа",
+        "passed": true,
+        "weight": 25,
+        "points": 25.0,
+        "detail": "Тупиков и изолированных узлов нет.",
+        "findings": []
+      }
+    ],
+    "naming_ratio": 1.0,
+    "gateway_issues": 0,
+    "long_chains": 0,
+    "dead_ends": 0,
+    "orphans": 0
+  },
   "stats": {
     "nodes": 23,
     "valid_links": 25,
@@ -322,7 +370,7 @@
       "облачный API: OPENAI_API_KEY не задан"
     ],
     "rejected": [],
-    "elapsed_s": 0.01,
+    "elapsed_s": 0.02,
     "parsed": {
       "title": "Закупка силового трансформатора 110/10 кВ с проверкой СБ и тендерным комитетом",
       "steps": 13,

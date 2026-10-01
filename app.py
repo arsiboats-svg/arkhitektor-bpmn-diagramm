@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import html
 import io
@@ -25,14 +26,17 @@ from ai_generator import (
     build_process_context,
     cloud_engine_status,
     export_docx_passport,
+    align_result_quality,
     generate_bpmn_from_text,
     generate_process_passport,
     generate_raci_matrix,
+    read_docx_regulation,
     inspect_task_details,
     normalize_regulation,
     optimize_process_to_be,
     parse_bpmn_structure,
     parse_regulation,
+    process_facts,
 )
 
 
@@ -58,6 +62,8 @@ ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
+USE_LLM_ON_OPEN = True
+GENERATION_BUSY_LABEL = "Генерация BPMN 2.0…"
 DIAGRAM_HEIGHT = 580  # ноутбук ~900 px: холст + карточки без бесконечной прокрутки
 DIAGRAM_HEIGHT_WIDE = 640
 VIEW_WIDE = "🖥  Широкий вид"
@@ -66,10 +72,10 @@ ASIS_LABEL = "Текущий процесс (As-Is)"
 TOBE_LABEL = "Целевой оптимизированный (To-Be)"
 
 QUICK_PROMPTS = [
-    ("🔍 Разбор узких мест SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
-    ("⚡ Как ускорить процесс?", "Как ускорить процесс? Что даст наибольший эффект?"),
-    ("📝 Регламент для исполнителя", "Составь должностную инструкцию для самой загруженной роли по текущей схеме."),
-    ("🔮 Предложить следующий шаг", "Предложи следующий шаг процесса: чего не хватает в регламенте?"),
+    ("🔍 Срыв SLA", "В чём причина срыва SLA? Какие шаги и возвраты съедают срок?"),
+    ("⚡ As-Is / To-Be", "Сравни As-Is и To-Be, до и после"),
+    ("⏱ Как сократили время", "Как мы сократили время? Объясни подробнее"),
+    ("🌿 Экологи после шага 3", "Добавь согласование с экологами после шага 3"),
 ]
 
 BLUE_DARK, BLUE = "#003366", "#1565C0"
@@ -102,7 +108,7 @@ def read_asset(name: str) -> Optional[str]:
 
 
 def _reg_hash(text: str, *parts: object) -> str:
-    payload = "\u001f".join(["palette-corporate-v3", text or "", *[str(p) for p in parts]])
+    payload = "\u001f".join(["palette-corporate-v7", text or "", *[str(p) for p in parts]])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -123,14 +129,14 @@ def _audit_cache_slice(audit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False)
 def cached_generate_bpmn(text_hash: str, text: str, use_llm: bool) -> Tuple[str, Dict[str, Any], str]:
-    """Генерация XML + аудит по sha256 текста регламента. Повторный вызов — из кэша Streamlit."""
+    """Генерация XML + аудит. Кэш v7: не отдаёт прошлую схему с другим числом обратных рёбер."""
     _ = text_hash
     return generate_bpmn_from_text(text, use_llm=use_llm)
 
 
 @st.cache_data(show_spinner=False)
 def cached_optimize_to_be(text_hash: str, text: str, asis_core: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """To-Be по хешу регламента: вкладки и смена вида не пересчитывают граф."""
+    """To-Be по хешу регламента и числу рёбер этой сборки. Прошлый delta с другим числом петель не берётся."""
     _ = text_hash
     return optimize_process_to_be(text, asis_core)
 
@@ -162,7 +168,26 @@ html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMarkdown
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
 }}
 .stApp {{ background: #F4F8FD; color: #0F172A; }}
-.block-container {{ padding-top: 0.85rem; max-width: 1500px; }}
+.block-container, [data-testid="stMainBlockContainer"] {{
+  padding-top: 0.85rem; max-width: 1500px; width: 100%;
+}}
+[data-testid="stMain"] {{ min-width: 0; }}
+/* Ширину 28rem только у открытого сайдбара: иначе transform не вынимает колонку из потока. */
+section[data-testid="stSidebar"][aria-expanded="true"] {{
+  min-width: 28rem !important; width: 28rem !important; max-width: 32rem !important;
+}}
+section[data-testid="stSidebar"][aria-expanded="false"] {{
+  min-width: 0 !important; width: 0 !important; max-width: 0 !important;
+}}
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+section[data-testid="stSidebar"] [data-testid="stChatMessage"] {{
+  overflow-wrap: anywhere; word-break: break-word; white-space: normal;
+}}
+iframe[srcdoc],
+[data-testid="stIFrame"] iframe,
+[data-testid="stCustomComponentV1"] iframe {{
+  width: 100% !important; max-width: 100% !important;
+}}
 header[data-testid="stHeader"] {{ background: transparent; }}
 #MainMenu, footer {{ visibility: hidden; }}
 button, a, [role="button"], [data-baseweb="tab"], [data-baseweb="select"],
@@ -222,6 +247,54 @@ div[data-testid="stDownloadButton"] button, .stDownloadButton > button {{
 .stButton > button[kind="primary"]:hover {{ filter:brightness(1.08); transform: translateY(-1px); }}
 .stDownloadButton > button {{ border:2px solid {BLUE}; color:{BLUE}; background:#fff; }}
 .stDownloadButton > button:hover {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
+/* Ряд из четырёх выгрузок: паспорт и DOCX тем же видом, что BPMN и SVG. */
+.st-key-export_row [data-testid="stButton"],
+.st-key-export_row [data-testid="stDownloadButton"] {{
+  margin: 0 !important;
+}}
+.st-key-export_row .stButton > button,
+.st-key-export_row .stDownloadButton > button {{
+  width: 100% !important;
+  height: 40px !important;
+  min-height: 40px !important;
+  max-height: 40px !important;
+  box-sizing: border-box !important;
+  border: 2px solid {BLUE} !important;
+  border-radius: 12px !important;
+  color: {BLUE} !important;
+  background: #fff !important;
+  font-weight: 700 !important;
+  font-size: 0.82rem !important;
+  padding: 0 0.7rem !important;
+  box-shadow: none !important;
+  white-space: nowrap !important;
+  line-height: 1.1 !important;
+}}
+.st-key-export_row .stButton > button:hover,
+.st-key-export_row .stDownloadButton > button:hover {{
+  background: #E3F2FD !important;
+  color: {BLUE_DARK} !important;
+  border-color: {BLUE_DARK} !important;
+}}
+.st-key-export_row .stButton > button p,
+.st-key-export_row .stDownloadButton > button p,
+.st-key-export_row .stButton > button span,
+.st-key-export_row .stDownloadButton > button span {{
+  color: inherit !important;
+  font-weight: 700 !important;
+  font-size: 0.82rem !important;
+}}
+.st-key-export_row [data-testid="stIFrame"],
+.st-key-export_row [data-testid="stCustomComponentV1"] {{
+  height: 40px !important;
+  border: 0 !important;
+  background: transparent !important;
+}}
+.st-key-export_row iframe {{
+  height: 40px !important;
+  border: 0 !important;
+  background: transparent !important;
+}}
 textarea, [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {{
   font-size:.9rem !important; line-height:1.45 !important; border-radius:14px !important;
   transition: all 0.2s ease !important;
@@ -424,8 +497,8 @@ def viewer_html(
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
-  html,body {{ margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
-  #wrap {{ position:relative; height:{height}px; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
+  html,body {{ margin:0; height:100%; width:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
+  #wrap {{ position:relative; width:100%; height:{height}px; box-sizing:border-box; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
       background-color:#fff;
       background-image: radial-gradient(circle, #D0DCEB 1.5px, transparent 1.5px);
       background-size: 24px 24px; }}
@@ -641,6 +714,7 @@ def viewer_html(
     fit();
     requestAnimationFrame(fit);
     setTimeout(fit, 120);
+    setTimeout(fit, 340);
     setTimeout(focusStart, 380);
   }}
   {EMPHASIZE_JS}
@@ -891,7 +965,6 @@ def viewer_html(
   document.getElementById('zout').onclick = () => zoomBy(0.8);
   document.getElementById('fit').onclick = fit;
   document.getElementById('one').onclick = () => canvas().zoom(1, 'auto');
-  window.addEventListener('resize', fit);
 
   // ---------------- Панорама на весь экран ----------------
   // Приоритет: Fullscreen API. Если он недоступен/отклонён — гарантированный оверлей:
@@ -901,6 +974,38 @@ def viewer_html(
   const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
   const frameEl = (() => {{ try {{ return window.frameElement; }} catch (e) {{ return null; }} }})();
   const parentDoc = (() => {{ try {{ return window.parent.document; }} catch (e) {{ return null; }} }})();
+
+  (function watchLayout() {{
+    let timer = 0;
+    const kick = () => {{
+      clearTimeout(timer);
+      timer = setTimeout(() => {{ fitSoon(); }}, 40);
+    }};
+    window.addEventListener('resize', kick);
+    try {{
+      if (window.ResizeObserver) {{
+        const ro = new ResizeObserver(kick);
+        ro.observe(wrap);
+        if (document.documentElement) ro.observe(document.documentElement);
+      }}
+    }} catch (e) {{}}
+    try {{
+      if (!parentDoc || !window.MutationObserver) return;
+      const side = parentDoc.querySelector('[data-testid="stSidebar"]');
+      if (side) {{
+        new MutationObserver(kick).observe(side, {{
+          attributes: true,
+          attributeFilter: ['aria-expanded', 'style', 'class'],
+        }});
+      }}
+      parentDoc.addEventListener('click', ev => {{
+        const hit = ev.target && ev.target.closest && ev.target.closest(
+          '[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapseButton"]'
+        );
+        if (hit) kick();
+      }}, true);
+    }} catch (e) {{}}
+  }})();
 
   function setPanoUi(on) {{
     wrap.classList.toggle('pano', on);
@@ -1000,25 +1105,32 @@ def viewer_html(
   }}
   function copilotAnswer(msg) {{
     const q = (msg || '').trim();
-    if (!q) return 'Напишите вопрос о процессе — SLA, сравнение As-Is/To-Be, роли или читаемость.';
+    if (!q) return 'Спросите про блок на схеме, SLA или As-Is/To-Be.';
     const low = q.toLowerCase();
+    if (/\b(добав\w*|вставь\w*|удал\w*|убер\w*|исключ\w*|сдела\w+\s+параллел)/.test(low)) {{
+      return 'Команду в сайдбар: «' + q.replace(/\s+/g, ' ').replace(/[.]+$/, '') + '»';
+    }}
+    const cardOpen = tip && tip.style.display === 'block';
+    const sel = (cardOpen && selectedId && CATALOG[selectedId]) || null;
+    if (sel && sel.copilot && /этот|выбран|блок|почему|критич|цикл|путь|возврат/.test(low)) {{
+      return sel.copilot;
+    }}
     const chips = COPILOT.chips || [];
     const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
     if (exact) return exact.a;
-    if (/quality|качеств|почему.*(?:score|балл|нотац|линтер)|(?:упал|изменил).*quality/.test(low))
-      return COPILOT.quality || COPILOT.readability || COPILOT.fallback;
-    if (/как\\s+(?:мы\\s+)?сократ|за сч[её]т|за счет чего|объясни подробн|почему.*(?:сократ|ускор|экономи)|в ч[её]м причина.*(?:сократ|экономи)/.test(low))
-      return COPILOT.why || chipBy('tobe') || COPILOT.fallback;
-    if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев/.test(low))
+    if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев|ускор|экономи/.test(low))
       return chipBy('tobe') || COPILOT.compare || COPILOT.fallback;
-    if (/читаем|метро|анти-метро|подпроцесс|методолог/.test(low))
-      return COPILOT.readability || chipBy('tobe') || COPILOT.fallback;
-    if (/ускор|оптимиз|быстрее|параллел/.test(low)) return chipBy('speed') || COPILOT.fallback;
-    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) return chipBy('sla') || COPILOT.fallback;
-    if (/цикл|возврат|доработ|rework/.test(low)) return COPILOT.loops || COPILOT.fallback;
-    if (/систем|it\b|ит-|документ|ландшафт/.test(low)) return COPILOT.landscape || COPILOT.fallback;
+    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) {{
+      if (sel && sel.copilot) return sel.copilot;
+      return chipBy('sla') || COPILOT.fallback;
+    }}
+    if (/цикл|возврат|доработ|rework/.test(low)) {{
+      if (sel && sel.copilot) return sel.copilot;
+      return COPILOT.loops || COPILOT.fallback;
+    }}
     if (/роль|нагруз|bus|риск|исполнител|диспетчер|загруж/.test(low)) return chipBy('roles') || COPILOT.fallback;
-    return COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — тогда отвечу по метрикам.';
+    if (sel && sel.copilot) return sel.copilot;
+    return COPILOT.compare || COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — отвечу по схеме.';
   }}
   function ask(text) {{
     const q = (text || '').trim();
@@ -1134,6 +1246,18 @@ def _share_by_role(lane_load: Optional[List[Dict[str, Any]]]) -> Dict[str, float
     return {str(it.get("role") or ""): float(it.get("share") or 0) for it in (lane_load or []) if it.get("role")}
 
 
+def _role_hours_share(lane_load: Optional[List[Dict[str, Any]]], role: str) -> float:
+    """Доля часов той же роли, чья доля шагов уже показана как bus-factor."""
+    for item in lane_load or []:
+        if str(item.get("role") or "") != str(role or ""):
+            continue
+        try:
+            return float(item.get("hours_share") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
 def lane_load_html(
     lane_load: Optional[List[Dict[str, Any]]],
     bus_factor: Optional[Dict[str, Any]] = None,
@@ -1146,6 +1270,7 @@ def lane_load_html(
     rows: List[str] = []
     for item in sorted(lane_load or [], key=lambda it: -float(it.get("share") or 0)):
         share = float(item.get("share") or 0)
+        hours_share = float(item.get("hours_share") or 0)
         role = str(item.get("role") or "")
         was = prev.get(role)
         relieved = compare and was is not None and was > threshold and share <= threshold
@@ -1159,7 +1284,7 @@ def lane_load_html(
         rows.append(
             f'<div class="bar-row"><div class="n" title="{esc(role)}">{esc(role)}</div>'
             f'<div class="t"><div class="f {klass}" style="width:{min(share, 1) * 100:.0f}%"></div></div>'
-            f'<div class="p">{share:.0%} · {int(item.get("tasks") or 0)} шаг.{delta}</div></div>'
+            f'<div class="p">{share:.0%} шагов · {hours_share:.0%} часов · {int(item.get("tasks") or 0)} шаг.{delta}</div></div>'
         )
     return "".join(rows) or '<div class="land-empty">Нет данных о нагрузке ролей.</div>'
 
@@ -1294,7 +1419,7 @@ def render_methodology(audit: Dict[str, Any]) -> None:
         f'<div class="meth-score" style="background:linear-gradient(105deg,{color},{BLUE})">'
         f'<div class="k" style="opacity:.85;font-size:.75rem;letter-spacing:.5px">QUALITY SCORE</div>'
         f'<div class="v">{score}%</div>'
-        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">интегральная оценка модели</div></div>'
+        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">доля регламента без нарушений</div></div>'
     ]
     for chk in meth.get("checks") or []:
         passed = bool(chk.get("passed"))
@@ -1308,9 +1433,16 @@ def render_methodology(audit: Dict[str, Any]) -> None:
             f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
         )
     st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
+    result_text = str(audit.get("result_text") or "").strip()
+    if result_text:
+        st.caption("Текст результата — его вставка собирает схему с тем же баллом.")
+        st.code(result_text, language="text")
+    for gap in meth.get("violations") or []:
+        if "явных возврата" in str(gap):
+            st.markdown(f'<div class="rec bad">{esc(gap)}</div>', unsafe_allow_html=True)
     with st.expander("Детали проверок нотации"):
         for chk in meth.get("checks") or []:
-            st.markdown(f"**{_meth_title(chk)}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
+            st.markdown(f"**{_meth_title(chk)}** — {chk.get('detail')}")
             for fnd in chk.get("findings") or []:
                 st.markdown(f"- {fnd}")
 
@@ -1398,7 +1530,8 @@ def render_audit(audit: Dict[str, Any]) -> None:
         card(
             "Bus-factor",
             f"{float(bus['max_share']):.0%}",
-            f"Роль «{esc(bus['top_role'])}» · порог {float(bus['threshold']):.0%}",
+            f"Роль «{esc(bus['top_role'])}» · порог {float(bus['threshold']):.0%}"
+            f" · по часам {_role_hours_share(audit.get('lane_load'), str(bus.get('top_role') or '')):.0%}",
             bus_color,
             bus_pill,
         ),
@@ -1481,30 +1614,176 @@ def render_details(audit: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # Приложение
 # --------------------------------------------------------------------------- #
+def _tobe_accepted(facts: Dict[str, Any]) -> bool:
+    """Кандидат длиннее голого As-Is или с живыми циклами на вкладку не попадает."""
+    if not facts.get("tobe_ready"):
+        return False
+    cp_before = float(facts.get("cp_before") or 0)
+    cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
+    if cp_after > cp_before + 1.0 / 60.0:
+        return False
+    loops_before = int(facts.get("loops_before") or 0)
+    loops_after = int(facts.get("loops_after") or 0)
+    if loops_after > loops_before:
+        return False
+    if loops_before > 0 and loops_after >= loops_before:
+        return False
+    return True
+
+
+def tobe_card_headline(facts: Dict[str, Any]) -> str:
+    """Подпись карточки экономии. «Без ускорения» не используется, когда путь с возвратами короче."""
+    if not facts.get("speedup_via_rework"):
+        return ""
+    rw_before = float(facts.get("rw_before") or 0)
+    rw_after = float(facts.get("rw_after") or 0)
+    pct = int(facts.get("rw_saved_pct") or 0)
+    return f"Экономия пути с возвратами: {fmt_hours(rw_before)} → {fmt_hours(rw_after)} (−{pct}%)"
+
+
+def _annotate_tobe_facts(
+    facts: Dict[str, Any],
+    asis_audit: Dict[str, Any],
+    tobe_audit: Dict[str, Any],
+    *,
+    show_steps: bool,
+) -> Dict[str, Any]:
+    view = dict(facts)
+    view["path_n_before"] = len(_path_tasks_only(asis_audit.get("critical_path")))
+    view["bus_hours_share"] = _role_hours_share(view.get("lane_load"), str(view.get("bus_role") or ""))
+    view["show_steps"] = bool(show_steps and tobe_audit.get("critical_path"))
+    if view["show_steps"]:
+        later = process_facts(tobe_audit, None)
+        view["path_n_after"] = len(_path_tasks_only(tobe_audit.get("critical_path")))
+        view["bus_share_after"] = later.get("bus_share") or 0
+        view["bus_role_after"] = later.get("bus_role") or ""
+        view["bus_status_after"] = later.get("bus_status") or ""
+        view["bus_hours_share_after"] = _role_hours_share(later.get("lane_load"), str(later.get("bus_role") or ""))
+    else:
+        view["path_n_after"] = view["path_n_before"]
+        view["bus_share_after"] = view.get("bus_share") or 0
+        view["bus_role_after"] = view.get("bus_role") or ""
+        view["bus_status_after"] = view.get("bus_status") or ""
+        view["bus_hours_share_after"] = view["bus_hours_share"]
+    return view
+
+
+def _delta_matches_edges(delta: Dict[str, Any], audit: Dict[str, Any]) -> bool:
+    """Delta этой сборки: число петель до оптимизации равно обратным рёбрам её аудита."""
+    edges = len((audit or {}).get("rework_loops") or [])
+    reported = (delta or {}).get("rework_before")
+    return reported is not None and int(reported) == edges
+
+
+def prepare_regulation(
+    text: str,
+    use_llm: bool = False,
+    previous: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Общий вход кнопки «Сгенерировать», быстрого старта первого примера и тестов.
+
+    As-Is и To-Be считаются одним проходом. На экране только эта сборка:
+    прошлый To-Be не подмешивается, даже если текст регламента тот же.
+    """
+    _ = previous
+    xml, audit, error = cached_generate_bpmn(
+        _reg_hash(text or "", bool(use_llm), "edges-v7"),
+        text or "",
+        bool(use_llm),
+    )
+    audit = copy.deepcopy(audit) if isinstance(audit, dict) else {}
+    _shown, audit = align_result_quality(text or "", xml or "", audit, bool(use_llm))
+    pack: Dict[str, Any] = {
+        "xml": xml or "",
+        "audit": audit,
+        "error": error or "",
+        "asis_text": text or "",
+        "use_llm": bool(use_llm),
+        "tobe_text": "",
+        "tobe_xml": "",
+        "tobe_audit": {},
+        "delta": {},
+        "tobe_ok": False,
+    }
+    if error or not audit.get("sla"):
+        pack["facts"] = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
+        return pack
+    opt_text, delta = cached_optimize_to_be(
+        _reg_hash(text or "", _audit_cache_slice(audit), "edges-v7"),
+        text or "",
+        audit,
+    )
+    delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
+    if not _delta_matches_edges(delta, audit):
+        opt_text, delta = optimize_process_to_be(text or "", audit)
+        delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
+    facts = process_facts(audit, delta)
+    tobe_audit = dict(delta.get("tobe_audit") or {})
+    tobe_xml = str(delta.get("tobe_xml") or "")
+    accepted = _tobe_accepted(facts) and bool(tobe_xml)
+    if not accepted:
+        pack["delta"] = delta or {}
+        pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+        return pack
+    shown_tobe, tobe_view = align_result_quality(opt_text or "", tobe_xml, tobe_audit, bool(use_llm))
+    paste_after = int(((tobe_view.get("methodology") or {}).get("score") or 0))
+    delta["quality_after"] = paste_after
+    delta["quality_before"] = int(((audit.get("methodology") or {}).get("score") or 0))
+    delta["quality_gain"] = max(0, paste_after - int(delta["quality_before"]))
+    facts = process_facts(audit, delta)
+    pack["tobe_text"] = shown_tobe or opt_text or ""
+    # На экране схема повторной сборки текста, а не рисунок в памяти с более высоким баллом.
+    rebuilt_xml = str(tobe_view.get("result_xml") or "")
+    rebuilt_audit = tobe_view.get("result_audit") if isinstance(tobe_view.get("result_audit"), dict) else None
+    if rebuilt_xml and rebuilt_audit:
+        tobe_xml = rebuilt_xml
+        tobe_audit = rebuilt_audit
+    pack["tobe_xml"] = tobe_xml
+    pack["tobe_audit"] = tobe_audit
+    pack["delta"] = delta or {}
+    pack["tobe_ok"] = True
+    pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
+    return pack
+
+
+def _store_regulation_pack(pack: Dict[str, Any]) -> None:
+    st.session_state["result"] = {
+        "xml": pack.get("xml") or "",
+        "audit": pack.get("audit") or {},
+        "error": pack.get("error") or "",
+    }
+    st.session_state["tobe_pack"] = {
+        "source_xml": pack.get("xml") or "",
+        "text": pack.get("tobe_text") or "",
+        "delta": pack.get("delta") or {},
+        "xml": pack.get("tobe_xml") or "",
+        "audit": pack.get("tobe_audit") or {},
+        "error": "",
+        "facts": pack.get("facts") or {},
+        "tobe_ok": bool(pack.get("tobe_ok")),
+        "asis_text": pack.get("asis_text") or "",
+    }
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+
+
 def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None:
-    key = _reg_hash(text, bool(use_llm))
-    mem = st.session_state.get("_gen_mem")
-    if isinstance(mem, dict) and mem.get("key") == key and mem.get("result"):
-        st.session_state["result"] = mem["result"]
-        return
     progress = st.progress(0, text="Запуск конвейера…") if show_progress else None
     if progress:
-        progress.progress(45, text="Генерация BPMN 2.0 (кэш по sha256 регламента)…")
-    xml, audit, error = cached_generate_bpmn(key, text, bool(use_llm))
+        progress.progress(45, text="Генерация BPMN 2.0…")
+    pack = prepare_regulation(text, use_llm=bool(use_llm))
     if progress:
         progress.progress(100, text="Аудит узких мест готов")
         progress.empty()
-    result = {"xml": xml, "audit": audit, "error": error}
-    st.session_state["result"] = result
-    st.session_state["_gen_mem"] = {"key": key, "result": result}
-    st.session_state.pop("inspector_cache", None)
-    st.session_state.pop("inspector_choice", None)
-    st.session_state.pop("tobe_pack", None)
+    _store_regulation_pack(pack)
+    st.session_state["gen_fingerprint"] = _reg_hash(text or "", bool(use_llm))
 
 
 def on_example_change() -> None:
     examples = load_examples()
     choice = st.session_state["example_choice"]
+    if choice == st.session_state.get("applied_example"):
+        return
     if choice in examples:
         st.session_state["reg_text"] = examples[choice]["text"]
         st.session_state["file_stem"] = examples[choice]["stem"]
@@ -1517,10 +1796,46 @@ def on_example_change() -> None:
         stem = Path(st.session_state.get("last_uploaded_filename") or "custom_process").stem
         st.session_state["file_stem"] = re.sub(r"[^\w.\-]+", "_", stem, flags=re.U) or "custom_process"
     st.session_state["chat_messages"] = []
+    st.session_state["chat_cleared_toast"] = True
     st.session_state.pop("diagram_updated_by_assistant", None)
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
+    st.session_state["applied_example"] = choice
+
+
+def _align_choice_text() -> None:
+    """Новый пример в сессии подставляет свой текст до отрисовки старой схемы."""
+    if st.session_state.get("example_choice") == st.session_state.get("applied_example"):
+        return
+    on_example_change()
+    st.session_state.pop("result", None)
+    st.session_state.pop("gen_fingerprint", None)
+
+
+def _page_is_live() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _generation_pending() -> bool:
+    """Открытие страницы схему не строит. Облако ждёт кнопку «Сгенерировать BPMN 2.0»."""
+    return False
+
+
+def _sync_generation() -> None:
+    """Форма уже на экране. Сама сборка стартует только из обработчика кнопки."""
+    if not _generation_pending():
+        return
+    text = st.session_state.get("reg_text") or ""
+    use_llm = bool(st.session_state.get("use_llm"))
+    with st.status(GENERATION_BUSY_LABEL, expanded=True) as gen_status:
+        run_generation(text, use_llm, show_progress=False)
+        gen_status.update(label="Схема готова", state="complete", expanded=False)
 
 
 def _read_txt_bytes(data: bytes) -> str:
@@ -1533,24 +1848,7 @@ def _read_txt_bytes(data: bytes) -> str:
 
 
 def _read_docx_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        from docx import Document  # type: ignore[import-untyped]
-    except ImportError:
-        return None, "Для чтения .docx установите пакет: `pip install python-docx>=1.0.0`"
-    try:
-        doc = Document(io.BytesIO(data))
-        parts: List[str] = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                if cells:
-                    parts.append(" | ".join(cells))
-        text = "\n".join(parts).strip()
-        if not text:
-            return None, "В файле .docx не найден текстовый слой (пустые абзацы и таблицы)."
-        return text, None
-    except Exception as exc:  # noqa: BLE001
-        return None, f"Не удалось прочитать .docx: {type(exc).__name__}: {exc}"
+    return read_docx_regulation(data)
 
 
 def _read_pdf_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:
@@ -1617,120 +1915,151 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state["file_stem"] = stem
     st.session_state["_keep_custom_text"] = True
     st.session_state["example_choice"] = CUSTOM_LABEL
+    st.session_state["applied_example"] = CUSTOM_LABEL
     st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
+    st.session_state["chat_cleared_toast"] = True
     st.session_state.pop("diagram_updated_by_assistant", None)
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
+    st.session_state.pop("gen_fingerprint", None)
+    st.rerun()
+
+
+def _export_slot(token: str) -> Dict[str, Any]:
+    """Паспорт и DOCX живут в сессии и собираются только по нажатию кнопки."""
+    bucket = st.session_state.setdefault("export_cache", {})
+    if token not in bucket:
+        bucket.clear()
+        bucket[token] = {}
+    return bucket[token]
 
 
 def render_downloads(key: str) -> None:
-    """Скачивание: BPMN 2.0, SVG, Паспорт (.md) и официальный регламент (.docx)."""
+    """Скачивание: BPMN 2.0 и SVG сразу, паспорт и DOCX — в момент запроса файла."""
     result = st.session_state.get("result")
     ok = bool(result and not result["error"])
     stem = st.session_state.get("file_stem", "process")
-    passport = ""
-    docx_bytes = b""
-    if ok:
-        try:
-            passport = generate_process_passport(
-                result.get("xml") or "",
-                result.get("audit") or {},
-                st.session_state.get("reg_text") or "",
-            )
-        except Exception:  # noqa: BLE001 — кнопка просто недоступна, UI не падает
-            passport = ""
-        try:
-            docx_bytes = export_docx_passport(
-                result.get("xml") or "",
-                result.get("audit") or {},
-                st.session_state.get("reg_text") or "",
-            )
-        except Exception:  # noqa: BLE001
-            docx_bytes = b""
+    token = _reg_hash((result or {}).get("xml") or "", st.session_state.get("reg_text") or "") if ok else ""
+    slot = _export_slot(token) if ok else {}
 
-    slots = st.columns(4, gap="small")
-    with slots[0]:
-        st.download_button(
-            "⬇️ BPMN 2.0",
-            data=(result["xml"] if ok else ""),
-            file_name=f"{stem}.bpmn",
-            mime="application/xml",
-            disabled=not ok,
-            key=f"dl_bpmn_{key}",
-            use_container_width=True,
-        )
-    with slots[1]:
-        if ok:
-            page = svg_export_html(result["xml"], f"{stem}.svg")
-            if hasattr(st, "iframe"):
-                st.iframe(page, height=44)
+    def _materialize(kind: str) -> Any:
+        if kind in slot:
+            return slot[kind]
+        xml = (result or {}).get("xml") or ""
+        audit = (result or {}).get("audit") or {}
+        text = st.session_state.get("reg_text") or ""
+        try:
+            slot[kind] = (
+                generate_process_passport(xml, audit, text)
+                if kind == "md"
+                else export_docx_passport(xml, audit, text)
+            )
+        except Exception:  # noqa: BLE001 — кнопка остаётся, страница не падает
+            slot[kind] = "" if kind == "md" else b""
+        return slot[kind]
+
+    with st.container(key="export_row"):
+        slots = st.columns(4, gap="small")
+        with slots[0]:
+            st.download_button(
+                "⬇️ BPMN 2.0",
+                data=(result["xml"] if ok else ""),
+                file_name=f"{stem}.bpmn",
+                mime="application/xml",
+                disabled=not ok,
+                key=f"dl_bpmn_{key}",
+                use_container_width=True,
+            )
+        with slots[1]:
+            if ok:
+                page = svg_export_html(result["xml"], f"{stem}.svg")
+                if hasattr(st, "iframe"):
+                    st.iframe(page, height=40)
+                else:
+                    components.html(page, height=40, scrolling=False)
             else:
-                components.html(page, height=44, scrolling=False)
-        else:
-            st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
-    with slots[2]:
-        st.download_button(
-            "⬇️ Паспорт .md",
-            data=passport or "",
-            file_name=f"{stem}_passport.md",
-            mime="text/markdown",
-            disabled=not (ok and bool(passport)),
-            key=f"dl_passport_{key}",
-            use_container_width=True,
-        )
-    with slots[3]:
-        st.download_button(
+                st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
+
+        def _lazy_file(col: Any, kind: str, label: str, file_name: str, mime: str) -> None:
+            with col:
+                if not ok:
+                    st.button(label, disabled=True, key=f"dl_off_{kind}_{key}", use_container_width=True)
+                    return
+                data = slot.get(kind)
+                if data is None and st.button(label, key=f"dl_build_{kind}_{key}", use_container_width=True):
+                    data = _materialize(kind)
+                if not data:
+                    return
+                st.download_button(
+                    label,
+                    data=data,
+                    file_name=file_name,
+                    mime=mime,
+                    key=f"dl_save_{kind}_{key}",
+                    use_container_width=True,
+                )
+
+        _lazy_file(slots[2], "md", "⬇️ Паспорт .md", f"{stem}_passport.md", "text/markdown")
+        _lazy_file(
+            slots[3],
+            "docx",
             "⬇️ Регламент .docx",
-            data=docx_bytes or b"",
-            file_name=f"{stem}_reglament.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            disabled=not (ok and bool(docx_bytes)),
-            key=f"dl_docx_{key}",
-            use_container_width=True,
+            f"{stem}_reglament.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
 
 def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
-    """Строит (и кэширует) целевой процесс To-Be для активного As-Is."""
+    """To-Be для уже посчитанного As-Is. Повторно схему не генерирует и LLM не включает."""
     result = st.session_state.get("result")
     if not result or result.get("error"):
         return None
     src = result.get("xml") or ""
     cached = st.session_state.get("tobe_pack")
-    if cached and cached.get("source_xml") == src:
+    if cached and cached.get("source_xml") == src and cached.get("facts"):
         return cached
     text = st.session_state.get("reg_text") or ""
-    asis_audit = result.get("audit") or {}
-    asis_core = {
-        "sla": asis_audit.get("sla") or {},
-        "methodology": asis_audit.get("methodology") or {},
-        "rework_loops": asis_audit.get("rework_loops") or [],
-    }
-    tobe_key = _reg_hash(text, "tobe", json.dumps(_audit_cache_slice(asis_audit), ensure_ascii=False, sort_keys=True))
-    mem = st.session_state.get("_tobe_mem")
-    if isinstance(mem, dict) and mem.get("key") == tobe_key and mem.get("pack") and mem["pack"].get("source_xml") == src:
-        st.session_state["tobe_pack"] = mem["pack"]
-        return mem["pack"]
-    with st.spinner("Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация…"):
-        opt_text, delta = cached_optimize_to_be(tobe_key, text, asis_core)
-    xml = str((delta or {}).get("tobe_xml") or "")
-    audit = (delta or {}).get("tobe_audit") or {}
-    err = str((delta or {}).get("tobe_error") or "")
-    if not xml:
-        xml, audit, err = cached_generate_bpmn(_reg_hash(opt_text, False), opt_text, False)
+    audit = result.get("audit") or {}
+    if not audit.get("sla"):
+        pack = prepare_regulation(text, use_llm=False)
+        _store_regulation_pack(pack)
+        return st.session_state.get("tobe_pack")
+    opt_text, delta = cached_optimize_to_be(
+        _reg_hash(text, _audit_cache_slice(audit), "edges-v7"),
+        text,
+        audit,
+    )
+    delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
+    if not _delta_matches_edges(delta, audit):
+        opt_text, delta = optimize_process_to_be(text, audit)
+        delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
+    facts = process_facts(audit, delta)
+    tobe_xml = str((delta or {}).get("tobe_xml") or "")
+    tobe_audit = dict((delta or {}).get("tobe_audit") or {})
     pack = {
-        "source_xml": src,
-        "text": opt_text,
-        "delta": delta or {},
-        "xml": xml,
+        "xml": src,
         "audit": audit,
-        "error": err,
+        "error": "",
+        "asis_text": text,
+        "use_llm": False,
+        "tobe_text": "",
+        "tobe_xml": "",
+        "tobe_audit": {},
+        "delta": delta or {},
+        "tobe_ok": False,
     }
-    st.session_state["tobe_pack"] = pack
-    st.session_state["_tobe_mem"] = {"key": tobe_key, "pack": pack}
-    return pack
+    if _tobe_accepted(facts) and tobe_xml:
+        pack["tobe_text"] = opt_text or ""
+        pack["tobe_xml"] = tobe_xml
+        pack["tobe_audit"] = tobe_audit
+        pack["tobe_ok"] = True
+        pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
+    else:
+        pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+    _store_regulation_pack(pack)
+    return st.session_state.get("tobe_pack")
 
 
 def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
@@ -1755,59 +2084,64 @@ def render_tobe_tab() -> None:
         st.info("Сначала сгенерируйте диаграмму As-Is.")
         return
     delta = pack.get("delta") or {}
+    facts = pack.get("facts") or process_facts(
+        (st.session_state.get("result") or {}).get("audit") or {},
+        delta,
+    )
     if pack.get("error") and not pack.get("xml"):
         st.warning(f"Целевую диаграмму построить не удалось: {pack['error']}")
-    saved_h = float(delta.get("sla_saved_hours") or 0)
-    before_h = float(delta.get("sla_before_hours") or 0)
-    after_h = float(delta.get("sla_after_hours") or 0)
-    asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
-    tobe_audit = pack.get("audit") or {}
-    asis_cp = before_h or float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
-    tobe_cp = after_h or float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
-    saved_h = asis_cp - tobe_cp
-    saved_pct = round(100.0 * max(0.0, saved_h) / asis_cp, 1) if asis_cp and saved_h > 0 else 0.0
-    removed = int(delta.get("rework_removed") or 0)
-    q_gain = int(delta.get("quality_gain") or 0)
-    asis_rw = float(delta.get("with_rework_before") or (asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
-    tobe_rw = float(delta.get("with_rework_after") or (tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
-    if saved_h >= 1.0 / 60.0:
-        eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
-    else:
-        eco_value = "Без ускорения"
-    eco_sub = (
-        f"КП без возвратов: {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
-        f"rework: {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
+    cp_before = float(facts.get("cp_before") or 0)
+    cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
+    rw_before = float(facts.get("rw_before") or 0)
+    rw_after = float(facts.get("rw_after") if facts.get("rw_after") is not None else rw_before)
+    loops_before = int(facts.get("loops_before") or 0)
+    loops_after = int(facts.get("loops_after") or 0)
+    quality_before = int(facts.get("quality_before") or 0)
+    quality_after = int(facts.get("quality_after") or 0)
+    eco_value = tobe_card_headline(facts) or (
+        f"Путь с возвратами: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
     )
+    eco_sub = (
+        f"КП без возвратов: {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
+        f"rework: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
+    )
+    removed = max(0, loops_before - loops_after)
     st.markdown(
         f'<div class="tobe-grid">'
         f'<div class="tobe-card"><div class="k">Экономия SLA</div>'
         f'<div class="v">{esc(eco_value)}</div>'
         f'<div class="s">{esc(eco_sub)}</div></div>'
         f'<div class="tobe-card"><div class="k">Циклы доработки</div>'
-        f'<div class="v">{int(delta.get("rework_before") or 0)} → {int(delta.get("rework_after") or 0)}</div>'
+        f'<div class="v">{loops_before} → {loops_after}</div>'
         f'<div class="s">устранено петель: {removed}</div></div>'
         f'<div class="tobe-card"><div class="k">Качество нотации</div>'
-        f'<div class="v">+{q_gain} п.п.</div>'
-        f'<div class="s">{int(delta.get("quality_before") or 0)}% → {int(delta.get("quality_after") or 0)}%</div></div>'
+        f'<div class="v">{quality_before}% → {quality_after}%</div>'
+        f'<div class="s">quality {quality_before} → {quality_after}</div></div>'
         f"</div>",
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)} · "
-        f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}"
+        f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
+        f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
     )
     engine = delta.get("engine") or "semantic-optimizer"
     st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
-    st.markdown('<div class="ir-title" style="margin-top:8px">Применённые мероприятия</div>', unsafe_allow_html=True)
-    for act in delta.get("actions") or []:
-        st.markdown(f'<div class="tobe-act">{esc(act.get("detail") or act.get("kind"))}</div>', unsafe_allow_html=True)
+    actions = [
+        act for act in (facts.get("tobe_actions") or delta.get("actions") or [])
+        if "узких мест" not in str(act.get("detail") or "")
+        and act.get("kind") != "stable"
+    ]
+    if actions:
+        st.markdown('<div class="ir-title" style="margin-top:8px">Применённые мероприятия</div>', unsafe_allow_html=True)
+        for act in actions:
+            st.markdown(f'<div class="tobe-act">{esc(act.get("detail") or act.get("kind"))}</div>', unsafe_allow_html=True)
 
     asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_audit = pack.get("audit") or {}
-    if tobe_audit.get("lane_load") or tobe_audit.get("critical_path"):
-        asis_bus = asis_audit.get("bus_factor") or {}
-        tobe_bus = tobe_audit.get("bus_factor") or {}
-        threshold = _bus_threshold(tobe_bus or asis_bus)
+    if facts.get("show_steps") and (tobe_audit.get("lane_load") or tobe_audit.get("critical_path")):
+        threshold = float(facts.get("bus_threshold") or 0.45)
+        before_share = float(facts.get("bus_share") or 0)
+        after_share = float(facts.get("bus_share_after") if facts.get("bus_share_after") is not None else before_share)
         prev_shares = _share_by_role(asis_audit.get("lane_load") or [])
         relieved = [
             str(item.get("role") or "")
@@ -1815,28 +2149,26 @@ def render_tobe_tab() -> None:
             if prev_shares.get(str(item.get("role") or ""), 0) > threshold
             and float(item.get("share") or 0) <= threshold
         ]
-        before_share = float(asis_bus.get("max_share") or 0)
-        after_share = float(tobe_bus.get("max_share") or 0)
-        load_bits = []
-        if before_share or after_share:
-            load_bits.append(f"Bus-factor {before_share:.0%} → {after_share:.0%}")
+        hours_before = float(facts.get("bus_hours_share") or 0)
+        hours_after = float(
+            facts.get("bus_hours_share_after") if facts.get("bus_hours_share_after") is not None else hours_before
+        )
+        load_bits = [
+            f"Bus-factor {before_share:.0%} → {after_share:.0%} шагов · по часам {hours_before:.0%} → {hours_after:.0%}"
+        ]
         if relieved:
             load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
-        elif tobe_bus.get("status") == "ok":
+        elif facts.get("bus_status_after") == "ok" or facts.get("bus_status") == "ok":
             load_bits.append("нагрузка сбалансирована")
-        asis_path = _path_tasks_only(asis_audit.get("critical_path") or [])
-        tobe_path = _path_tasks_only(tobe_audit.get("critical_path") or [])
-        asis_cp = float((asis_audit.get("sla") or {}).get("critical_path_hours") or 0)
-        tobe_cp = float((tobe_audit.get("sla") or {}).get("critical_path_hours") or 0)
-        asis_rw = float((asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
-        tobe_rw = float((tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
-        shortened = len(tobe_path) < len(asis_path) or tobe_cp + 1e-6 < asis_cp
+        path_n_before = int(facts.get("path_n_before") or 0)
+        path_n_after = int(facts.get("path_n_after") or 0)
+        shortened = path_n_after < path_n_before or cp_after + 1e-6 < cp_before
         path_label = "Цепочка спрямилась" if shortened else "Критический путь"
         path_cap = (
-            f"{path_label}: {len(asis_path)} шагов / {fmt_hours(asis_cp)}"
-            f" → {len(tobe_path)} шагов / {fmt_hours(tobe_cp)}. "
-            f"Критический путь (базовый, без возвратов): {fmt_hours(asis_cp)} → {fmt_hours(tobe_cp)}. "
-            f"Срок с худшим возвратом (rework): {fmt_hours(asis_rw)} → {fmt_hours(tobe_rw)}."
+            f"{path_label}: {path_n_before} шагов / {fmt_hours(cp_before)}"
+            f" → {path_n_after} шагов / {fmt_hours(cp_after)}. "
+            f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)}. "
+            f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}."
         )
         render_load_and_path(
             tobe_audit,
@@ -1962,15 +2294,18 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             help="Выберите эталонный кейс или введите свой текст ниже.",
         )
         st.text_area(
-            "Текст регламента (свободный текст или нумерованный список; развилки — «Если ..., иначе ...»)",
+            "Вставьте свой регламент или выберите пример слева",
             key="reg_text",
             height=220 if compact else 360,
         )
     with box_right:
+        if "use_llm" not in st.session_state:
+            st.session_state["use_llm"] = USE_LLM_ON_OPEN
         use_llm = st.checkbox(
             "Использовать LLM (Ollama / OpenAI), если доступна",
-            value=True,
-            help="Если модель недоступна, автоматически включается встроенный семантический эмулятор.",
+            key="use_llm",
+            help="При открытии страницы галочка включена. Снимите её — кнопка соберёт схему эмулятором и не пойдёт в облако. "
+            "Сборка начинается только по кнопке «Сгенерировать BPMN 2.0».",
         )
         # Имена секретов — только если ключа нет (диагностика настройки), иначе строка для жюри лишняя.
         secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
@@ -1980,29 +2315,28 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             if not st.session_state["reg_text"].strip():
                 st.warning("Введите текст регламента.")
             else:
-                run_generation(st.session_state["reg_text"], use_llm)
+                # Одна и та же анимация с галочкой LLM и без неё: видна, пока схема не готова.
+                with st.status(GENERATION_BUSY_LABEL, expanded=True) as gen_status:
+                    run_generation(st.session_state["reg_text"], use_llm)
+                    gen_status.update(label="Схема готова", state="complete", expanded=False)
+        _sync_generation()
 
         result = st.session_state.get("result")
         if result and not result["error"]:
-            if st.session_state.get("quickstart"):
-                st.markdown(
-                    '<div class="engine">Эталонный процесс подготовлен Groq GPT-OSS 120B · режим быстрого старта</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                gen = result["audit"].get("generation", {})
-                engine = gen.get("engine", "—")
-                note = ""
-                if gen.get("fallback") and engine == "semantic-emulator":
-                    reasons = gen.get("trace") or ["LLM недоступна"]
-                    note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
-                elif gen.get("attempts", 1) > 1:
-                    note = f" · исправлено со {gen['attempts']}-й попытки"
-                xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
-                st.markdown(
-                    f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
-                    unsafe_allow_html=True,
-                )
+            gen = result["audit"].get("generation", {})
+            engine = gen.get("engine", "—")
+            elapsed = gen.get("elapsed_s", 0)
+            note = ""
+            if gen.get("fallback") and engine == "semantic-emulator":
+                reasons = gen.get("trace") or ["LLM недоступна"]
+                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
+            elif gen.get("attempts", 1) > 1:
+                note = f" · исправлено со {gen['attempts']}-й попытки"
+            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
+            st.markdown(
+                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {elapsed} с{xsd}{note}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def _diagram_height(wide: bool) -> int:
@@ -2038,9 +2372,33 @@ def _sync_canvas_from_query() -> None:
         st.session_state["canvas_variant"] = ASIS_LABEL
 
 
+def engine_badge_text(engine: str, fallback: bool = False) -> str:
+    """Имя модели, которая собрала схему. Эмулятор не подписывается чужим облаком."""
+    if fallback:
+        return "Эмулятор"
+    label = (engine or "").strip()
+    low = label.lower()
+    if not label or low == "semantic-emulator":
+        return "Эмулятор"
+    if low.startswith("ollama"):
+        model = label.split(":", 1)[1].strip() if ":" in label else ""
+        return f"Ollama {model}".strip()
+    if ":" in label:
+        return label.split(":", 1)[1].strip() or label
+    return label
+
+
+def _hero_engine_badge() -> str:
+    """Бейдж шапки: модель облака только если эта схема им собрана."""
+    result = st.session_state.get("result") or {}
+    if result.get("error") or not result.get("xml"):
+        return "Эмулятор"
+    gen = (result.get("audit") or {}).get("generation") or {}
+    return engine_badge_text(str(gen.get("engine") or ""), bool(gen.get("fallback")))
+
+
 def _hero_html() -> str:
-    connected = bool(os.getenv("OPENAI_API_KEY"))
-    engine = "🟢 Groq 120B Online" if connected else "LLM офлайн"
+    engine = _hero_engine_badge()
     return (
         '<div class="ir-hero">'
         "<div><h1>⚡ Архитектор BPMN-диаграмм</h1>"
@@ -2105,7 +2463,7 @@ def render_diagram(canvas_height: int) -> None:
             catalog_tobe=catalog_tb,
         )
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
-            st.iframe(page, height=canvas_height + 16)
+            st.iframe(page, width="stretch", height=canvas_height + 16)
         else:
             components.html(page, height=canvas_height + 16, scrolling=False)
     render_downloads("under_canvas")
@@ -2137,6 +2495,9 @@ def _send_assistant(prompt: str) -> None:
     if new_text and new_xml and new_audit:
         st.session_state["reg_text"] = new_text
         st.session_state["result"] = {"xml": new_xml, "audit": new_audit, "error": ""}
+        st.session_state["gen_fingerprint"] = _reg_hash(
+            new_text, bool(st.session_state.get("use_llm", USE_LLM_ON_OPEN))
+        )
         st.session_state["diagram_updated_by_assistant"] = True
         st.session_state["file_stem"] = st.session_state.get("file_stem") or "custom_process"
         st.session_state.pop("inspector_cache", None)
@@ -2173,7 +2534,12 @@ def render_assistant() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Архитектор BPMN — Интер РАО", page_icon="⚡", layout="wide")
+    st.set_page_config(
+        page_title="Архитектор BPMN — Интер РАО",
+        page_icon="⚡",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.markdown(CSS, unsafe_allow_html=True)
     render_assistant()
     # Часть виджетов не рисуется в отдельных режимах — не даём Streamlit стереть их состояние.
@@ -2184,6 +2550,18 @@ def main() -> None:
     _sync_canvas_from_query()
     _migrate_view_mode()
 
+    examples = load_examples()
+    labels = list(examples)
+    if "reg_text" not in st.session_state:
+        first = labels[0] if labels else CUSTOM_LABEL
+        st.session_state["example_choice"] = first
+        st.session_state["reg_text"] = examples[first]["text"] if labels else ""
+        st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
+        st.session_state["applied_example"] = first
+    if "use_llm" not in st.session_state:
+        st.session_state["use_llm"] = USE_LLM_ON_OPEN
+    _align_choice_text()
+
     st.markdown(_hero_html(), unsafe_allow_html=True)
     view = st.radio(
         "Режим отображения",
@@ -2192,19 +2570,6 @@ def main() -> None:
         horizontal=True,
         label_visibility="collapsed",
     )
-
-    examples = load_examples()
-    labels = list(examples)
-    if "reg_text" not in st.session_state:
-        first = labels[0] if labels else CUSTOM_LABEL
-        st.session_state["example_choice"] = first
-        st.session_state["reg_text"] = examples[first]["text"] if labels else ""
-        st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
-    if "result" not in st.session_state and st.session_state["reg_text"].strip():
-        with st.spinner("Готовим эталонный пример…"):
-            # Эталон при открытии — эмулятором: страница не должна минутами ждать LLM.
-            run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
-            st.session_state["quickstart"] = True
 
     wide = view == VIEW_WIDE
     canvas_h = _diagram_height(wide)
@@ -2216,11 +2581,21 @@ def main() -> None:
     if wide:
         with st.expander("Параметры регламента", expanded=True):
             render_input_panel(labels, compact=True)
+        if st.session_state.pop("chat_cleared_toast", False):
+            st.markdown(
+                '<div class="ir-toast">Диалог очищен: выбран другой регламент</div>',
+                unsafe_allow_html=True,
+            )
         render_diagram(canvas_h)
     else:
         left, right = st.columns([5, 7], gap="large")
         with left:
             render_input_panel(labels)
+            if st.session_state.pop("chat_cleared_toast", False):
+                st.markdown(
+                    '<div class="ir-toast">Диалог очищен: выбран другой регламент</div>',
+                    unsafe_allow_html=True,
+                )
         with right:
             render_diagram(canvas_h)
 
