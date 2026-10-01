@@ -37,6 +37,8 @@ import io
 import json
 import os
 import re
+import signal
+import threading
 import time
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
@@ -156,6 +158,10 @@ _MAX_RANGE = 2000
 
 class UnsafeCodeError(ValueError):
     """Сгенерированный код нарушает правила песочницы."""
+
+
+class _DiagramExecTimeout(BaseException):
+    """Таймаут exec. BaseException, чтобы except Exception внутри кода его не съел."""
 
 
 def _strip_markdown(code: str) -> str:
@@ -281,12 +287,11 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
         return 0
     applied = 0
     used_nodes: set = set()
-    used_steps: set = set()
 
     def _free(node: Any) -> bool:
         return node.id not in used_nodes and _sla_looks_default(node)
 
-    for idx, step in enumerate(steps):
+    for step in steps:
         title = step.title or ""
         best, score = None, 0
         for node in work:
@@ -298,15 +303,29 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
         if best is not None and score >= 1:
             best.sla_hours = float(step.hours)
             used_nodes.add(best.id)
-            used_steps.add(idx)
             applied += 1
 
-    leftover_nodes = [n for n in work if _free(n)]
-    leftover_steps = [s for i, s in enumerate(steps) if i not in used_steps]
-    for step, node in zip(leftover_steps, leftover_nodes):
-        node.sla_hours = float(step.hours)
-        applied += 1
     return applied
+
+
+def _run_diagram_exec(code: Any, namespace: Dict[str, Any]) -> None:
+    """Исполняет код DIAGRAM. На главном потоке обрывает зависший цикл по таймеру."""
+    timeout = float(os.getenv("DIAGRAM_EXEC_TIMEOUT", "12"))
+
+    def _handle(signum: int, frame: Any) -> None:
+        raise _DiagramExecTimeout(f"дольше {timeout:g} с")
+
+    on_main = threading.current_thread() is threading.main_thread()
+    if timeout <= 0 or not on_main or not hasattr(signal, "setitimer"):
+        exec(code, namespace)  # noqa: S102 — песочница: AST-фильтр + whitelist builtins
+        return
+    old = signal.signal(signal.SIGALRM, _handle)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        exec(code, namespace)  # noqa: S102 — песочница: AST-фильтр + whitelist builtins
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
 
 def execute_generated_code(
@@ -347,7 +366,10 @@ def execute_generated_code(
             "ROOT_START_TASK_ID": ROOT_START_TASK_ID,
             "ROOT_END_TASK_ID": ROOT_END_TASK_ID,
         }
-        exec(compile(tree, "<generated>", "exec"), namespace)  # noqa: S102 — песочница: AST-фильтр + whitelist builtins
+        try:
+            _run_diagram_exec(compile(tree, "<generated>", "exec"), namespace)
+        except _DiagramExecTimeout as exc:
+            return "", {}, f"Исполнение кода прервано по таймауту: {exc}"
 
         work_nodes = [n for n in diagram.nodes.values() if n.kind not in ("startEvent", "endEvent")]
         if len(work_nodes) < 2:
@@ -359,6 +381,13 @@ def execute_generated_code(
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit, diagram)
+        expected_returns = _explicit_return_count(regulation_text)
+        actual_returns = len(audit.get("rework_loops") or [])
+        if expected_returns > actual_returns:
+            audit["quality"]["critical"].append(
+                f"В регламенте {expected_returns} явных возврата, в графе обратных рёбер {actual_returns}."
+            )
+            audit["quality"]["ok"] = False
         if sla_enriched:
             audit["sla_enriched_nodes"] = sla_enriched
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
@@ -534,6 +563,11 @@ _DUR_RE = re.compile(
 _REF_RE = re.compile(r"(?:п(?:ункт\w*|\.|п\.)?|шаг\w*)\s*(\d+)", re.I)
 _END_KW = re.compile(r"завершить|завершается|завершение процесса|прекрат|закрыть\s+(?:заявку|процесс|закупку)", re.I)
 _BACK_KW = re.compile(r"верну|возврат|возвраща|доработ|повтор|заново|перенос\s+срок", re.I)
+_EXPLICIT_RETURN_RE = re.compile(
+    r"верну\w*|возврат\w*|возвраща\w*|на\s+доработк\w*|\bповторно\b|при\s+замечаниях",
+    re.I,
+)
+_NAZAD_RETURN_RE = re.compile(r"(?:если|иначе|при)\b[^.]{0,80}\bназад\b", re.I)
 _CASE_RE = re.compile(r"\b(?:если|в случае(?:\s+если)?)\b", re.I)
 _RETURN_RE = re.compile(
     r"(?:возвраща\w+|верну\w+|направляется\s+на\s+доработ|на\s+доработк|перенос\s+срок)",
@@ -1583,6 +1617,83 @@ def _parse_decision(text: str) -> Tuple[str, Optional[Decision]]:
     return src, None
 
 
+def _has_explicit_return(text: str) -> bool:
+    """Один шаг с явным возвратом — одно обратное ребро, не отдельное слово в подписи ветки."""
+    src = text or ""
+    return bool(_EXPLICIT_RETURN_RE.search(src) or _NAZAD_RETURN_RE.search(src))
+
+
+def _decision_points_back(decision: Optional[Decision], step_num: int) -> bool:
+    if decision is None:
+        return False
+    if decision.no_back:
+        return True
+    if decision.no_ref is not None and decision.no_ref < step_num:
+        return True
+    if decision.yes_ref is not None and decision.yes_ref < step_num:
+        return True
+    return False
+
+
+def _ensure_return_decision(text: str, decision: Optional[Decision], step_num: int) -> Optional[Decision]:
+    """Фраза возврата без ребра назад не остаётся обычным шагом."""
+    if not _has_explicit_return(text) or _decision_points_back(decision, step_num):
+        return decision
+    if decision is None:
+        return Decision(
+            yes_label="Продолжить",
+            no_label="На доработку",
+            no_back=True,
+            back_clause=text,
+        )
+    decision.no_back = True
+    if not decision.back_clause:
+        decision.back_clause = text
+    if not decision.no_label or decision.no_label == "Иначе":
+        decision.no_label = "На доработку"
+    return decision
+
+
+def _explicit_return_count(text: str) -> int:
+    """Сколько пунктов регламента содержат явный возврат. Каждый такой пункт — одно ребро."""
+    raw = normalize_regulation(text or "")
+    chunks: List[str] = []
+    current = ""
+    for line in raw.splitlines():
+        if re.match(r"^\s*\d+[.)]\s+\S", line):
+            if current:
+                chunks.append(current)
+            current = line
+        elif current:
+            current = f"{current} {line.strip()}"
+    if current:
+        chunks.append(current)
+    if not chunks and _has_explicit_return(raw):
+        return 1
+    return sum(1 for chunk in chunks if _has_explicit_return(chunk))
+
+
+def _limit_escalation_actions(
+    actions: List[Dict[str, str]],
+    asis_audit: Optional[dict],
+    tobe_audit: Optional[dict],
+) -> List[Dict[str, str]]:
+    """«Цикл заменён эскалацией» только для ребра, которое было в As-Is и снято в To-Be."""
+    before = len((asis_audit or {}).get("rework_loops") or [])
+    after = len((tobe_audit or {}).get("rework_loops") or [])
+    removed = max(0, before - after)
+    kept: List[Dict[str, str]] = []
+    used = 0
+    for act in actions or []:
+        detail = str(act.get("detail") or "")
+        if re.search(r"цикл заменён эскалацией|петля возврата снята", detail, re.I):
+            if used >= removed:
+                continue
+            used += 1
+        kept.append(act)
+    return kept
+
+
 def _resolve_implicit_returns(steps: List[Step]) -> None:
     """Возврат без «п.N» → последний предыдущий шаг указанной (или текущей) роли."""
     for i, step in enumerate(steps):
@@ -1711,7 +1822,7 @@ def parse_regulation(text: str) -> ParsedRegulation:
         t = _INTRO_CLAUSE_RE.sub("", t).strip(" .;,:—–-")
         t = _CONNECTORS_RE.sub("", t).strip(" .;,:—–-")
         action, decision = _parse_decision(t)
-        step.decision = decision
+        step.decision = _ensure_return_decision(t, decision, step.num)
         step.action = bool(action)
         source = action if action else t
         joint = _split_joint_role(source)
@@ -5425,6 +5536,10 @@ def _catalog_tobe_moves(regulation_text: str) -> Tuple[List[int], List[int], Lis
     return autos, pairs, loops
 
 
+_TOBE_FULL_ENUM_LIMIT = 48
+_TOBE_REBUILD_BUDGET = 64
+
+
 def _iter_tobe_selections(
     autos: Sequence[int],
     pairs: Sequence[int],
@@ -5440,7 +5555,7 @@ def _iter_tobe_selections(
         chosen_ctrl = {loop_l[i] for i, state in enumerate(loop_states) if state == 2}
         selections.append((set(auto_idx), set(pair_idx), chosen_loops, chosen_ctrl))
 
-    if count <= 256 and count:
+    if 0 < count <= _TOBE_FULL_ENUM_LIMIT:
         for amask in range(2 ** len(auto_l)):
             auto_idx = [auto_l[i] for i in range(len(auto_l)) if amask & (1 << i)]
             for pmask in range(2 ** len(pair_l)):
@@ -5514,14 +5629,18 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
         {"do_auto": False, "do_parallel": False, "do_safety": True, "do_loops": True, "do_control": False},
     ]
     seen: set = set()
+    built = 0
     best: Optional[Tuple[Tuple[float, float, float], str, List[Dict[str, str]], str, dict, str]] = None
 
     def _consider(cand_text: str, cand_actions: List[Dict[str, str]], cand_engine: str) -> None:
-        nonlocal best
+        nonlocal best, built
+        if built >= _TOBE_REBUILD_BUDGET:
+            return
         key = normalize_regulation(cand_text or "")
         if not key or key in seen:
             return
         seen.add(key)
+        built += 1
         try:
             xml, new_audit, err = _rebuild_process(cand_text, f"to-be · {cand_engine}", [], use_llm=(cand_engine == "llm"))
         except Exception as exc:  # noqa: BLE001
@@ -5589,6 +5708,7 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
         return optimized, delta
 
     _score, optimized, actions, xml, new_audit, engine = best
+    actions = _limit_escalation_actions(actions, asis_audit, new_audit)
     if not actions:
         actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
     delta = _tobe_delta(asis_audit, new_audit or {}, actions, engine)

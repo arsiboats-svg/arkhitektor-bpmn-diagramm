@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import html
 import io
@@ -104,7 +105,7 @@ def read_asset(name: str) -> Optional[str]:
 
 
 def _reg_hash(text: str, *parts: object) -> str:
-    payload = "\u001f".join(["palette-corporate-v4", text or "", *[str(p) for p in parts]])
+    payload = "\u001f".join(["palette-corporate-v5", text or "", *[str(p) for p in parts]])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1194,6 +1195,18 @@ def _share_by_role(lane_load: Optional[List[Dict[str, Any]]]) -> Dict[str, float
     return {str(it.get("role") or ""): float(it.get("share") or 0) for it in (lane_load or []) if it.get("role")}
 
 
+def _role_hours_share(lane_load: Optional[List[Dict[str, Any]]], role: str) -> float:
+    """Доля часов той же роли, чья доля шагов уже показана как bus-factor."""
+    for item in lane_load or []:
+        if str(item.get("role") or "") != str(role or ""):
+            continue
+        try:
+            return float(item.get("hours_share") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
 def lane_load_html(
     lane_load: Optional[List[Dict[str, Any]]],
     bus_factor: Optional[Dict[str, Any]] = None,
@@ -1206,6 +1219,7 @@ def lane_load_html(
     rows: List[str] = []
     for item in sorted(lane_load or [], key=lambda it: -float(it.get("share") or 0)):
         share = float(item.get("share") or 0)
+        hours_share = float(item.get("hours_share") or 0)
         role = str(item.get("role") or "")
         was = prev.get(role)
         relieved = compare and was is not None and was > threshold and share <= threshold
@@ -1219,7 +1233,7 @@ def lane_load_html(
         rows.append(
             f'<div class="bar-row"><div class="n" title="{esc(role)}">{esc(role)}</div>'
             f'<div class="t"><div class="f {klass}" style="width:{min(share, 1) * 100:.0f}%"></div></div>'
-            f'<div class="p">{share:.0%} · {int(item.get("tasks") or 0)} шаг.{delta}</div></div>'
+            f'<div class="p">{share:.0%} шагов · {hours_share:.0%} часов · {int(item.get("tasks") or 0)} шаг.{delta}</div></div>'
         )
     return "".join(rows) or '<div class="land-empty">Нет данных о нагрузке ролей.</div>'
 
@@ -1458,7 +1472,8 @@ def render_audit(audit: Dict[str, Any]) -> None:
         card(
             "Bus-factor",
             f"{float(bus['max_share']):.0%}",
-            f"Роль «{esc(bus['top_role'])}» · порог {float(bus['threshold']):.0%}",
+            f"Роль «{esc(bus['top_role'])}» · порог {float(bus['threshold']):.0%}"
+            f" · по часам {_role_hours_share(audit.get('lane_load'), str(bus.get('top_role') or '')):.0%}",
             bus_color,
             bus_pill,
         ),
@@ -1553,7 +1568,7 @@ def _tobe_accepted(facts: Dict[str, Any]) -> bool:
     loops_after = int(facts.get("loops_after") or 0)
     if loops_after > loops_before:
         return False
-    if loops_before > 0 and loops_after > 0:
+    if loops_before > 0 and loops_after >= loops_before:
         return False
     return True
 
@@ -1577,6 +1592,7 @@ def _annotate_tobe_facts(
 ) -> Dict[str, Any]:
     view = dict(facts)
     view["path_n_before"] = len(_path_tasks_only(asis_audit.get("critical_path")))
+    view["bus_hours_share"] = _role_hours_share(view.get("lane_load"), str(view.get("bus_role") or ""))
     view["show_steps"] = bool(show_steps and tobe_audit.get("critical_path"))
     if view["show_steps"]:
         later = process_facts(tobe_audit, None)
@@ -1584,11 +1600,13 @@ def _annotate_tobe_facts(
         view["bus_share_after"] = later.get("bus_share") or 0
         view["bus_role_after"] = later.get("bus_role") or ""
         view["bus_status_after"] = later.get("bus_status") or ""
+        view["bus_hours_share_after"] = _role_hours_share(later.get("lane_load"), str(later.get("bus_role") or ""))
     else:
         view["path_n_after"] = view["path_n_before"]
         view["bus_share_after"] = view.get("bus_share") or 0
         view["bus_role_after"] = view.get("bus_role") or ""
         view["bus_status_after"] = view.get("bus_status") or ""
+        view["bus_hours_share_after"] = view["bus_hours_share"]
     return view
 
 
@@ -1602,8 +1620,12 @@ def prepare_regulation(
     As-Is и To-Be считаются одним проходом. Кандидат, который длиннее голого пути
     или не снял циклы, не попадает в список шагов: остаётся предыдущий допустимый To-Be.
     """
-    xml, audit, error = generate_bpmn_from_text(text or "", use_llm=bool(use_llm))
-    audit = audit or {}
+    xml, audit, error = cached_generate_bpmn(
+        _reg_hash(text or "", bool(use_llm)),
+        text or "",
+        bool(use_llm),
+    )
+    audit = copy.deepcopy(audit) if isinstance(audit, dict) else {}
     pack: Dict[str, Any] = {
         "xml": xml or "",
         "audit": audit,
@@ -1619,7 +1641,12 @@ def prepare_regulation(
     if error or not audit.get("sla"):
         pack["facts"] = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
         return pack
-    opt_text, delta = optimize_process_to_be(text, audit)
+    opt_text, delta = cached_optimize_to_be(
+        _reg_hash(text or "", _audit_cache_slice(audit)),
+        text or "",
+        audit,
+    )
+    delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
     facts = process_facts(audit, delta)
     tobe_audit = dict(delta.get("tobe_audit") or {})
     tobe_xml = str(delta.get("tobe_xml") or "")
@@ -1789,30 +1816,38 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state.pop("tobe_pack", None)
 
 
+def _export_slot(token: str) -> Dict[str, Any]:
+    """Паспорт и DOCX живут в сессии и собираются только по нажатию кнопки."""
+    bucket = st.session_state.setdefault("export_cache", {})
+    if token not in bucket:
+        bucket.clear()
+        bucket[token] = {}
+    return bucket[token]
+
+
 def render_downloads(key: str) -> None:
-    """Скачивание: BPMN 2.0, SVG, Паспорт (.md) и официальный регламент (.docx)."""
+    """Скачивание: BPMN 2.0 и SVG сразу, паспорт и DOCX — в момент запроса файла."""
     result = st.session_state.get("result")
     ok = bool(result and not result["error"])
     stem = st.session_state.get("file_stem", "process")
-    passport = ""
-    docx_bytes = b""
-    if ok:
+    token = _reg_hash((result or {}).get("xml") or "", st.session_state.get("reg_text") or "") if ok else ""
+    slot = _export_slot(token) if ok else {}
+
+    def _materialize(kind: str) -> Any:
+        if kind in slot:
+            return slot[kind]
+        xml = (result or {}).get("xml") or ""
+        audit = (result or {}).get("audit") or {}
+        text = st.session_state.get("reg_text") or ""
         try:
-            passport = generate_process_passport(
-                result.get("xml") or "",
-                result.get("audit") or {},
-                st.session_state.get("reg_text") or "",
+            slot[kind] = (
+                generate_process_passport(xml, audit, text)
+                if kind == "md"
+                else export_docx_passport(xml, audit, text)
             )
-        except Exception:  # noqa: BLE001 — кнопка просто недоступна, UI не падает
-            passport = ""
-        try:
-            docx_bytes = export_docx_passport(
-                result.get("xml") or "",
-                result.get("audit") or {},
-                st.session_state.get("reg_text") or "",
-            )
-        except Exception:  # noqa: BLE001
-            docx_bytes = b""
+        except Exception:  # noqa: BLE001 — кнопка остаётся, страница не падает
+            slot[kind] = "" if kind == "md" else b""
+        return slot[kind]
 
     slots = st.columns(4, gap="small")
     with slots[0]:
@@ -1834,26 +1869,33 @@ def render_downloads(key: str) -> None:
                 components.html(page, height=44, scrolling=False)
         else:
             st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
-    with slots[2]:
-        st.download_button(
-            "⬇️ Паспорт .md",
-            data=passport or "",
-            file_name=f"{stem}_passport.md",
-            mime="text/markdown",
-            disabled=not (ok and bool(passport)),
-            key=f"dl_passport_{key}",
-            use_container_width=True,
-        )
-    with slots[3]:
-        st.download_button(
-            "⬇️ Регламент .docx",
-            data=docx_bytes or b"",
-            file_name=f"{stem}_reglament.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            disabled=not (ok and bool(docx_bytes)),
-            key=f"dl_docx_{key}",
-            use_container_width=True,
-        )
+    def _lazy_file(col: Any, kind: str, label: str, file_name: str, mime: str) -> None:
+        with col:
+            if not ok:
+                st.button(label, disabled=True, key=f"dl_off_{kind}_{key}", use_container_width=True)
+                return
+            data = slot.get(kind)
+            if data is None and st.button(label, key=f"dl_build_{kind}_{key}", use_container_width=True):
+                data = _materialize(kind)
+            if not data:
+                return
+            st.download_button(
+                label,
+                data=data,
+                file_name=file_name,
+                mime=mime,
+                key=f"dl_save_{kind}_{key}",
+                use_container_width=True,
+            )
+
+    _lazy_file(slots[2], "md", "⬇️ Паспорт .md", f"{stem}_passport.md", "text/markdown")
+    _lazy_file(
+        slots[3],
+        "docx",
+        "⬇️ Регламент .docx",
+        f"{stem}_reglament.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
 
 def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
@@ -1871,7 +1913,12 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
         pack = prepare_regulation(text, use_llm=False, previous=cached if isinstance(cached, dict) else None)
         _store_regulation_pack(pack)
         return st.session_state.get("tobe_pack")
-    opt_text, delta = optimize_process_to_be(text, audit)
+    opt_text, delta = cached_optimize_to_be(
+        _reg_hash(text, _audit_cache_slice(audit)),
+        text,
+        audit,
+    )
+    delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
     facts = process_facts(audit, delta)
     tobe_xml = str((delta or {}).get("tobe_xml") or "")
     tobe_audit = dict((delta or {}).get("tobe_audit") or {})
@@ -1996,7 +2043,13 @@ def render_tobe_tab() -> None:
             if prev_shares.get(str(item.get("role") or ""), 0) > threshold
             and float(item.get("share") or 0) <= threshold
         ]
-        load_bits = [f"Bus-factor {before_share:.0%} → {after_share:.0%}"]
+        hours_before = float(facts.get("bus_hours_share") or 0)
+        hours_after = float(
+            facts.get("bus_hours_share_after") if facts.get("bus_hours_share_after") is not None else hours_before
+        )
+        load_bits = [
+            f"Bus-factor {before_share:.0%} → {after_share:.0%} шагов · по часам {hours_before:.0%} → {hours_after:.0%}"
+        ]
         if relieved:
             load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
         elif facts.get("bus_status_after") == "ok" or facts.get("bus_status") == "ok":

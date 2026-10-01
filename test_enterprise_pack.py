@@ -317,7 +317,12 @@ b = DIAGRAM.add_user_task("Выполнить аварийный ремонт о
 DIAGRAM.add_link(ROOT_START_TASK_ID, a)
 DIAGRAM.add_link(a, ROOT_END_TASK_ID)
 """
-    xml_h, audit_h, err_h = execute_generated_code(healed_code, "Проверка heal", regulation_text=text1)
+    heal_text = (
+        "Регламент: Проверка heal\n"
+        "1. Диспетчер принимает сообщение об аварии (10 минут).\n"
+        "2. Ремонтная бригада выполняет аварийный ремонт оборудования (30 минут).\n"
+    )
+    xml_h, audit_h, err_h = execute_generated_code(healed_code, "Проверка heal", regulation_text=heal_text)
     assert not err_h, err_h
     journal = " ".join(audit_h.get("auto_healed") or [])
     assert "без входа" in journal or "Тупик" in journal, journal
@@ -429,6 +434,113 @@ DIAGRAM.add_link(f, ROOT_END_TASK_ID)
     assert audit_bare["methodology"]["long_chains"], audit_bare["methodology"]
     assert audit_bare["methodology"]["score"] < 100
 
+    from ai_generator import _explicit_return_count
+
+    two_returns = (
+        "Регламент: Два возврата\n"
+        "1. Диспетчер принимает заявку (10 минут).\n"
+        "2. Начальник смены проверяет комплект (20 минут). "
+        "Если комплект полный — перейти к п.3, иначе «замечания» — вернуть на п.1.\n"
+        "3. Служба готовит ответ (15 минут). "
+        "Если согласовано — завершить процесс, иначе «на доработку» — вернуть на п.2.\n"
+    )
+    one_return = (
+        "Регламент: Один возврат\n"
+        "1. Диспетчер готовит пакет (10 минут).\n"
+        "2. Начальник смены согласовывает пакет (20 минут). Если не согласовано — назад.\n"
+        "3. Служба закрывает заявку (15 минут).\n"
+    )
+    no_return = (
+        "Регламент: Без возврата\n"
+        "1. Диспетчер принимает заявку (10 минут).\n"
+        "2. Начальник смены проверяет комплект (20 минут).\n"
+        "3. Служба закрывает заявку (15 минут).\n"
+    )
+    _, audit_two, err_two = generate_bpmn_from_text(two_returns, use_llm=False)
+    _, audit_one, err_one = generate_bpmn_from_text(one_return, use_llm=False)
+    _, audit_zero, err_zero = generate_bpmn_from_text(no_return, use_llm=False)
+    assert not err_two and not err_one and not err_zero, (err_two, err_one, err_zero)
+    loops_two = len(audit_two["rework_loops"])
+    loops_one = len(audit_one["rework_loops"])
+    loops_zero = len(audit_zero["rework_loops"])
+    assert loops_two == 2, loops_two
+    assert loops_one == 1, loops_one
+    assert loops_zero == 0, loops_zero
+    assert _explicit_return_count(two_returns) == loops_two
+    assert _explicit_return_count(one_return) == loops_one
+    assert _explicit_return_count(no_return) == loops_zero
+    _, delta_zero = optimize_process_to_be(no_return, audit_zero)
+    assert not any(
+        "цикл заменён эскалацией" in str(a.get("detail") or "")
+        for a in (delta_zero.get("actions") or [])
+    ), delta_zero.get("actions")
+
+    said = _explicit_return_count(text)
+    assert said == len(audit["rework_loops"]), (said, len(audit["rework_loops"]))
+    assert int(delta.get("rework_before") or 0) == said
+    assert int(delta.get("rework_after") or 0) == 0
+    removed_edges = int(delta.get("rework_before") or 0) - int(delta.get("rework_after") or 0)
+    escalations = [
+        a for a in (delta.get("actions") or [])
+        if "цикл заменён эскалацией" in str(a.get("detail") or "")
+    ]
+    assert len(escalations) == removed_edges, (len(escalations), removed_edges, escalations)
+
+    linear = """
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+a = DIAGRAM.add_user_task("Принять заявку", lanes[0])
+b = DIAGRAM.add_user_task("Проверить комплект", lanes[0])
+DIAGRAM.add_link(ROOT_START_TASK_ID, a)
+DIAGRAM.add_link(a, b)
+DIAGRAM.add_link(b, ROOT_END_TASK_ID)
+"""
+    _, audit_gap, err_gap = execute_generated_code(linear, "Дыра возврата", regulation_text=one_return)
+    assert not err_gap, err_gap
+    assert audit_gap["quality"]["ok"] is False
+    assert any("явных возврата" in item for item in audit_gap["quality"]["critical"])
+
+    sla_code = """
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+a = DIAGRAM.add_user_task("Принять сообщение диспетчера", lanes[0])
+b = DIAGRAM.add_user_task("Совершенно постороннее действие", lanes[0])
+DIAGRAM.add_link(ROOT_START_TASK_ID, a)
+DIAGRAM.add_link(a, b)
+DIAGRAM.add_link(b, ROOT_END_TASK_ID)
+"""
+    sla_reg = (
+        "1. Диспетчер принимает сообщение (5 часов).\n"
+        "2. Диспетчер пишет отдельный журнал (9 часов).\n"
+    )
+    _, audit_sla, err_sla = execute_generated_code(sla_code, "Сроки по имени", regulation_text=sla_reg)
+    assert not err_sla, err_sla
+    by_name = {str(item.get("name") or ""): float(item.get("hours") or 0) for item in audit_sla["critical_path"]}
+    assert abs(by_name["Принять сообщение диспетчера"] - 5.0) < 1e-6, by_name
+    assert abs(by_name["Совершенно постороннее действие"] - 2.0) < 1e-6, by_name
+
+    import os
+    import time
+
+    hang = "for i in range(2000):\n    for j in range(2000):\n        for k in range(2000):\n            x = i + j + k\n"
+    os.environ["DIAGRAM_EXEC_TIMEOUT"] = "0.4"
+    started = time.time()
+    try:
+        xml_hang, _, err_hang = execute_generated_code(hang, "Зависание")
+    finally:
+        os.environ.pop("DIAGRAM_EXEC_TIMEOUT", None)
+    assert time.time() - started < 3, time.time() - started
+    assert not xml_hang
+    assert "таймаут" in err_hang.lower(), err_hang
+
+    from ai_generator import _iter_tobe_selections
+
+    assert len(_iter_tobe_selections([0], [1], [2, 3])) == 36
+    huge = _iter_tobe_selections(list(range(5)), list(range(5)), list(range(3)))
+    assert len(huge) <= 80, len(huge)
+
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
     print("NEW_STEP", new_step)
@@ -443,6 +555,8 @@ DIAGRAM.add_link(f, ROOT_END_TASK_ID)
         f"engine={delta.get('engine')}",
         f"grid={delta_g.get('sla_before_hours')}→{delta_g.get('sla_after_hours')}",
         f"proc_q={q_before}→{q_after}",
+        f"returns={loops_two}/{loops_one}/{loops_zero}",
+        f"example1_loops={said}→0",
     )
 
 
