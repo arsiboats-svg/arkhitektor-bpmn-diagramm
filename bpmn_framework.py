@@ -2011,9 +2011,13 @@ class BPMNDiagramBuilder:
 
         for node in self.nodes.values():
             stroke, fill = KIND_COLORS[node.kind]
-            expanded = ' isExpanded="true"' if node.kind == "subProcess" else ""
+            extras = ""
+            if node.kind == "subProcess":
+                extras += ' isExpanded="true"'
+            if node.kind == "exclusiveGateway":
+                extras += ' isMarkerVisible="true"'
             out.append(
-                f'      <bpmndi:BPMNShape id="{node.id}_di" bpmnElement="{node.id}"{expanded}'
+                f'      <bpmndi:BPMNShape id="{node.id}_di" bpmnElement="{node.id}"{extras}'
                 f"{_color_attrs(stroke, fill)}>"
             )
             out.append(bounds(node.x, node.y, node.width, node.height))

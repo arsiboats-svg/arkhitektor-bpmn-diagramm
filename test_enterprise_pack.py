@@ -26,6 +26,16 @@ def main() -> None:
     xml, audit, err = generate_bpmn_from_text(text, use_llm=False)
     assert not err, err
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
+    xor_ids = set(re.findall(r'<bpmn:exclusiveGateway\b[^>]*\bid="([^"]+)"', xml))
+    other_ids = set(re.findall(r'<bpmn:(?:parallelGateway|inclusiveGateway)\b[^>]*\bid="([^"]+)"', xml))
+    for sid in xor_ids:
+        m = re.search(rf'<bpmndi:BPMNShape\b[^>]*bpmnElement="{re.escape(sid)}"[^>]*>', xml)
+        assert m and 'isMarkerVisible="true"' in m.group(0), sid
+    for sid in other_ids:
+        m = re.search(rf'<bpmndi:BPMNShape\b[^>]*bpmnElement="{re.escape(sid)}"[^>]*>', xml)
+        assert m and "isMarkerVisible" not in m.group(0), sid
+    assert not re.search(r"<bpmn:exclusiveGateway\b[^>]*isMarkerVisible", xml)
+    assert not re.search(r"<bpmn:(?:parallelGateway|inclusiveGateway)\b[^>]*isMarkerVisible", xml)
 
     opt, delta = optimize_process_to_be(text, audit)
     ot_stop = re.compile(

@@ -29,8 +29,10 @@
         <bpmn:flowNodeRef>Activity_6</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Activity_11</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Gateway_2</bpmn:flowNodeRef>
-        <bpmn:flowNodeRef>Activity_13</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Activity_15</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_5" name="СИЗ">
+        <bpmn:flowNodeRef>Activity_13</bpmn:flowNodeRef>
       </bpmn:lane>
     </bpmn:laneSet>
     <bpmn:userTask id="Activity_1" name="Принять сообщение об аварийном отключении оборудования ПС 110 кВ">
@@ -114,7 +116,7 @@
       <bpmn:incoming>Flow_6</bpmn:incoming>
       <bpmn:outgoing>Flow_7</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:userTask id="Activity_13" name="Подготовить СИЗ, инструмент и переносные заземления">
+    <bpmn:userTask id="Activity_13" name="Подготовить ремонтная бригада">
       <bpmn:incoming>Flow_8</bpmn:incoming>
       <bpmn:outgoing>Flow_9</bpmn:outgoing>
     </bpmn:userTask>
@@ -165,249 +167,252 @@
   <bpmndi:BPMNDiagram id="BPMNDiagram_1">
     <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Collaboration_1">
       <bpmndi:BPMNShape id="Participant_1_di" bpmnElement="Participant_1" isHorizontal="true" bioc:stroke="#003366" bioc:fill="#FFFFFF" color:border-color="#003366" color:background-color="#FFFFFF">
-        <dc:Bounds x="160.0" y="80.0" width="4742.0" height="923.0" />
+        <dc:Bounds x="160.0" y="80.0" width="4742.0" height="1217.0" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Lane_1_di" bpmnElement="Lane_1" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F5F9FF" color:border-color="#1565C0" color:background-color="#F5F9FF">
-        <dc:Bounds x="190.0" y="80.0" width="4712.0" height="211.0" />
+      <bpmndi:BPMNShape id="Lane_1_di" bpmnElement="Lane_1" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F4F8FD" color:border-color="#1565C0" color:background-color="#F4F8FD">
+        <dc:Bounds x="190.0" y="80.0" width="4712.0" height="243.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Lane_2_di" bpmnElement="Lane_2" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#FFFFFF" color:border-color="#1565C0" color:background-color="#FFFFFF">
-        <dc:Bounds x="190.0" y="291.0" width="4712.0" height="182.0" />
+        <dc:Bounds x="190.0" y="323.0" width="4712.0" height="214.0" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Lane_3_di" bpmnElement="Lane_3" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F5F9FF" color:border-color="#1565C0" color:background-color="#F5F9FF">
-        <dc:Bounds x="190.0" y="473.0" width="4712.0" height="182.0" />
+      <bpmndi:BPMNShape id="Lane_3_di" bpmnElement="Lane_3" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F4F8FD" color:border-color="#1565C0" color:background-color="#F4F8FD">
+        <dc:Bounds x="190.0" y="537.0" width="4712.0" height="214.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Lane_4_di" bpmnElement="Lane_4" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#FFFFFF" color:border-color="#1565C0" color:background-color="#FFFFFF">
-        <dc:Bounds x="190.0" y="655.0" width="4712.0" height="348.0" />
+        <dc:Bounds x="190.0" y="751.0" width="4712.0" height="348.0" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_5_di" bpmnElement="Lane_5" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F4F8FD" color:border-color="#1565C0" color:background-color="#F4F8FD">
+        <dc:Bounds x="190.0" y="1099.0" width="4712.0" height="198.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_1_di" bpmnElement="Activity_1" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="374.0" y="125.2" width="140.0" height="120.5" />
+        <dc:Bounds x="374.0" y="141.2" width="140.0" height="120.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_2_di" bpmnElement="Activity_2" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="598.0" y="118.0" width="140.0" height="135.0" />
+        <dc:Bounds x="598.0" y="134.0" width="140.0" height="135.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_3_di" bpmnElement="Activity_3" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="822.0" y="329.0" width="140.0" height="106.0" />
+        <dc:Bounds x="822.0" y="377.0" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_4_di" bpmnElement="Activity_4" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="1046.0" y="336.2" width="140.0" height="91.5" />
+        <dc:Bounds x="1046.0" y="384.2" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_5_di" bpmnElement="Activity_5" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="1270.0" y="511.0" width="140.0" height="106.0" />
+        <dc:Bounds x="1270.0" y="591.0" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Gateway_1_di" bpmnElement="Gateway_1" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
-        <dc:Bounds x="1494.0" y="539.0" width="50.0" height="50.0" />
+      <bpmndi:BPMNShape id="Gateway_1_di" bpmnElement="Gateway_1" isMarkerVisible="true" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
+        <dc:Bounds x="1494.0" y="619.0" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1414.6" y="522.0" width="98.4" height="15.0" />
+          <dc:Bounds x="1414.6" y="602.0" width="98.4" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_6_di" bpmnElement="Activity_6" isExpanded="true" bioc:stroke="#4527A0" bioc:fill="#EDE7F6" color:border-color="#4527A0" color:background-color="#EDE7F6">
-        <dc:Bounds x="1628.0" y="693.0" width="1344.0" height="240.0" />
+        <dc:Bounds x="1628.0" y="805.0" width="1344.0" height="240.0" />
         <bpmndi:BPMNLabel labelStyle="LabelStyle_SubprocessTitle" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Event_1_di" bpmnElement="Event_1" bioc:stroke="#2E7D32" bioc:fill="#E8F5E9" color:border-color="#2E7D32" color:background-color="#E8F5E9">
-        <dc:Bounds x="1684.0" y="805.0" width="36.0" height="36.0" />
+        <dc:Bounds x="1684.0" y="917.0" width="36.0" height="36.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1667.0" y="845.0" width="70.0" height="15.0" />
+          <dc:Bounds x="1667.0" y="957.0" width="70.0" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Event_2_di" bpmnElement="Event_2" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
-        <dc:Bounds x="2880.0" y="805.0" width="36.0" height="36.0" />
+        <dc:Bounds x="2880.0" y="917.0" width="36.0" height="36.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="2862.4" y="845.0" width="71.2" height="15.0" />
+          <dc:Bounds x="2862.4" y="957.0" width="71.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_7_di" bpmnElement="Activity_7" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="1840.0" y="777.2" width="140.0" height="91.5" />
+        <dc:Bounds x="1840.0" y="889.2" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_8_di" bpmnElement="Activity_8" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="2100.0" y="762.8" width="140.0" height="120.5" />
+        <dc:Bounds x="2100.0" y="874.8" width="140.0" height="120.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_9_di" bpmnElement="Activity_9" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="2360.0" y="770.0" width="140.0" height="106.0" />
+        <dc:Bounds x="2360.0" y="882.0" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_10_di" bpmnElement="Activity_10" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="2620.0" y="770.0" width="140.0" height="106.0" />
+        <dc:Bounds x="2620.0" y="882.0" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_11_di" bpmnElement="Activity_11" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="3056.0" y="767.2" width="140.0" height="91.5" />
+        <dc:Bounds x="3056.0" y="879.2" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Gateway_2_di" bpmnElement="Gateway_2" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
-        <dc:Bounds x="3280.0" y="788.0" width="50.0" height="50.0" />
+      <bpmndi:BPMNShape id="Gateway_2_di" bpmnElement="Gateway_2" isMarkerVisible="true" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
+        <dc:Bounds x="3280.0" y="900.0" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3149.0" y="736.0" width="150.0" height="30.0" />
+          <dc:Bounds x="3149.0" y="848.0" width="150.0" height="30.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Gateway_3_di" bpmnElement="Gateway_3" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
-        <dc:Bounds x="3414.0" y="160.5" width="50.0" height="50.0" />
+        <dc:Bounds x="3414.0" y="176.5" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3293.8" y="143.5" width="139.2" height="15.0" />
+          <dc:Bounds x="3293.8" y="159.5" width="139.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Gateway_4_di" bpmnElement="Gateway_4" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
-        <dc:Bounds x="3772.0" y="160.5" width="50.0" height="50.0" />
+        <dc:Bounds x="3772.0" y="176.5" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3803.0" y="143.5" width="118.8" height="15.0" />
+          <dc:Bounds x="3803.0" y="159.5" width="118.8" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_12_di" bpmnElement="Activity_12" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="3548.0" y="125.2" width="140.0" height="120.5" />
+        <dc:Bounds x="3548.0" y="141.2" width="140.0" height="120.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_13_di" bpmnElement="Activity_13" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="3548.0" y="760.0" width="140.0" height="106.0" />
+        <dc:Bounds x="3548.0" y="1153.0" width="140.0" height="80.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_14_di" bpmnElement="Activity_14" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="3906.0" y="511.0" width="140.0" height="106.0" />
+        <dc:Bounds x="3906.0" y="591.0" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_15_di" bpmnElement="Activity_15" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="4130.0" y="767.2" width="140.0" height="91.5" />
+        <dc:Bounds x="4130.0" y="879.2" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_16_di" bpmnElement="Activity_16" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="4354.0" y="329.0" width="140.0" height="106.0" />
+        <dc:Bounds x="4354.0" y="377.0" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_17_di" bpmnElement="Activity_17" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="4578.0" y="132.5" width="140.0" height="106.0" />
+        <dc:Bounds x="4578.0" y="148.5" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Event_RootStart_di" bpmnElement="Event_RootStart" bioc:stroke="#2E7D32" bioc:fill="#E8F5E9" color:border-color="#2E7D32" color:background-color="#E8F5E9">
-        <dc:Bounds x="254.0" y="167.5" width="36.0" height="36.0" />
+        <dc:Bounds x="254.0" y="183.5" width="36.0" height="36.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="219.4" y="207.5" width="105.2" height="15.0" />
+          <dc:Bounds x="219.4" y="223.5" width="105.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Event_RootEnd_di" bpmnElement="Event_RootEnd" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
-        <dc:Bounds x="4802.0" y="167.5" width="36.0" height="36.0" />
+        <dc:Bounds x="4802.0" y="183.5" width="36.0" height="36.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="4760.6" y="207.5" width="118.8" height="15.0" />
+          <dc:Bounds x="4760.6" y="223.5" width="118.8" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="1410.0" y="564.0" />
-        <di:waypoint x="1494.0" y="564.0" />
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="1410.0" y="644.0" />
+        <di:waypoint x="1494.0" y="644.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="1980.0" y="823.0" />
-        <di:waypoint x="2100.0" y="823.0" />
+      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="1980.0" y="935.0" />
+        <di:waypoint x="2100.0" y="935.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_3_di" bpmnElement="Flow_3" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="2240.0" y="823.0" />
-        <di:waypoint x="2360.0" y="823.0" />
+      <bpmndi:BPMNEdge id="Flow_3_di" bpmnElement="Flow_3" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="2240.0" y="935.0" />
+        <di:waypoint x="2360.0" y="935.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_4_di" bpmnElement="Flow_4" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="2500.0" y="823.0" />
-        <di:waypoint x="2620.0" y="823.0" />
+      <bpmndi:BPMNEdge id="Flow_4_di" bpmnElement="Flow_4" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="2500.0" y="935.0" />
+        <di:waypoint x="2620.0" y="935.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_5_di" bpmnElement="Flow_5" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3196.0" y="813.0" />
-        <di:waypoint x="3280.0" y="813.0" />
+      <bpmndi:BPMNEdge id="Flow_5_di" bpmnElement="Flow_5" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3196.0" y="925.0" />
+        <di:waypoint x="3280.0" y="925.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_6_di" bpmnElement="Flow_6" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3464.0" y="185.5" />
-        <di:waypoint x="3548.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_6_di" bpmnElement="Flow_6" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3464.0" y="201.5" />
+        <di:waypoint x="3548.0" y="201.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_7_di" bpmnElement="Flow_7" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3688.0" y="185.5" />
-        <di:waypoint x="3772.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_7_di" bpmnElement="Flow_7" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3688.0" y="201.5" />
+        <di:waypoint x="3772.0" y="201.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_8_di" bpmnElement="Flow_8" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3439.0" y="210.5" />
-        <di:waypoint x="3439.0" y="813.0" />
-        <di:waypoint x="3548.0" y="813.0" />
+      <bpmndi:BPMNEdge id="Flow_8_di" bpmnElement="Flow_8" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3439.0" y="226.5" />
+        <di:waypoint x="3439.0" y="1193.0" />
+        <di:waypoint x="3548.0" y="1193.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_9_di" bpmnElement="Flow_9" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3688.0" y="813.0" />
-        <di:waypoint x="3797.0" y="813.0" />
-        <di:waypoint x="3797.0" y="210.5" />
+      <bpmndi:BPMNEdge id="Flow_9_di" bpmnElement="Flow_9" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3688.0" y="1193.0" />
+        <di:waypoint x="3797.0" y="1193.0" />
+        <di:waypoint x="3797.0" y="226.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_10_di" bpmnElement="Flow_10" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="290.0" y="185.5" />
-        <di:waypoint x="374.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_10_di" bpmnElement="Flow_10" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="290.0" y="201.5" />
+        <di:waypoint x="374.0" y="201.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_11_di" bpmnElement="Flow_11" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="514.0" y="185.5" />
-        <di:waypoint x="598.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_11_di" bpmnElement="Flow_11" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="514.0" y="201.5" />
+        <di:waypoint x="598.0" y="201.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_12_di" bpmnElement="Flow_12" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="668.0" y="253.0" />
-        <di:waypoint x="668.0" y="382.0" />
-        <di:waypoint x="822.0" y="382.0" />
+      <bpmndi:BPMNEdge id="Flow_12_di" bpmnElement="Flow_12" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="668.0" y="269.0" />
+        <di:waypoint x="668.0" y="430.0" />
+        <di:waypoint x="822.0" y="430.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_13_di" bpmnElement="Flow_13" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="962.0" y="382.0" />
-        <di:waypoint x="1046.0" y="382.0" />
+      <bpmndi:BPMNEdge id="Flow_13_di" bpmnElement="Flow_13" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="962.0" y="430.0" />
+        <di:waypoint x="1046.0" y="430.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_14_di" bpmnElement="Flow_14" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="1186.0" y="382.0" />
-        <di:waypoint x="1340.0" y="382.0" />
-        <di:waypoint x="1340.0" y="511.0" />
+      <bpmndi:BPMNEdge id="Flow_14_di" bpmnElement="Flow_14" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="1186.0" y="430.0" />
+        <di:waypoint x="1340.0" y="430.0" />
+        <di:waypoint x="1340.0" y="591.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_15_di" bpmnElement="Flow_15" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="1519.0" y="589.0" />
-        <di:waypoint x="1519.0" y="813.0" />
-        <di:waypoint x="1628.0" y="813.0" />
+      <bpmndi:BPMNEdge id="Flow_15_di" bpmnElement="Flow_15" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="1519.0" y="669.0" />
+        <di:waypoint x="1519.0" y="925.0" />
+        <di:waypoint x="1628.0" y="925.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1527.0" y="601.0" width="91.6" height="15.0" />
+          <dc:Bounds x="1527.0" y="681.0" width="91.6" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_16_di" bpmnElement="Flow_16" bioc:stroke="#C62828" color:border-color="#C62828">
-        <di:waypoint x="1519.0" y="539.0" />
-        <di:waypoint x="1519.0" y="483.4" />
-        <di:waypoint x="1116.0" y="483.4" />
-        <di:waypoint x="1116.0" y="427.8" />
+        <di:waypoint x="1519.0" y="619.0" />
+        <di:waypoint x="1519.0" y="547.4" />
+        <di:waypoint x="1116.0" y="547.4" />
+        <di:waypoint x="1116.0" y="475.8" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1527.0" y="512.0" width="71.2" height="15.0" />
+          <dc:Bounds x="1527.0" y="592.0" width="71.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_17_di" bpmnElement="Flow_17" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="2972.0" y="813.0" />
-        <di:waypoint x="3056.0" y="813.0" />
+      <bpmndi:BPMNEdge id="Flow_17_di" bpmnElement="Flow_17" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="2972.0" y="925.0" />
+        <di:waypoint x="3056.0" y="925.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_18_di" bpmnElement="Flow_18" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3305.0" y="788.0" />
-        <di:waypoint x="3305.0" y="185.5" />
-        <di:waypoint x="3414.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_18_di" bpmnElement="Flow_18" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3305.0" y="900.0" />
+        <di:waypoint x="3305.0" y="201.5" />
+        <di:waypoint x="3414.0" y="201.5" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3313.0" y="716.0" width="96.0" height="60.0" />
+          <dc:Bounds x="3313.0" y="828.0" width="96.0" height="60.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_19_di" bpmnElement="Flow_19" bioc:stroke="#C62828" color:border-color="#C62828">
-        <di:waypoint x="3305.0" y="838.0" />
-        <di:waypoint x="3305.0" y="959.0" />
-        <di:waypoint x="2300.0" y="959.0" />
-        <di:waypoint x="2300.0" y="933.0" />
+        <di:waypoint x="3305.0" y="950.0" />
+        <di:waypoint x="3305.0" y="1253.0" />
+        <di:waypoint x="2300.0" y="1253.0" />
+        <di:waypoint x="2300.0" y="1045.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="2727.5" y="967.0" width="150.0" height="30.0" />
+          <dc:Bounds x="2727.5" y="1261.0" width="150.0" height="30.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_20_di" bpmnElement="Flow_20" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3822.0" y="185.5" />
-        <di:waypoint x="3976.0" y="185.5" />
-        <di:waypoint x="3976.0" y="511.0" />
+      <bpmndi:BPMNEdge id="Flow_20_di" bpmnElement="Flow_20" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3822.0" y="201.5" />
+        <di:waypoint x="3976.0" y="201.5" />
+        <di:waypoint x="3976.0" y="591.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_21_di" bpmnElement="Flow_21" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="3976.0" y="617.0" />
-        <di:waypoint x="3976.0" y="813.0" />
-        <di:waypoint x="4130.0" y="813.0" />
+      <bpmndi:BPMNEdge id="Flow_21_di" bpmnElement="Flow_21" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3976.0" y="697.0" />
+        <di:waypoint x="3976.0" y="925.0" />
+        <di:waypoint x="4130.0" y="925.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_22_di" bpmnElement="Flow_22" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="4270.0" y="813.0" />
-        <di:waypoint x="4424.0" y="813.0" />
-        <di:waypoint x="4424.0" y="435.0" />
+      <bpmndi:BPMNEdge id="Flow_22_di" bpmnElement="Flow_22" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="4270.0" y="925.0" />
+        <di:waypoint x="4424.0" y="925.0" />
+        <di:waypoint x="4424.0" y="483.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_23_di" bpmnElement="Flow_23" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="4424.0" y="329.0" />
-        <di:waypoint x="4424.0" y="185.5" />
-        <di:waypoint x="4578.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_23_di" bpmnElement="Flow_23" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="4424.0" y="377.0" />
+        <di:waypoint x="4424.0" y="201.5" />
+        <di:waypoint x="4578.0" y="201.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_24_di" bpmnElement="Flow_24" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="4718.0" y="185.5" />
-        <di:waypoint x="4802.0" y="185.5" />
+      <bpmndi:BPMNEdge id="Flow_24_di" bpmnElement="Flow_24" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="4718.0" y="201.5" />
+        <di:waypoint x="4802.0" y="201.5" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_25_di" bpmnElement="Flow_25" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="1720.0" y="823.0" />
-        <di:waypoint x="1840.0" y="823.0" />
+      <bpmndi:BPMNEdge id="Flow_25_di" bpmnElement="Flow_25" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="1720.0" y="935.0" />
+        <di:waypoint x="1840.0" y="935.0" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_26_di" bpmnElement="Flow_26" bioc:stroke="#455A64" color:border-color="#455A64">
-        <di:waypoint x="2760.0" y="823.0" />
-        <di:waypoint x="2880.0" y="823.0" />
+      <bpmndi:BPMNEdge id="Flow_26_di" bpmnElement="Flow_26" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="2760.0" y="935.0" />
+        <di:waypoint x="2880.0" y="935.0" />
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
     <bpmndi:BPMNLabelStyle id="LabelStyle_SubprocessTitle">

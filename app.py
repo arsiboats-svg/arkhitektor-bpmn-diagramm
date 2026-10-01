@@ -102,7 +102,7 @@ def read_asset(name: str) -> Optional[str]:
 
 
 def _reg_hash(text: str, *parts: object) -> str:
-    payload = "\u001f".join(["palette-corporate-v3", text or "", *[str(p) for p in parts]])
+    payload = "\u001f".join(["palette-corporate-v4", text or "", *[str(p) for p in parts]])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1517,6 +1517,7 @@ def on_example_change() -> None:
         stem = Path(st.session_state.get("last_uploaded_filename") or "custom_process").stem
         st.session_state["file_stem"] = re.sub(r"[^\w.\-]+", "_", stem, flags=re.U) or "custom_process"
     st.session_state["chat_messages"] = []
+    st.session_state["chat_cleared_toast"] = True
     st.session_state.pop("diagram_updated_by_assistant", None)
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
@@ -1619,6 +1620,7 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state["example_choice"] = CUSTOM_LABEL
     st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
+    st.session_state["chat_cleared_toast"] = True
     st.session_state.pop("diagram_updated_by_assistant", None)
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
@@ -1770,7 +1772,13 @@ def render_tobe_tab() -> None:
     q_gain = int(delta.get("quality_gain") or 0)
     asis_rw = float(delta.get("with_rework_before") or (asis_audit.get("sla") or {}).get("with_rework_hours") or asis_cp)
     tobe_rw = float(delta.get("with_rework_after") or (tobe_audit.get("sla") or {}).get("with_rework_hours") or tobe_cp)
-    if saved_h >= 1.0 / 60.0:
+    rw_saved = asis_rw - tobe_rw
+    minute = 1.0 / 60.0
+    if removed > 0 and rw_saved >= minute:
+        rw_pct = round(100.0 * rw_saved / asis_rw) if asis_rw else 0
+        hours_txt = fmt_hours(rw_saved).replace(".", ",")
+        eco_value = f"Экономия до {hours_txt} (−{rw_pct:.0f}%) за счёт устранения возвратов"
+    elif saved_h >= minute:
         eco_value = f"Экономия: {fmt_hours(saved_h)} ({saved_pct:.0f}%)"
     else:
         eco_value = "Без ускорения"
@@ -1962,7 +1970,7 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             help="Выберите эталонный кейс или введите свой текст ниже.",
         )
         st.text_area(
-            "Текст регламента (свободный текст или нумерованный список; развилки — «Если ..., иначе ...»)",
+            "Вставьте свой регламент или выберите пример слева",
             key="reg_text",
             height=220 if compact else 360,
         )
@@ -1984,25 +1992,22 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
 
         result = st.session_state.get("result")
         if result and not result["error"]:
+            gen = result["audit"].get("generation", {})
+            engine = gen.get("engine", "—")
+            elapsed = gen.get("elapsed_s", 0)
+            note = ""
+            if gen.get("fallback") and engine == "semantic-emulator":
+                reasons = gen.get("trace") or ["LLM недоступна"]
+                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
+            elif gen.get("attempts", 1) > 1:
+                note = f" · исправлено со {gen['attempts']}-й попытки"
             if st.session_state.get("quickstart"):
-                st.markdown(
-                    '<div class="engine">Эталонный процесс подготовлен Groq GPT-OSS 120B · режим быстрого старта</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                gen = result["audit"].get("generation", {})
-                engine = gen.get("engine", "—")
-                note = ""
-                if gen.get("fallback") and engine == "semantic-emulator":
-                    reasons = gen.get("trace") or ["LLM недоступна"]
-                    note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
-                elif gen.get("attempts", 1) > 1:
-                    note = f" · исправлено со {gen['attempts']}-й попытки"
-                xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
-                st.markdown(
-                    f'<div class="engine">Движок: <b>{esc(engine)}</b> · {gen.get("elapsed_s", 0)} с{xsd}{note}</div>',
-                    unsafe_allow_html=True,
-                )
+                note += " · режим быстрого старта"
+            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
+            st.markdown(
+                f'<div class="engine">Движок: <b>{esc(engine)}</b> · {elapsed} с{xsd}{note}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def _diagram_height(wide: bool) -> int:
@@ -2038,9 +2043,26 @@ def _sync_canvas_from_query() -> None:
         st.session_state["canvas_variant"] = ASIS_LABEL
 
 
+def _hero_engine_badge() -> str:
+    """Бейдж шапки: Online только если последняя успешная схема реально от облака."""
+    result = st.session_state.get("result") or {}
+    if result.get("error") or not result.get("xml"):
+        return "Эмулятор"
+    engine = str(((result.get("audit") or {}).get("generation") or {}).get("engine") or "")
+    low = engine.lower()
+    if not engine or low == "semantic-emulator":
+        return "Эмулятор"
+    if low.startswith("ollama"):
+        return "Ollama"
+    if "gpt-oss-120b" in low or "groq" in low:
+        return "🟢 Groq 120B Online"
+    if low.startswith("openai") or low.startswith("fallback"):
+        return "🟢 Online"
+    return engine
+
+
 def _hero_html() -> str:
-    connected = bool(os.getenv("OPENAI_API_KEY"))
-    engine = "🟢 Groq 120B Online" if connected else "LLM офлайн"
+    engine = _hero_engine_badge()
     return (
         '<div class="ir-hero">'
         "<div><h1>⚡ Архитектор BPMN-диаграмм</h1>"
@@ -2184,15 +2206,6 @@ def main() -> None:
     _sync_canvas_from_query()
     _migrate_view_mode()
 
-    st.markdown(_hero_html(), unsafe_allow_html=True)
-    view = st.radio(
-        "Режим отображения",
-        [VIEW_WIDE, VIEW_SPLIT],
-        key="view_mode",
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
     examples = load_examples()
     labels = list(examples)
     if "reg_text" not in st.session_state:
@@ -2206,6 +2219,15 @@ def main() -> None:
             run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
             st.session_state["quickstart"] = True
 
+    st.markdown(_hero_html(), unsafe_allow_html=True)
+    view = st.radio(
+        "Режим отображения",
+        [VIEW_WIDE, VIEW_SPLIT],
+        key="view_mode",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
     wide = view == VIEW_WIDE
     canvas_h = _diagram_height(wide)
     if st.session_state.pop("diagram_updated_by_assistant", False):
@@ -2216,11 +2238,21 @@ def main() -> None:
     if wide:
         with st.expander("Параметры регламента", expanded=True):
             render_input_panel(labels, compact=True)
+        if st.session_state.pop("chat_cleared_toast", False):
+            st.markdown(
+                '<div class="ir-toast">Диалог очищен: выбран другой регламент</div>',
+                unsafe_allow_html=True,
+            )
         render_diagram(canvas_h)
     else:
         left, right = st.columns([5, 7], gap="large")
         with left:
             render_input_panel(labels)
+            if st.session_state.pop("chat_cleared_toast", False):
+                st.markdown(
+                    '<div class="ir-toast">Диалог очищен: выбран другой регламент</div>',
+                    unsafe_allow_html=True,
+                )
         with right:
             render_diagram(canvas_h)
 

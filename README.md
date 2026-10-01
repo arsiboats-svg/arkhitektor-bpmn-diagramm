@@ -136,7 +136,7 @@ DIAGRAM.add_link(source_id, target_id, condition_name="")
 
 Чистота XML:
 
-- Нет атрибута `isMarkerVisible`.
+- У фигуры `exclusiveGateway` в DI стоит `isMarkerVisible="true"` (маркер X на ромбе); у `parallelGateway` и `inclusiveGateway` атрибут не ставится.
 - Тег `<bpmn:group>` не попадает в `<bpmn:process>`: группа размещена в `<bpmn:collaboration>` с `category` / `categoryValue`, это валидно по схеме BPMN 2.0.2.
 - Каждый элемент модели имеет пару в `bpmndi`.
 

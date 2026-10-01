@@ -2,7 +2,7 @@
   "bus_factor_alerts": [],
   "bus_factor": {
     "threshold": 0.45,
-    "max_share": 0.438,
+    "max_share": 0.375,
     "top_role": "Ремонтная бригада",
     "status": "ok"
   },
@@ -34,10 +34,18 @@
     {
       "lane_id": "Lane_4",
       "role": "Ремонтная бригада",
-      "tasks": 7,
-      "share": 0.438,
-      "hours": 6.25,
-      "hours_share": 0.625
+      "tasks": 6,
+      "share": 0.375,
+      "hours": 5.75,
+      "hours_share": 0.575
+    },
+    {
+      "lane_id": "Lane_5",
+      "role": "СИЗ",
+      "tasks": 1,
+      "share": 0.062,
+      "hours": 0.5,
+      "hours_share": 0.05
     }
   ],
   "dead_ends": [],
@@ -212,10 +220,58 @@
   "auto_healed": [],
   "engine_warnings": [],
   "skipped_links": [],
+  "methodology": {
+    "score": 100,
+    "max_score": 100,
+    "passed": true,
+    "checks": [
+      {
+        "key": "naming",
+        "title": "Стандарт названий задач (Глагол + Объект)",
+        "passed": true,
+        "weight": 30,
+        "points": 30.0,
+        "detail": "16 из 16 задач в форме «глагол в инфинитиве + объект» (100%; цель 100%).",
+        "findings": []
+      },
+      {
+        "key": "gateway",
+        "title": "Корректность развилок и условий",
+        "passed": true,
+        "weight": 25,
+        "points": 25.0,
+        "detail": "XOR/OR-развилки с «?» в названии и подписями исходящих потоков.",
+        "findings": []
+      },
+      {
+        "key": "subway",
+        "title": "Индекс декомпозиции (Анти-метро)",
+        "passed": true,
+        "weight": 20,
+        "points": 20.0,
+        "detail": "Нет монотонных цепочек длиннее 4 шагов одной роли без подпроцесса.",
+        "findings": []
+      },
+      {
+        "key": "topology",
+        "title": "Топологическая связность графа",
+        "passed": true,
+        "weight": 25,
+        "points": 25.0,
+        "detail": "Тупиков и изолированных узлов нет.",
+        "findings": []
+      }
+    ],
+    "naming_ratio": 1.0,
+    "gateway_issues": 0,
+    "long_chains": 0,
+    "dead_ends": 0,
+    "orphans": 0
+  },
   "stats": {
     "nodes": 25,
     "valid_links": 26,
-    "lanes": 4,
+    "lanes": 5,
     "subprocesses": 1,
     "work_items": 16,
     "critical_path_layers": 18,
@@ -291,7 +347,7 @@
       "облачный API: OPENAI_API_KEY не задан"
     ],
     "rejected": [],
-    "elapsed_s": 0.02,
+    "elapsed_s": 0.04,
     "parsed": {
       "title": "Аварийно-восстановительные работы на ПС 110 кВ с оформлением наряда-допуска",
       "steps": 16,
@@ -299,7 +355,8 @@
         "Диспетчер",
         "Начальник смены",
         "Служба безопасности",
-        "Ремонтная бригада"
+        "Ремонтная бригада",
+        "СИЗ"
       ],
       "blocks": 12,
       "subprocesses": 1,
