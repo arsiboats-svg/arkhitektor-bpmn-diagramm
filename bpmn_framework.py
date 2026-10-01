@@ -64,6 +64,7 @@ LINE_H = 15.0
 ROUTE_CLEARANCE = 12.0         # клиренс стрелки от чужого прямоугольника / угла
 FAN_IN_GAP = 10.0              # разводка входящих в одну грань (8–12 px)
 REWORK_PAD = 20.0              # запас U-петли возврата за крайним узлом скоупа
+POOL_REWORK_PAD = 18.0         # отступ U-петли от нижней границы пула
 
 BUS_FACTOR_THRESHOLD = 0.45
 
@@ -82,9 +83,9 @@ KIND_COLORS: Dict[str, Tuple[str, str]] = {
     "subProcess": ("#4527A0", "#EDE7F6"),
 }
 POOL_COLORS = ("#003366", "#FFFFFF")
-LANE_COLORS = (("#1565C0", "#F5F9FF"), ("#1565C0", "#FFFFFF"))
-GROUP_COLORS = ("#546E7A", "#FAFAFA")
-EDGE_COLOR = "#455A64"
+LANE_COLORS = (("#1565C0", "#F4F8FD"), ("#1565C0", "#FFFFFF"))
+GROUP_COLORS = ("#64748B", "#F8FAFC")
+EDGE_COLOR = "#64748B"
 REWORK_EDGE_COLOR = "#C62828"
 
 GATEWAY_KINDS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway"}
@@ -714,6 +715,53 @@ class BPMNDiagramBuilder:
             if end_ok and end_id not in has_in and not any(l.target_id == end_id for l in self.links):
                 connect(work[-1].id, end_id, f"Финал подключён к «{work[-1].name}»", record)  # type: ignore[arg-type]
         self.healed.extend(actions)
+        self.collapse_passthrough_gateways()
+        return actions
+
+    def collapse_passthrough_gateways(self) -> List[str]:
+        """Убирает шлюзы без реального ветвления: 1 вход и 1 выход → прямая связь add_link."""
+        actions: List[str] = []
+        protected = set()
+        for node in self.nodes.values():
+            if node.inner_start_id:
+                protected.add(node.inner_start_id)
+            if node.inner_end_id:
+                protected.add(node.inner_end_id)
+        changed = True
+        while changed:
+            changed = False
+            incoming: Dict[str, List[SequenceLink]] = defaultdict(list)
+            outgoing: Dict[str, List[SequenceLink]] = defaultdict(list)
+            for link in self.links:
+                outgoing[link.source_id].append(link)
+                incoming[link.target_id].append(link)
+            for node in list(self.nodes.values()):
+                if node.kind not in GATEWAY_KINDS or node.id in protected:
+                    continue
+                ins = incoming.get(node.id, [])
+                outs = outgoing.get(node.id, [])
+                if len(outs) >= 2 or len(ins) >= 2:
+                    continue
+                if len(ins) != 1 or len(outs) != 1:
+                    continue
+                pred, succ = ins[0], outs[0]
+                if pred.source_id == succ.target_id:
+                    continue
+                label = (succ.condition_name or pred.condition_name or "").strip()
+                drop = {pred.id, succ.id}
+                self.links = [lk for lk in self.links if lk.id not in drop]
+                name = node.name
+                del self.nodes[node.id]
+                linked = self.add_link(pred.source_id, succ.target_id, label)
+                if linked is None and pred.source_id != succ.target_id:
+                    link_id = self._next_id("Flow")
+                    self.links.append(
+                        SequenceLink(id=link_id, source_id=pred.source_id, target_id=succ.target_id, condition_name=label)
+                    )
+                actions.append(f"Шлюз-пустышка «{name}» заменён прямой связью")
+                changed = True
+                break
+        self.healed.extend(actions)
         return actions
 
     # ----------------------------------------------------------- граф-утилиты
@@ -1083,18 +1131,23 @@ class BPMNDiagramBuilder:
             group.width, group.height = max(80.0, x2 - x1), max(40.0, y2 - y1)
 
     def _fit_pool_to_waypoints(self) -> None:
-        """U-петля возврата не должна упираться в нижнюю/верхнюю границу пула: растим дорожку."""
-        pad = ROUTE_CLEARANCE
+        """U-петля возврата не должна упираться в нижнюю границу пула: запас ≥ POOL_REWORK_PAD."""
         for pool in self.pools.values():
             ys: List[float] = []
+            rework_ys: List[float] = []
             for link in self.links:
                 src = self.nodes.get(link.source_id)
                 if src is None or src.owner_id != pool.process_id:
                     continue
-                ys.extend(pt[1] for pt in link.waypoints)
+                for pt in link.waypoints:
+                    ys.append(pt[1])
+                    if link.is_back:
+                        rework_ys.append(pt[1])
             if not ys or not pool.lane_ids:
                 continue
-            overflow = max(ys) + pad - (pool.y + pool.height)
+            overflow = max(ys) + ROUTE_CLEARANCE - (pool.y + pool.height)
+            if rework_ys:
+                overflow = max(overflow, max(rework_ys) + POOL_REWORK_PAD - (pool.y + pool.height))
             if overflow > 0:
                 pool.height += overflow
                 lowest = max((self.lanes[i] for i in pool.lane_ids), key=lambda lane: lane.y)
@@ -1148,25 +1201,35 @@ class BPMNDiagramBuilder:
         )[0]
 
     def _shift_path_end(self, path: Sequence[Point], side: str, delta: float) -> List[Point]:
+        """Смещает только колени и конечную точку; out[0] — неподвижный выход из источника."""
         out = [(p[0], p[1]) for p in path]
         if len(out) < 2 or abs(delta) < 0.05:
             return out
+        origin = out[0]
         x, y = out[-1]
         if side in ("left", "right"):
             y2 = y + delta
             out[-1] = (x, y2)
             i = len(out) - 2
-            while i >= 0 and abs(out[i][1] - y) < 0.05:
+            while i >= 1 and abs(out[i][1] - y) < 0.05:
                 out[i] = (out[i][0], y2)
                 i -= 1
         else:
             x2 = x + delta
             out[-1] = (x2, y)
             i = len(out) - 2
-            while i >= 0 and abs(out[i][0] - x) < 0.05:
+            while i >= 1 and abs(out[i][0] - x) < 0.05:
                 out[i] = (x2, out[i][1])
                 i -= 1
-        return _clean_path(out)
+        out[0] = origin
+        a, b = out[0], out[1]
+        if abs(a[0] - b[0]) >= 0.05 and abs(a[1] - b[1]) >= 0.05:
+            knee = (a[0], b[1]) if side in ("left", "right") else (b[0], a[1])
+            out = [out[0], knee, *out[1:]]
+        cleaned = _clean_path(out)
+        if cleaned:
+            cleaned[0] = origin
+        return cleaned
 
     def _fan_in_offsets(self) -> None:
         """Входы в одну грань узла разводятся на FAN_IN_GAP, чтобы стрелки не сливались."""
@@ -1248,7 +1311,8 @@ class BPMNDiagramBuilder:
             y_below = max(sy2, ty2, bot_env) + max(off, ROUTE_CLEARANCE)
             y_above = min(sy1, ty1, top_env) - max(off, ROUTE_CLEARANCE)
             if hi - lo > 2 * ROUTE_CLEARANCE:
-                y_below = min(y_below, hi - ROUTE_CLEARANCE) if y_below > hi - ROUTE_CLEARANCE else y_below
+                frame_pad = POOL_REWORK_PAD if go_around else ROUTE_CLEARANCE
+                y_below = min(y_below, hi - frame_pad) if y_below > hi - frame_pad else y_below
                 y_above = max(y_above, lo + ROUTE_CLEARANCE) if y_above < lo + ROUTE_CLEARANCE else y_above
                 # Петля возврата обязана обогнуть крайний узел: не подрезаем клиренс узлов ради рамки.
                 y_below = max(y_below, max(sy2, ty2, bot_env) + ROUTE_CLEARANCE)
@@ -1845,6 +1909,7 @@ class BPMNDiagramBuilder:
         else:
             self.warnings.append(f"root_end_id={root_end_id!r} отсутствует в диаграмме.")
 
+        self.collapse_passthrough_gateways()
         start = self.root_start_id if self.root_start_id in self.nodes else next(
             (n.id for n in self.nodes.values() if n.kind == "startEvent" and n.owner_id == self.process_id), None
         )

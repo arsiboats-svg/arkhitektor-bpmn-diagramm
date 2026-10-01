@@ -98,6 +98,47 @@ def main() -> None:
     read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
     assert "Quality Score" in read or "читаем" in read.lower()
 
+    from bpmn_framework import BPMNDiagramBuilder
+    from test_pipeline import build_emergency_repair
+
+    origin = (40.0, 80.0)
+    path = [origin, (180.0, 80.0), (180.0, 120.0), (280.0, 120.0)]
+    dummy = BPMNDiagramBuilder("fan-in")
+    shifted = dummy._shift_path_end(path, "left", 10.0)
+    assert shifted[0] == origin, shifted[0]
+    for a, b in zip(shifted, shifted[1:]):
+        assert abs(a[0] - b[0]) < 0.05 or abs(a[1] - b[1]) < 0.05, (a, b)
+    two = dummy._shift_path_end([origin, (200.0, 80.0)], "left", 12.0)
+    assert two[0] == origin, two
+    for a, b in zip(two, two[1:]):
+        assert abs(a[0] - b[0]) < 0.05 or abs(a[1] - b[1]) < 0.05, (a, b)
+
+    diagram = build_emergency_repair()
+    diagram.compute_layout()
+    for link in diagram.links:
+        src = diagram.nodes[link.source_id]
+        x0, y0 = link.waypoints[0]
+        on_src = (
+            abs(x0 - src.x) < 2.0
+            or abs(x0 - (src.x + src.width)) < 2.0
+            or abs(y0 - src.y) < 2.0
+            or abs(y0 - (src.y + src.height)) < 2.0
+        )
+        assert on_src, (link.id, link.waypoints[0], src.x, src.y, src.width, src.height)
+        for a, b in zip(link.waypoints, link.waypoints[1:]):
+            assert abs(a[0] - b[0]) < 0.05 or abs(a[1] - b[1]) < 0.05, (link.id, a, b)
+
+    inverted = parse_regulation(
+        "Регламент: Инверсия ТЭК\n"
+        "1. Осмотр оборудования проводит начальник смены (30 минут).\n"
+        "2. Диспетчер фиксирует результат в оперативном журнале (5 минут).\n"
+    )
+    assert inverted.steps[0].role == "Начальник смены", inverted.steps[0]
+    title0 = (inverted.steps[0].title or "").lower()
+    assert title0.startswith("провести") or title0.startswith("осмотреть"), inverted.steps[0].title
+    assert "осмотр" in title0 or "осмотреть" in title0
+    assert inverted.steps[1].role == "Диспетчер"
+
     print(
         "ok",
         f"steps={len(parsed.steps)}",

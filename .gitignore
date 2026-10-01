@@ -5,3 +5,8 @@ __pycache__/
 .DS_Store
 stress_tests/out/
 .streamlit/secrets.toml
+project_dump.txt
+full_project.txt
+kirill_diff.txt
+clean_code.txt
+review_bundle.txt
