@@ -26,6 +26,7 @@ from ai_generator import (
     build_process_context,
     cloud_engine_status,
     export_docx_passport,
+    align_result_quality,
     generate_bpmn_from_text,
     generate_process_passport,
     generate_raci_matrix,
@@ -1432,6 +1433,10 @@ def render_methodology(audit: Dict[str, Any]) -> None:
             f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
         )
     st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
+    result_text = str(audit.get("result_text") or "").strip()
+    if result_text:
+        st.caption("Текст результата — его вставка собирает схему с тем же баллом.")
+        st.code(result_text, language="text")
     for gap in meth.get("violations") or []:
         if "явных возврата" in str(gap):
             st.markdown(f'<div class="rec bad">{esc(gap)}</div>', unsafe_allow_html=True)
@@ -1687,6 +1692,7 @@ def prepare_regulation(
         bool(use_llm),
     )
     audit = copy.deepcopy(audit) if isinstance(audit, dict) else {}
+    _shown, audit = align_result_quality(text or "", xml or "", audit, bool(use_llm))
     pack: Dict[str, Any] = {
         "xml": xml or "",
         "audit": audit,
@@ -1719,7 +1725,19 @@ def prepare_regulation(
         pack["delta"] = delta or {}
         pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
         return pack
-    pack["tobe_text"] = opt_text or ""
+    shown_tobe, tobe_view = align_result_quality(opt_text or "", tobe_xml, tobe_audit, bool(use_llm))
+    paste_after = int(((tobe_view.get("methodology") or {}).get("score") or 0))
+    delta["quality_after"] = paste_after
+    delta["quality_before"] = int(((audit.get("methodology") or {}).get("score") or 0))
+    delta["quality_gain"] = max(0, paste_after - int(delta["quality_before"]))
+    facts = process_facts(audit, delta)
+    pack["tobe_text"] = shown_tobe or opt_text or ""
+    # На экране схема повторной сборки текста, а не рисунок в памяти с более высоким баллом.
+    rebuilt_xml = str(tobe_view.get("result_xml") or "")
+    rebuilt_audit = tobe_view.get("result_audit") if isinstance(tobe_view.get("result_audit"), dict) else None
+    if rebuilt_xml and rebuilt_audit:
+        tobe_xml = rebuilt_xml
+        tobe_audit = rebuilt_audit
     pack["tobe_xml"] = tobe_xml
     pack["tobe_audit"] = tobe_audit
     pack["delta"] = delta or {}
@@ -1805,29 +1823,12 @@ def _page_is_live() -> bool:
 
 
 def _generation_pending() -> bool:
-    """Нужна ли сборка. Сама генерация здесь не стартует: форма уже на экране."""
-    if not _page_is_live():
-        return False
-    if "use_llm" not in st.session_state:
-        st.session_state["use_llm"] = USE_LLM_ON_OPEN
-    text = st.session_state.get("reg_text") or ""
-    use_llm = bool(st.session_state.get("use_llm"))
-    if not text.strip():
-        st.session_state.pop("result", None)
-        st.session_state.pop("tobe_pack", None)
-        st.session_state.pop("gen_fingerprint", None)
-        return False
-    fingerprint = _reg_hash(text, use_llm)
-    ready = bool((st.session_state.get("result") or {}).get("xml"))
-    if st.session_state.get("gen_fingerprint") == fingerprint and ready:
-        return False
-    st.session_state.pop("result", None)
-    st.session_state.pop("tobe_pack", None)
-    return True
+    """Открытие страницы схему не строит. Облако ждёт кнопку «Сгенерировать BPMN 2.0»."""
+    return False
 
 
 def _sync_generation() -> None:
-    """После виджетов формы. Облачный вызов не стоит перед первой отрисовкой."""
+    """Форма уже на экране. Сама сборка стартует только из обработчика кнопки."""
     if not _generation_pending():
         return
     text = st.session_state.get("reg_text") or ""
@@ -2303,8 +2304,8 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
         use_llm = st.checkbox(
             "Использовать LLM (Ollama / OpenAI), если доступна",
             key="use_llm",
-            help="При открытии страницы галочка включена. Снимите её, чтобы строить схему только эмулятором. "
-            "Смена галочки или текста регламента пересчитывает схему.",
+            help="При открытии страницы галочка включена. Снимите её — кнопка соберёт схему эмулятором и не пойдёт в облако. "
+            "Сборка начинается только по кнопке «Сгенерировать BPMN 2.0».",
         )
         # Имена секретов — только если ключа нет (диагностика настройки), иначе строка для жюри лишняя.
         secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""

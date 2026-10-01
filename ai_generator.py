@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+from collections import defaultdict
 import io
 import json
 import os
@@ -1484,6 +1485,7 @@ class Step:
     hours: Optional[float] = None
     system: bool = False
     decision: Optional[Decision] = None
+    back_ref: Optional[int] = None  # «на п.N» без развилки: одно ребро, шаг остаётся обычным
     action: bool = True  # есть ли собственное действие перед шлюзом
     artifacts: List[str] = field(default_factory=list)  # документы шага: наряд-допуск, акт, договор…
     systems: List[str] = field(default_factory=list)  # ИТ-системы шага: АСУ ТП, CRM, 1С…
@@ -1599,26 +1601,29 @@ def _parse_decision(text: str) -> Tuple[str, Optional[Decision]]:
             decision.no_ref = int(no_ref_m.group(1))
         return action, decision
 
-    rm = _RETURN_RE.search(src)
-    if rm and _BACK_KW.search(src):
-        action = src[: rm.start()].strip(" .;,—–-")
-        clause = src[rm.start():]
-        ref_m = _REF_RE.search(clause)
-        decision = Decision(
-            yes_label="Замечаний нет",
-            no_label=_derive_no_label(clause),
-            no_ref=int(ref_m.group(1)) if ref_m else None,
-            no_back=True,
-            back_clause=clause,
-        )
-        return action, decision
     return src, None
 
 
 def _has_explicit_return(text: str) -> bool:
-    """Один шаг с явным возвратом — одно обратное ребро, не отдельное слово в подписи ветки."""
+    """Одно обратное ребро: «на п.N» при глаголе возврата или «иначе … назад».
+
+    Голые «возвращает», «вернуть» и «возврат» без номера пункта — обычный шаг, не цикл.
+    """
     src = text or ""
-    return bool(_EXPLICIT_RETURN_RE.search(src) or _NAZAD_RETURN_RE.search(src))
+    if _NAZAD_RETURN_RE.search(src):
+        return True
+    return bool(_EXPLICIT_RETURN_RE.search(src) and _REF_RE.search(src))
+
+
+def _bare_return_ref(text: str) -> Optional[int]:
+    """«Вернуть на п.N» без «если»: номер цели. Развилку это не создаёт."""
+    src = text or ""
+    if _CASE_RE.search(src) or _NAZAD_RETURN_RE.search(src):
+        return None
+    if not (_EXPLICIT_RETURN_RE.search(src) and _REF_RE.search(src)):
+        return None
+    ref = _REF_RE.search(src)
+    return int(ref.group(1)) if ref else None
 
 
 def _decision_points_back(decision: Optional[Decision], step_num: int) -> bool:
@@ -1634,16 +1639,11 @@ def _decision_points_back(decision: Optional[Decision], step_num: int) -> bool:
 
 
 def _ensure_return_decision(text: str, decision: Optional[Decision], step_num: int) -> Optional[Decision]:
-    """Фраза возврата без ребра назад не остаётся обычным шагом."""
+    """«Если … назад» дополняет уже найденную развилку. Голый глагол возврата шаг не превращает."""
     if not _has_explicit_return(text) or _decision_points_back(decision, step_num):
         return decision
     if decision is None:
-        return Decision(
-            yes_label="Продолжить",
-            no_label="На доработку",
-            no_back=True,
-            back_clause=text,
-        )
+        return None
     decision.no_back = True
     if not decision.back_clause:
         decision.back_clause = text
@@ -1737,6 +1737,9 @@ def _return_phrase_specs(text: str) -> List[Dict[str, Any]]:
             elif decision.yes_ref is not None and decision.yes_ref < step.num:
                 target_num = decision.yes_ref
             label = (decision.no_label or label)[:40]
+        if target_num is None and step is not None and step.back_ref and step.back_ref < step.num:
+            target_num = step.back_ref
+            label = "Возврат"
         if target_num is None:
             ref_m = _REF_RE.search(chunk)
             if ref_m and step and int(ref_m.group(1)) < step.num:
@@ -2109,8 +2112,16 @@ def parse_regulation(text: str) -> ParsedRegulation:
             t = (t[: dm.start()] + " " + t[dm.end():]).strip()
         t = _INTRO_CLAUSE_RE.sub("", t).strip(" .;,:—–-")
         t = _CONNECTORS_RE.sub("", t).strip(" .;,:—–-")
+        bare_ref = _bare_return_ref(t)
+        if bare_ref is not None:
+            # Номер пункта — ребро, не часть названия и не имя этапа.
+            t = _REF_RE.sub(" ", t)
+            t = re.sub(r"\bна\s+(?=\s|$)", " ", t)
+            t = re.sub(r"\s+", " ", t).strip(" .;,:—–-")
         action, decision = _parse_decision(t)
         step.decision = _ensure_return_decision(t, decision, step.num)
+        if step.decision is None:
+            step.back_ref = bare_ref
         step.action = bool(action)
         source = action if action else t
         joint = _split_joint_role(source)
@@ -2155,6 +2166,7 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
     steps = parsed.steps
     targets = {s.decision.yes_ref for s in steps if s.decision and s.decision.yes_ref}
     targets |= {s.decision.no_ref for s in steps if s.decision and s.decision.no_ref}
+    targets |= {s.back_ref for s in steps if s.back_ref}
 
     blocks: List[Block] = []
     for step in steps:
@@ -2175,6 +2187,34 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
         if block.kind == "parallel" and len(block.steps) < 2:
             block.kind = "step"
 
+    # Явная граница «(этап «…»)» на соседних шагах — тот же подпроцесс, даже если шагов меньше пяти.
+    staged: List[Block] = []
+    i = 0
+    while i < len(blocks):
+        stage = blocks[i].steps[0].stage if blocks[i].kind == "step" and blocks[i].steps else None
+        if not stage:
+            staged.append(blocks[i])
+            i += 1
+            continue
+        j = i + 1
+        while (
+            j < len(blocks)
+            and blocks[j].kind == "step"
+            and blocks[j].steps
+            and blocks[j].steps[0].stage == stage
+            and blocks[j].role == blocks[i].role
+        ):
+            j += 1
+        run = blocks[i:j]
+        while run and run[0].steps[0].num in targets:
+            staged.append(run.pop(0))
+        if len(run) >= 2:
+            staged.append(Block("subprocess", [b.steps[0] for b in run], name=stage))
+        else:
+            staged.extend(run)
+        i = j
+    blocks = staged
+
     merged: List[Block] = []
     i = 0
     while i < len(blocks):
@@ -2192,34 +2232,10 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
             j += 1
         run = blocks[i:j]
         # Цель «вернуть на п.N» не прячем внутрь подпроцесса: иначе ребро садится на имя этапа.
+        # Шлюз серию не режет и кусок из-за него в подпроцесс не кладём: шаг остаётся отдельным.
         while run and run[0].steps[0].num in targets:
             merged.append(run.pop(0))
-        if not run:
-            i = j
-            continue
-        role = run[0].role
-        ahead = 0
-        if j < len(blocks) and blocks[j].kind == "decision" and blocks[j].role == role:
-            ahead = 1
-        visible_tail = 0
-        for prev in reversed(merged):
-            if prev.kind == "subprocess" or prev.role != role or prev.kind not in ("step", "decision"):
-                break
-            visible_tail += 1
-        # Линтер не сбрасывает цепочку на шлюзе: задача развилки той же роли входит в неё.
-        glue = len(run) + ahead + visible_tail
-        if len(run) > 4 or (glue > 4 and len(run) >= 2):
-            chunks = [run] if len(run) <= 4 else [run[k:k + 4] for k in range(0, len(run), 4)]
-            for chunk in chunks:
-                if len(chunk) < 2:
-                    merged.extend(chunk)
-                    continue
-                chunk_steps = [b.steps[0] for b in chunk]
-                stage = next((s.stage for s in chunk_steps if s.stage), None)
-                name = stage or f"{chunk[0].role}: {chunk_steps[0].title[:38].rstrip('…')}"
-                merged.append(Block("subprocess", chunk_steps, name=name))
-        else:
-            merged.extend(run)
+        merged.extend(run)
         i = j
 
     number_to_block: Dict[int, int] = {}
@@ -4295,6 +4311,228 @@ def parse_bpmn_structure(xml: str) -> Dict[str, Any]:
         node["lane"] = lane_of.get(owner, "")
         node["x"], node["y"] = pos.get(nid, (0.0, 0.0))
     return {"nodes": nodes, "flows": flows, "lanes": list(dict.fromkeys(lane_of.values()))}
+
+
+def _hours_phrase(hours: Optional[float]) -> str:
+    if hours is None:
+        return ""
+    minutes = hours * 60.0
+    if hours < 1 and abs(minutes - round(minutes)) < 0.05:
+        return f" ({int(round(minutes))} минут)"
+    if abs(hours - round(hours)) < 0.05:
+        return f" ({int(round(hours))} ч)"
+    return f" ({hours:.1f} ч)".replace(".0 ч", " ч")
+
+
+def render_result_regulation(source_text: str, xml: str) -> str:
+    """Текст результата: имена «глагол + объект», подписи веток и границы подпроцесса со схемы.
+
+    Без этих трёх кусков повторная сборка того, что видит пользователь, теряет балл.
+    Часы и фразы возврата берутся из исходного регламента, если шаг узнаётся.
+    """
+    source = (source_text or "").strip()
+    if not xml or not source:
+        return source
+    try:
+        struct = parse_bpmn_structure(xml)
+    except Exception:  # noqa: BLE001
+        return source
+    nodes: Dict[str, Dict[str, Any]] = struct["nodes"]
+    flows: List[Dict[str, str]] = struct["flows"]
+    if not nodes:
+        return source
+    try:
+        parsed = parse_regulation(normalize_regulation(source))
+    except Exception:  # noqa: BLE001
+        parsed = ParsedRegulation(title="Бизнес-процесс", sla_hours=None)
+
+    outgoing: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for flow in flows:
+        outgoing[flow["src"]].append(flow)
+
+    def _expand(owner: Optional[str]) -> List[Dict[str, Any]]:
+        kids = [
+            n for n in nodes.values()
+            if n.get("sub") == owner and (n["type"] in _TASK_TAGS or n["type"] == "subProcess")
+        ]
+        kids.sort(key=lambda n: (float(n.get("x") or 0), float(n.get("y") or 0), n.get("id") or ""))
+        ordered: List[Dict[str, Any]] = []
+        for node in kids:
+            if node["type"] == "subProcess":
+                ordered.extend(_expand(node["id"]))
+            else:
+                ordered.append(node)
+        return ordered
+
+    tasks = _expand(None)
+    if len(tasks) < 2:
+        return source
+
+    pool = list(tasks)
+    bound: Dict[int, Dict[str, Any]] = {}
+    for step in parsed.steps:
+        title = (step.title or "").strip().lower()
+        if not title:
+            continue
+        hit = next((t for t in pool if (t.get("name") or "").strip().lower() == title), None)
+        if hit is None:
+            continue
+        bound[step.num] = hit
+        pool.remove(hit)
+    # Похожее имя чужой срок не получает: неузнанный шаг остаётся без часов.
+    next_num = max((s.num for s in parsed.steps), default=0)
+    for task in pool:
+        next_num += 1
+        bound_extra = task.setdefault("_out_num", next_num)
+        _ = bound_extra
+    num_by_task = {task["id"]: num for num, task in bound.items()}
+    num_by_task.update({task["id"]: int(task["_out_num"]) for task in pool})
+
+    def _land(node_id: str, guard: int = 0) -> Optional[str]:
+        if guard > 8:
+            return None
+        node = nodes.get(node_id) or {}
+        if node.get("type") in _TASK_TAGS and node_id in num_by_task:
+            return node_id
+        if node.get("type") == "subProcess":
+            inner = _expand(node_id)
+            return inner[0]["id"] if inner else None
+        if node.get("type") == "endEvent" and not node.get("sub"):
+            return "END"
+        for flow in outgoing.get(node_id, []):
+            found = _land(flow["dst"], guard + 1)
+            if found:
+                return found
+        return None
+
+    def _stage_phrase(task: Optional[Dict[str, Any]], step: Optional[Step]) -> str:
+        if task is not None:
+            parent = nodes.get(task.get("sub") or "")
+            if parent and parent.get("type") == "subProcess" and parent.get("name"):
+                return f" (этап «{parent['name']}»)"
+        if step is not None and step.stage:
+            return f" (этап «{step.stage}»)"
+        return ""
+
+    def _gateway_sentence(task: Optional[Dict[str, Any]], step: Optional[Step]) -> str:
+        step_num = step.num if step is not None else 0
+        back_num = None
+        if step is not None and step.decision is not None and step.decision.no_ref:
+            if step.decision.no_back or step.decision.no_ref < step.num:
+                back_num = step.decision.no_ref
+        elif step is not None and step.back_ref:
+            back_num = step.back_ref
+        gateway = None
+        if task is not None:
+            for flow in outgoing.get(task["id"], []):
+                nxt = nodes.get(flow["dst"]) or {}
+                if nxt.get("type") in ("exclusiveGateway", "inclusiveGateway"):
+                    gateway = nxt
+                    break
+        if gateway is not None:
+            outs = outgoing.get(gateway["id"], [])
+            labeled = [(f, _land(f["dst"])) for f in outs]
+            labeled = [(f, dest) for f, dest in labeled if dest]
+            if len(labeled) >= 2:
+                question = str(gateway.get("name") or "Условие").rstrip("?").strip() or "Условие"
+
+                def _dest(dest: str, label: str, *, returning: bool) -> str:
+                    if dest == "END":
+                        return "завершить процесс"
+                    num = num_by_task.get(dest)
+                    quote = f"«{label}» — " if label else ""
+                    # Иначе-возврат из исходника держит свой номер, даже если ребро село на другой шаг.
+                    if returning and back_num is not None:
+                        return f"{quote}вернуть на п.{back_num}"
+                    if num is not None and num < step_num:
+                        return f"{quote}вернуть на п.{num}"
+                    if num is None:
+                        return "перейти дальше"
+                    return f"{quote}перейти к п.{num}"
+
+                yes_f, yes_to = labeled[0]
+                no_f, no_to = labeled[1]
+                yes_label = str(yes_f.get("name") or "Да").strip() or "Да"
+                no_label = str(no_f.get("name") or "Иначе").strip() or "Иначе"
+                return (
+                    f". Если {question} — {_dest(yes_to, yes_label, returning=False)}, "
+                    f"иначе {_dest(no_to, no_label, returning=back_num is not None)}"
+                )
+        if step is not None and step.decision is not None and step.decision.no_back and step.decision.no_ref:
+            return f". иначе «{step.decision.no_label}» — вернуть на п.{step.decision.no_ref}"
+        if step is not None and step.back_ref:
+            return f". вернуть на п.{step.back_ref}"
+        return ""
+
+    lines: List[str] = []
+    title = parsed.title or "Бизнес-процесс"
+    lines.append(f"Регламент: {title}")
+    if parsed.sla_hours:
+        lines.append(f"Целевой срок: {_hours_phrase(parsed.sla_hours).strip(' ()')}")
+    # Порядок и номер — из регламента, не из координат картинки.
+    for step in sorted(parsed.steps, key=lambda s: s.num):
+        task = bound.get(step.num)
+        name = (str(task.get("name") or "").strip() if task is not None else "") or (step.title or "Выполнить действие")
+        role = (str(task.get("lane") or "").strip() if task is not None else "") or step.role or "Исполнитель"
+        parallel = "Параллельно: " if step.parallel else ""
+        body = f"{parallel}{role}: {name}{_stage_phrase(task, step)}{_hours_phrase(step.hours)}{_gateway_sentence(task, step)}"
+        lines.append(f"{step.num}. {body}.")
+    for task in pool:
+        name = str(task.get("name") or "").strip() or "Выполнить действие"
+        role = str(task.get("lane") or "").strip() or "Исполнитель"
+        body = f"{role}: {name}{_stage_phrase(task, None)}{_gateway_sentence(task, None)}"
+        lines.append(f"{int(task['_out_num'])}. {body}.")
+    rendered = "\n".join(lines).strip()
+    return rendered or source
+
+
+def align_result_quality(
+    text: str,
+    xml: str,
+    audit: Dict[str, Any],
+    use_llm: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
+    """Текст результата и аудит карточки.
+
+    Карточка равна местной повторной сборке текста на экране, даже если она ниже рисунка в памяти.
+    Второй вызов Groq отсюда не уходит. Схема To-Be — эта сборка, не рисунок с большим баллом.
+    """
+    _ = use_llm
+    data = dict(audit or {})
+    memory = data.get("methodology") if isinstance(data.get("methodology"), dict) else {}
+    shown = render_result_regulation(text, xml) if xml else (text or "")
+    if not shown.strip():
+        shown = text or ""
+    same_text = normalize_regulation(shown) == normalize_regulation(text or "")
+    if same_text and not use_llm:
+        if memory:
+            data["methodology"] = dict(memory)
+        data["result_text"] = shown
+        return shown, data
+    rebuilt_xml, rebuilt, rebuild_err = generate_bpmn_from_text(shown, use_llm=False)
+    rebuilt_meth = (rebuilt or {}).get("methodology") if isinstance((rebuilt or {}).get("methodology"), dict) else None
+    if rebuilt and not rebuild_err and rebuilt_meth:
+        data["methodology"] = dict(rebuilt_meth)
+        data["result_xml"] = rebuilt_xml or ""
+        data["result_audit"] = rebuilt
+    data["result_text"] = shown
+    return shown, data
+
+
+def card_matches_paste(text: str, use_llm: bool = False) -> Dict[str, Any]:
+    """Балл карточки — повторная сборка текста, который показан как результат."""
+    xml, audit, err = generate_bpmn_from_text(text, use_llm=use_llm)
+    memory = int(((audit or {}).get("methodology") or {}).get("score") or 0)
+    shown, audit = align_result_quality(text, xml or "", audit or {}, use_llm=use_llm)
+    score = int(((audit.get("methodology") or {}).get("score") or 0))
+    return {
+        "shown": shown,
+        "memory": memory,
+        "card": score,
+        "xml": xml,
+        "audit": audit,
+        "error": err or "",
+    }
 
 
 def _work_neighbors(struct: Dict[str, Any], node_id: str, forward: bool) -> List[Tuple[Dict[str, Any], List[str]]]:

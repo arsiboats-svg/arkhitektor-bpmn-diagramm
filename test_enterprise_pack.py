@@ -17,7 +17,9 @@ from ai_generator import (
     optimize_process_to_be,
     parse_regulation,
     read_docx_regulation,
+    render_result_regulation,
     _build_blocks,
+    _hours_phrase,
 )
 
 
@@ -30,7 +32,8 @@ def main() -> None:
     assert audit["sla"]["critical_path_hours"] == 9.7
     assert audit["sla"]["with_rework_hours"] == 12.55
     assert len(audit["rework_loops"]) == 2
-    assert audit["methodology"]["score"] == 100
+    assert audit["methodology"]["long_chains"]
+    assert audit["methodology"]["score"] < 100
     assert 'name="СИЗ"' not in xml
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
     xor_ids = set(re.findall(r'<bpmn:exclusiveGateway\b[^>]*\bid="([^"]+)"', xml))
@@ -93,7 +96,7 @@ def main() -> None:
     assert opened_facts["cp_after"] <= 9.6
     assert opened_facts["rw_after"] <= 9.6
     assert opened_facts["loops_before"] == 2 and opened_facts["loops_after"] == 0
-    assert opened_facts["quality_before"] == 100 and opened_facts["quality_after"] == 100
+    assert opened_facts["quality_before"] < 100 and opened_facts["quality_after"] < 100
     headline = bpmn_app.tobe_card_headline(opened_facts)
     assert headline == "Экономия пути с возвратами: 12.6 ч → 9.6 ч (−24%)", headline
     assert "Без ускорения" not in headline
@@ -174,8 +177,8 @@ def main() -> None:
     opt_p, delta_p = optimize_process_to_be(proc, audit_p)
     q_after = int(delta_p.get("quality_after") or 0)
     q_before = int(delta_p.get("quality_before") or 0)
-    assert q_before == 100, q_before
-    assert q_after == 100, (q_after, (delta_p.get("tobe_audit") or {}).get("methodology"))
+    assert q_before < 100, q_before
+    assert q_after >= q_before, (q_after, q_before)
     assert audit_p["sla"]["critical_path_hours"] == 528.3
     assert audit_p["sla"]["with_rework_hours"] == 856.5
     assert "автоматически:" not in opt_p.lower()
@@ -434,11 +437,11 @@ DIAGRAM.add_link(a, ROOT_END_TASK_ID)
         ]
     )
     chain_blocks, _ = _build_blocks(parse_regulation(chain))
-    assert [(b.kind, len(b.steps)) for b in chain_blocks] == [("subprocess", 4), ("subprocess", 2)]
+    assert [(b.kind, len(b.steps)) for b in chain_blocks] == [("step", 1)] * 6
     _, audit_chain, err_chain = generate_bpmn_from_text(chain, use_llm=False)
     assert not err_chain, err_chain
-    assert audit_chain["methodology"]["score"] == 100
-    assert not audit_chain["methodology"]["long_chains"]
+    assert audit_chain["methodology"]["score"] < 100
+    assert audit_chain["methodology"]["long_chains"]
 
     bare = """
 pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
@@ -464,7 +467,6 @@ DIAGRAM.add_link(f, ROOT_END_TASK_ID)
     assert audit_bare["methodology"]["score"] < 100
     bare_violations = audit_bare["methodology"]["violations"]
     assert any("Диспетчер" in item for item in bare_violations), bare_violations
-    assert audit_chain["methodology"]["score"] > audit_bare["methodology"]["score"]
 
     wide = """
 pool_id, lanes = DIAGRAM.add_pool(
@@ -759,6 +761,167 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert len(_iter_tobe_selections([0], [1], [2, 3])) == 36
     huge = _iter_tobe_selections(list(range(5)), list(range(5)), list(range(3)))
     assert len(huge) <= 80, len(huge)
+
+    from ai_generator import card_matches_paste
+
+    # Шесть шагов одной роли без этапов в исходном тексте. As-Is не режет серию до балла.
+    stages_q = """Регламент: Шесть шагов одной роли
+1. Диспетчер принимает заявку абонента на ремонт линии номер один (10 минут).
+2. Диспетчер фиксирует запись в оперативном журнале (10 минут).
+3. Диспетчер сверяет однолинейную схему подстанции (10 минут).
+4. Диспетчер готовит бланк переключений для бригады (10 минут).
+5. Диспетчер принимает заявку абонента на ремонт линии номер пять (10 минут).
+6. Диспетчер вызывает ремонтную бригаду на место (10 минут).
+"""
+    chain_q = """Регламент: Цепочка одной роли через развилки
+1. Диспетчер принимает заявку (10 минут). Если заявка принята — «принята» — перейти к п.2, иначе «отказ» — завершить процесс.
+2. Диспетчер фиксирует журнал (10 минут). Если журнал записан — «записан» — перейти к п.3, иначе «ошибка журнала» — завершить процесс.
+3. Диспетчер сверяет схему (10 минут). Если схема верна — «схема верна» — перейти к п.4, иначе «ошибка схемы» — завершить процесс.
+4. Диспетчер готовит бланк переключений (10 минут). Если бланк готов — «бланк готов» — перейти к п.5, иначе «бланк не готов» — завершить процесс.
+5. Диспетчер закрывает заявку (10 минут). Если заявка закрыта — «закрыта» — завершить процесс, иначе «не закрыта» — завершить процесс.
+"""
+    four_q = """Регламент: Четыре шага одной роли
+1. Диспетчер принимает заявку (10 минут).
+2. Диспетчер фиксирует запись (10 минут).
+3. Диспетчер сверяет схему (10 минут).
+4. Диспетчер закрывает заявку (10 минут).
+"""
+    # Глагол «возвращает» остаётся шагом внутри той же серии, а не поводом резать её на этапы.
+    worse_q = """Регламент: Возврат комплекта
+1. Диспетчер принимает заявку (10 минут).
+2. Диспетчер фиксирует журнал (10 минут).
+3. Диспетчер сверяет схему (10 минут).
+4. Диспетчер возвращает комплект документов (10 минут).
+5. Диспетчер вызывает бригаду (10 минут).
+6. Диспетчер закрывает заявку (10 минут).
+"""
+
+    def _paste(shown: str):
+        _, pasted, paste_err = generate_bpmn_from_text(shown, use_llm=False)
+        assert not paste_err, paste_err
+        return pasted
+
+    def _triple(text: str):
+        pack = card_matches_paste(text, use_llm=False)
+        pasted = _paste(pack["shown"])
+        paste = int((pasted.get("methodology") or {}).get("score") or 0)
+        return pack, paste, pasted
+
+    def _chains(audit: dict) -> int:
+        return int((audit.get("methodology") or {}).get("long_chains") or 0)
+
+    gate_q = """Регламент: Шлюз внутри серии одной роли
+1. Диспетчер принимает заявку (10 минут).
+2. Диспетчер фиксирует журнал (10 минут).
+3. Диспетчер сверяет схему (10 минут). Если схема верна — «схема верна» — перейти к п.4, иначе «ошибка схемы» — завершить процесс.
+4. Диспетчер готовит бланк (10 минут).
+5. Диспетчер вызывает бригаду (10 минут).
+6. Начальник смены закрывает наряд (10 минут).
+"""
+    para_q = """Регламент: Параллель и возврат
+1. Эксплуатационная служба выполняет стройку линии (20 часов).
+2. Параллельно: Заявитель выполняет мероприятия на участке (15 часов).
+3. Эксплуатационная служба проводит осмотр устройств (3 часа). Если замечаний нет — «замечаний нет» — перейти к п.4, иначе «замечания» — вернуть на п.2.
+4. Эксплуатационная служба подключает объект (2 часа).
+"""
+    xml_para, _, err_para = generate_bpmn_from_text(para_q, use_llm=False)
+    assert not err_para, err_para
+    import xml.etree.ElementTree as _ET
+
+    para_root = _ET.fromstring(xml_para)
+    para_names = {
+        el.get("id"): el.get("name") or ""
+        for el in para_root.iter("{http://www.omg.org/spec/BPMN/20100524/MODEL}userTask")
+    }
+    for shape in para_root.iter("{http://www.omg.org/spec/BPMN/20100524/DI}BPMNShape"):
+        bounds = shape.find("{http://www.omg.org/spec/DD/20100524/DC}Bounds")
+        if bounds is None:
+            continue
+        title = para_names.get(shape.get("bpmnElement")) or ""
+        if "мероприят" in title.lower():
+            bounds.set("x", "900")
+        elif "осмотр" in title.lower():
+            bounds.set("x", "100")
+    para_shown = render_result_regulation(para_q, _ET.tostring(para_root, encoding="unicode"))
+    para_lines = {
+        int(m.group(1)): line
+        for line in para_shown.splitlines()
+        if (m := re.match(r"(\d+)\.\s", line))
+    }
+    for step in parse_regulation(para_q).steps:
+        line = para_lines[step.num]
+        if step.hours:
+            assert _hours_phrase(step.hours) in line, (step.num, line)
+        if step.parallel:
+            assert line.startswith(f"{step.num}. Параллельно:"), line
+        if step.decision is not None and step.decision.no_ref and (
+            step.decision.no_back or step.decision.no_ref < step.num
+        ):
+            assert f"вернуть на п.{step.decision.no_ref}" in line, line
+            assert f"перейти к п.{step.decision.no_ref}" not in line, line
+    gate_blocks, _ = _build_blocks(parse_regulation(gate_q))
+    assert not any(b.kind == "subprocess" for b in gate_blocks), [
+        (b.kind, len(b.steps)) for b in gate_blocks
+    ]
+    gate_pack, gate_paste, _ = _triple(gate_q)
+    assert gate_pack["memory"] == gate_pack["card"] == gate_paste
+    assert gate_pack["card"] < 100
+    assert "этап «" not in gate_pack["shown"]
+    stages_pack, stages_paste, stages_pasted = _triple(stages_q)
+    assert stages_pack["memory"] == stages_pack["card"] == stages_paste
+    assert stages_pack["card"] < 100
+    assert _chains(stages_pack["audit"]) > 0
+    assert _chains(stages_pasted) > 0
+    assert stages_pack["shown"].count("этап «") < 2
+    four_pack, four_paste, four_pasted = _triple(four_q)
+    assert four_pack["memory"] == four_pack["card"] == four_paste
+    assert _chains(four_pack["audit"]) == 0
+    assert _chains(four_pasted) == 0
+    chain_pack, chain_paste, _ = _triple(chain_q)
+    assert chain_pack["memory"] == chain_pack["card"] == chain_paste
+    assert chain_pack["card"] < 100
+    worse_pack, worse_paste, worse_pasted = _triple(worse_q)
+    assert worse_pack["memory"] == worse_pack["card"] == worse_paste
+    assert worse_pack["card"] < 100
+    assert _chains(worse_pack["audit"]) > 0
+    assert _chains(worse_pasted) > 0
+    assert worse_pack["shown"].count("этап «") < 2
+    # Видимый текст успешной облачной схемы: этапы уже записаны, локальная вставка их не снимает.
+    cloud_q = """Регламент: Облачная схема с этапами
+1. Диспетчер: Принять заявку (этап «Диспетчер: Принять заявку — Зафиксировать журнал — Сверять схему — Подготовить бланк») (10 минут).
+2. Диспетчер: Зафиксировать журнал (этап «Диспетчер: Принять заявку — Зафиксировать журнал — Сверять схему — Подготовить бланк») (10 минут).
+3. Диспетчер: Сверять схему (этап «Диспетчер: Принять заявку — Зафиксировать журнал — Сверять схему — Подготовить бланк») (10 минут).
+4. Диспетчер: Подготовить бланк (этап «Диспетчер: Принять заявку — Зафиксировать журнал — Сверять схему — Подготовить бланк») (10 минут).
+5. Диспетчер: Передать смену (этап «Диспетчер: Передать смену — Закрыть заявку») (10 минут).
+6. Диспетчер: Закрыть заявку (этап «Диспетчер: Передать смену — Закрыть заявку») (10 минут).
+"""
+    cloud_pack, cloud_paste, cloud_pasted = _triple(cloud_q)
+    cloud_names = set(re.findall(r"этап «([^»]+)»", cloud_pack["shown"]))
+    assert cloud_pack["memory"] == cloud_pack["card"] == cloud_paste
+    assert cloud_pack["card"] >= stages_pack["card"]
+    assert _chains(cloud_pack["audit"]) == 0
+    assert _chains(cloud_pasted) == 0
+    assert len(cloud_names) >= 2, cloud_names
+    one_edge_q = """Регламент: Одно обратное ребро
+1. Диспетчер принимает заявку (10 минут).
+2. Мастер проверяет комплект (20 минут). вернуть на п.1
+3. Служба закрывает заявку (15 минут).
+"""
+    one_phrases = _explicit_return_count(one_edge_q)
+    _, one_audit, one_err = generate_bpmn_from_text(one_edge_q, use_llm=False)
+    assert not one_err, one_err
+    one_pack = card_matches_paste(one_edge_q, use_llm=False)
+    assert len(one_audit["rework_loops"]) == one_phrases
+    assert len(one_pack["audit"]["rework_loops"]) == one_phrases
+    print(
+        "quality_triples",
+        f"gate={gate_pack['memory']}/{gate_pack['card']}/{gate_paste}",
+        f"{stages_pack['memory']}/{stages_pack['card']}/{stages_paste}",
+        f"{four_pack['memory']}/{four_pack['card']}/{four_paste}",
+        f"{chain_pack['memory']}/{chain_pack['card']}/{chain_paste}",
+        f"{worse_pack['memory']}/{worse_pack['card']}/{worse_paste}",
+        f"cloud={cloud_pack['memory']}/{cloud_pack['card']}/{cloud_paste}",
+    )
 
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
