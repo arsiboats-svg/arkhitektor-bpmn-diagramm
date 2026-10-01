@@ -212,17 +212,34 @@ def _structure_issues(diagram: BPMNDiagramBuilder) -> List[str]:
     return issues
 
 
-# Ошибки, при которых ответ модели отклоняется (остальные — предупреждения).
-# «Шлюз ничего не разветвляет» — лишь предупреждение: так бывает, когда ветка из подпроцесса
-# переадресована движком на сам подпроцесс; схема при этом корректна.
-_CRITICAL_MARKERS = ("ветвление без шлюза", "без входа", "Несуществующие")
+def _quality_report(
+    structure_issues: List[str],
+    audit: Dict[str, Any],
+    diagram: Optional[BPMNDiagramBuilder] = None,
+) -> Dict[str, Any]:
+    """Отчёт по графу после heal. Журнал лечения («без входа», «Тупик») отказ не вызывает.
 
-
-def _quality_report(structure_issues: List[str], audit: Dict[str, Any]) -> Dict[str, Any]:
+    Критично только то, что осталось в графе: нет старта или конца, тупик, узел без входа.
+    Битый XML отсекается отдельно, проверкой XSD.
+    """
     issues = list(structure_issues)
-    issues += [h for h in audit.get("auto_healed", []) if "без входа" in h or "Тупик" in h]
     issues += [f"Связь пропущена: {s['reason']}" for s in audit.get("skipped_links", [])]
-    critical = [i for i in issues if any(m in i for m in _CRITICAL_MARKERS)]
+    critical: List[str] = []
+    nodes = list(diagram.nodes.values()) if diagram is not None else []
+    if diagram is not None:
+        if not any(n.kind == "startEvent" for n in nodes):
+            critical.append("В графе нет стартового события")
+        if not any(n.kind == "endEvent" for n in nodes):
+            critical.append("В графе нет конечного события")
+    for item in audit.get("dead_ends") or []:
+        msg = item.get("message") if isinstance(item, dict) else str(item)
+        if msg:
+            critical.append(str(msg))
+    for oid in audit.get("orphans_without_incoming") or []:
+        name = str(oid)
+        if diagram is not None and oid in diagram.nodes:
+            name = diagram.nodes[oid].name or name
+        critical.append(f"Узел «{name}» без входящего потока")
     return {"issues": issues, "critical": critical, "ok": not critical}
 
 
@@ -341,7 +358,7 @@ def execute_generated_code(
         structure_issues = _structure_issues(diagram)
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
-        audit["quality"] = _quality_report(structure_issues, audit)
+        audit["quality"] = _quality_report(structure_issues, audit, diagram)
         if sla_enriched:
             audit["sla_enriched_nodes"] = sla_enriched
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
@@ -1055,6 +1072,10 @@ def _match_inverted_role(text: str) -> Optional[Tuple[str, str, str]]:
     action = src[: m.start()].strip(" .,;:—–-")
     tail = src[m.end() :].strip()
     if not action or not tail or len(action.split()) > 12:
+        return None
+    # «Ремонтная бригада готовит СИЗ» — обычный порядок, не инверсия.
+    # Иначе объект «СИЗ» становится дорожкой, а бригада — названием задачи.
+    if any((mm := rx.search(action)) and mm.start() <= 1 for rx, _ in _ROLE_RE):
         return None
     head = action.split()[0].lower().strip("«»\"'")
     if any(rx.search(head) for rx, _ in _ROLE_RE):
@@ -1855,7 +1876,8 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
 
     Порядок: облачный API (если задан OPENAI_API_KEY) → локальная Ollama (qwen2.5-coder / llama3) →
     встроенный семантический эмулятор. Исключения сети наружу не выходят.
-    Ответ модели с ошибками структуры (висящие узлы, ветвление без шлюза) отклоняется;
+    Ответ модели отклоняется по графу после heal (нет старта/конца, тупик или дыра) или по XSD,
+    не по тексту журнала лечения. Нет ключа, ошибка сети или пустой ответ — эмулятор.
     модель получает список ошибок и одну попытку исправиться (LLM_MAX_ATTEMPTS).
     """
     started = time.time()
@@ -2529,10 +2551,166 @@ def _analysis_tobe(ctx: Dict[str, Any]) -> str:
     bus_role = f.get("bus_role")
     if bus_role:
         out.append(f"Bus-factor: «{bus_role}» держит {float(f.get('bus_share') or 0):.0%} шагов.")
-    heavy = (ctx.get("critical_path") or [])[:2]
-    if heavy:
-        out.append("На схеме: " + "; ".join(f"«{c.get('name')}» ({c.get('role')})" for c in heavy) + ".")
+    if abs(rw_a - cp_a) < 0.051:
+        out.append("Одинаковые цифры справа: циклы сняты, добавки за возврат нет.")
     return "\n".join(out)
+
+
+_ASK_STOP = {
+    "что", "как", "про", "для", "это", "шаг", "шага", "шаге", "шаги", "шагов", "пункт", "пункта",
+    "делает", "делают", "почему", "цифры", "цифра", "одинаковые", "одинаковых", "время", "срок",
+    "процесс", "схемы", "схеме", "схему", "расскажи", "текущей", "какие", "какой", "какая",
+    "роль", "роли", "ролей", "часов", "часы", "минут",
+}
+_FACTS_Q_RE = re.compile(
+    r"одинаков|сравни|as-is|as is|to-be|tobe|до и после|экономи|rework|"
+    r"цикл|возврат|сколько\s+времени",
+    re.I,
+)
+_ROLE_Q_RE = re.compile(r"рол|какие\s+шаги|что\s+делает|перечисл|шаги\s+|нагрузк|разгруз", re.I)
+_STEP_WORD_RE = re.compile(r"шаг\w*|пункт\w*|п\.\s*\d+|этап\w*", re.I)
+
+
+def _explicit_step_num(message: str) -> Optional[int]:
+    m = re.search(r"(?:шаг\w*|пункт\w*|этап\w*|п\.)\s*№?\s*(\d+)", message or "", re.I)
+    if not m:
+        m = re.search(r"\b(\d+)\s*(?:-?(?:й|ый|ой|го|м))?\s*шаг", message or "", re.I)
+    return int(m.group(1)) if m else None
+
+
+def _step_bodies(ctx: Dict[str, Any]) -> Dict[int, str]:
+    reg = ctx.get("regulation_text") or ""
+    if not str(reg).strip():
+        return {}
+    try:
+        _, raw = _split_steps(normalize_regulation(reg))
+    except Exception:  # noqa: BLE001
+        return {}
+    return {int(s["num"]): str(s.get("body") or "") for s in raw if s.get("num") is not None}
+
+
+def _ask_tokens(message: str) -> List[str]:
+    toks = []
+    for w in re.findall(r"[А-Яа-яЁёA-Za-z]{3,}", message or ""):
+        low = w.lower().replace("ё", "е")
+        if low in _ASK_STOP:
+            continue
+        toks.append(low)
+    return toks
+
+
+def _blob_has_token(blob: str, token: str) -> bool:
+    b = (blob or "").lower().replace("ё", "е")
+    if token in b:
+        return True
+    stem = token[:5]
+    return len(stem) >= 4 and stem in b
+
+
+def _match_asked_step(message: str, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    steps = list(ctx.get("steps") or [])
+    if not steps:
+        return None
+    bodies = _step_bodies(ctx)
+    tokens = _ask_tokens(message)
+    scored: List[Tuple[int, int, Dict[str, Any]]] = []
+    for s in steps:
+        blob = " ".join([str(s.get("title") or ""), str(s.get("role") or ""), bodies.get(int(s["num"]), "")])
+        hit = [t for t in tokens if _blob_has_token(blob, t)]
+        if hit:
+            scored.append((len(hit), max(len(t) for t in hit), s))
+    scored.sort(key=lambda pair: (-pair[0], -pair[1], int(pair[2]["num"])))
+    if not scored:
+        return None
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    best_n, best_len, best = scored[0]
+    if best_n >= 2:
+        return best
+    if best_len >= 6 and re.search(r"шаг|что\s+делает|про\s+|подготов", message or "", re.I):
+        return best
+    return None
+
+
+def _one_step_reply(step: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    num = int(step["num"])
+    title = str(step.get("title") or "").strip() or "—"
+    role = str(step.get("role") or "").strip() or "—"
+    hours = step.get("hours")
+    tail = f", {_fh(float(hours))}" if hours else ""
+    body = _step_bodies(ctx).get(num, "")
+    lines = [f"**Шаг {num}. «{title}»** — {role}{tail}."]
+    if body and title.lower() not in body.lower():
+        snip = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", body, flags=re.I)
+        snip = re.sub(r"\s*\([^)]*\)\s*$", "", snip).strip()
+        if snip:
+            lines.append(f"В регламенте: «{snip[:140]}».")
+    return "\n".join(lines)
+
+
+def _role_steps_reply(ctx: Dict[str, Any], role: str) -> str:
+    mine = [s for s in (ctx.get("steps") or []) if s.get("role") == role]
+    lines = [f"**«{role}»** — шаги по порядку:"]
+    if not mine:
+        lines.append("Шагов этой роли на схеме нет.")
+        return "\n".join(lines)
+    for s in mine:
+        hours = s.get("hours")
+        tail = f" — {_fh(float(hours))}" if hours else ""
+        lines.append(f"{s['num']}. «{s.get('title') or '—'}»{tail}")
+    return "\n".join(lines)
+
+
+def _steps_miss_reply(ctx: Dict[str, Any]) -> str:
+    f = ctx.get("facts") or {}
+    n = len(ctx.get("steps") or [])
+    cp = float(f.get("critical_path_hours") or (ctx.get("sla") or {}).get("critical_path_hours") or 0)
+    title = str(ctx.get("title") or "процесс")
+    return f"Шаг не найден. В схеме «{title}» {n} шагов, критический путь {_fh(cp)}."
+
+
+def _facts_time_reply(ctx: Dict[str, Any]) -> str:
+    """Срок, экономия, циклы — только числа process_facts, без подстановки шага 1."""
+    f = ctx.get("facts") or {}
+    if not f.get("tobe_ready"):
+        rw = float(f.get("with_rework_hours") or 0)
+        cp = float(f.get("critical_path_hours") or 0)
+        n = int(f.get("rework_loops_n") or 0)
+        return (
+            f"**As-Is: срок с возвратами {_fh(rw)}, голый КП {_fh(cp)}, циклов {n}.** "
+            "To-Be ещё не посчитан."
+        )
+    rw_b, rw_a = float(f.get("rw_before") or 0), float(f.get("rw_after") or 0)
+    cp_b, cp_a = float(f.get("cp_before") or 0), float(f.get("cp_after") or 0)
+    rb, ra = int(f.get("loops_before") or 0), int(f.get("loops_after") or 0)
+    pct = int(f.get("rw_saved_pct") or 0)
+    lines = [
+        f"**Экономия пути с возвратами: {_fh(rw_b)} → {_fh(rw_a)} (−{pct}%), циклы «{rb} → {ra}».**",
+        f"Голый критический путь: {_fh(cp_b)} → {_fh(cp_a)}.",
+    ]
+    if abs(rw_a - cp_a) < 0.051 or ra == 0:
+        lines.append("Одинаковые цифры справа: циклы сняты, добавки за возврат нет.")
+    return "\n".join(lines)
+
+
+def _visible_answer(message: str, ctx: Dict[str, Any]) -> Optional[str]:
+    """Шаг, роль или цифры To-Be по тексту вопроса. None — вопрос не про видимый шаг и не про срок."""
+    steps = list(ctx.get("steps") or [])
+    num = _explicit_step_num(message)
+    if num is not None:
+        hit = next((s for s in steps if int(s["num"]) == num), None)
+        return _one_step_reply(hit, ctx) if hit else _steps_miss_reply(ctx)
+    hit = _match_asked_step(message, ctx)
+    if hit is not None and not _FACTS_Q_RE.search(message or ""):
+        return _one_step_reply(hit, ctx)
+    if _FACTS_Q_RE.search(message or ""):
+        return _facts_time_reply(ctx)
+    roles = _roles_in_message(message, _roles_of(ctx))
+    if roles and _ROLE_Q_RE.search(message or ""):
+        return _role_steps_reply(ctx, roles[0])
+    if _STEP_WORD_RE.search(message or "") and hit is None:
+        return _steps_miss_reply(ctx)
+    return None
 
 
 def _analysis_readability(ctx: Dict[str, Any]) -> str:
@@ -2942,8 +3120,11 @@ def heuristic_analysis(message: str, ctx: Dict[str, Any]) -> str:
         return _analysis_opt_audit(ctx)
     if _QUALITY_Q_RE.search(low):
         return _analysis_quality_score(ctx)
-    if _WHY_SAVED_RE.search(low):
+    if _WHY_SAVED_RE.search(low) and not re.search(r"одинаков", low):
         return _analysis_why_saved(ctx)
+    visible = _visible_answer(message, ctx)
+    if visible:
+        return visible
     if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|до/после|целев\w+\s+схем|реинжинир", low):
         return _analysis_tobe(ctx)
     if re.search(r"читаем|метро|нотаци|подпроцесс|анти-метро|методолог", low):
@@ -3622,6 +3803,9 @@ def assistant_chat(
         if not ctx["steps"] and not current_xml:
             return "Активного процесса пока нет: выберите регламент и нажмите «Сгенерировать BPMN 2.0».", None, None, None
         intent = classify_intent(message)
+        if intent == "instruction" and not re.search(r"инструкц|памятк|должностн", message, re.I):
+            if _visible_answer(message, ctx):
+                intent = "analysis"
         trace: List[str] = []
         hist = _normalize_history(history)[-8:]
 
@@ -4265,25 +4449,7 @@ def _copilot_node_brief(name: str, role: str, kind: str, ctx: Dict[str, Any]) ->
 
 
 def _copilot_tobe(ctx: Dict[str, Any]) -> str:
-    f = ctx.get("facts") or {}
-    if not f.get("tobe_ready"):
-        return _limit_lines(
-            f"**As-Is.** Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}, "
-            f"циклов {int(f.get('rework_loops_n') or 0)}.\nTo-Be ещё не посчитан.",
-            6,
-        )
-    rb, ra = int(f.get("loops_before") or 0), int(f.get("loops_after") or 0)
-    lines = [
-        f"**Экономия пути с возвратами: {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))} "
-        f"(−{int(f.get('rw_saved_pct') or 0)}%).**",
-        f"Циклы {rb} → {ra}.",
-        f"Голый путь {_fh(float(f['cp_before']))} → {_fh(float(f['cp_after']))}.",
-    ]
-    heavy = (f.get("critical_path") or ctx.get("critical_path") or [])[:1]
-    if heavy:
-        c = heavy[0]
-        lines.append(f"На схеме: «{c.get('name')}» ({c.get('role')}).")
-    return _limit_lines("\n".join(lines), 6)
+    return _limit_lines(_facts_time_reply(ctx), 6)
 
 
 def canvas_copilot_reply(
@@ -4303,6 +4469,9 @@ def canvas_copilot_reply(
     if classify_intent(msg) == "edit":
         cmd = re.sub(r"\s+", " ", msg).strip(" .")
         return f"Команду в сайдбар: «{cmd}»"
+    visible = _visible_answer(msg, ctx)
+    if visible:
+        return _limit_lines(visible, 12)
     cat = catalog or {}
     if selected_id and selected_id in cat:
         packed = cat[selected_id].get("copilot")
@@ -4316,8 +4485,7 @@ def canvas_copilot_reply(
         return _limit_lines(
             f"**Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}**, "
             f"голый КП {_fh(float(f.get('critical_path_hours') or 0))}.\n"
-            f"Циклов {int(f.get('rework_loops_n') or 0)}. "
-            + (f"Узкое место — «{(f.get('critical_path') or [{}])[0].get('name', '—')}»." if f.get("critical_path") else ""),
+            f"Циклов {int(f.get('rework_loops_n') or 0)}.",
             6,
         )
     if re.search(r"цикл|возврат|доработ|rework", low):

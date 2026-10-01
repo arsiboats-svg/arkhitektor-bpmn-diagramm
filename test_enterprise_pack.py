@@ -236,6 +236,58 @@ def main() -> None:
     repair_rows = [ln for ln in audit_reply.splitlines() if "Ремонт остаётся" in ln]
     assert repair_rows, audit_reply
     assert "| да |" in repair_rows[0], repair_rows[0]
+
+    ppe_q = "Что делает подготовка СИЗ, инструмента и переносных заземлений?"
+    cop_ppe = canvas_copilot_reply(ppe_q, xml1, audit1, text1, tobe_delta=delta1)
+    side_ppe, ppe_text, ppe_xml, ppe_audit = assistant_chat(
+        ppe_q, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1
+    )
+    assert ppe_text is None and ppe_xml is None and ppe_audit is None
+    for blob, who in ((cop_ppe, "copilot"), (side_ppe, "sidebar")):
+        assert "Принять сообщение" not in blob, (who, blob)
+        assert "СИЗ" in blob, (who, blob)
+        assert "12" in blob, (who, blob)
+    same_q = "Почему в To-Be цифры одинаковые?"
+    cop_same = canvas_copilot_reply(same_q, xml1, audit1, text1, tobe_delta=delta1)
+    side_same, same_text, same_xml, same_audit = assistant_chat(
+        same_q, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1
+    )
+    assert same_text is None and same_xml is None and same_audit is None
+    for blob, who in ((cop_same, "copilot"), (side_same, "sidebar")):
+        assert "Принять сообщение" not in blob, (who, blob)
+        assert "Добавь " not in blob and "Удали " not in blob, (who, blob)
+        assert _hours_cited(blob, float(facts1["rw_before"]))
+        assert _hours_cited(blob, float(facts1["rw_after"]))
+        assert _hours_cited(blob, float(facts1["cp_before"]))
+        assert _hours_cited(blob, float(facts1["cp_after"]))
+        assert "добавки за возврат нет" in blob.lower(), blob
+    role_q = "Какие шаги у диспетчера?"
+    side_role, role_text, role_xml, _ = assistant_chat(
+        role_q, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1
+    )
+    assert role_text is None and role_xml is None
+    assert side_role.index("Принять сообщение") < side_role.index("Зафиксировать аварию")
+    assert "5 мин" in side_role
+    cop_role = canvas_copilot_reply(role_q, xml1, audit1, text1, tobe_delta=delta1)
+    assert "Принять сообщение" in cop_role and "5 мин" in cop_role
+
+    healed_code = """
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер", "Ремонтная бригада"])
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+a = DIAGRAM.add_user_task("Принять сообщение об аварии", lanes[0])
+b = DIAGRAM.add_user_task("Выполнить аварийный ремонт оборудования", lanes[1])
+DIAGRAM.add_link(ROOT_START_TASK_ID, a)
+DIAGRAM.add_link(a, ROOT_END_TASK_ID)
+"""
+    xml_h, audit_h, err_h = execute_generated_code(healed_code, "Проверка heal", regulation_text=text1)
+    assert not err_h, err_h
+    journal = " ".join(audit_h.get("auto_healed") or [])
+    assert "без входа" in journal or "Тупик" in journal, journal
+    assert audit_h["quality"]["ok"], audit_h["quality"]
+    assert not audit_h.get("dead_ends")
+    assert not audit_h.get("orphans_without_incoming")
+    assert audit_h.get("xsd_valid") is not False
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
     print("NEW_STEP", new_step)
