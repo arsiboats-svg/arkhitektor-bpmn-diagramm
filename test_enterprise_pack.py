@@ -167,7 +167,7 @@ def main() -> None:
     assert "осмотр" in title0 or "осмотреть" in title0
     assert inverted.steps[1].role == "Диспетчер"
 
-    from ai_generator import assistant_chat, canvas_copilot_reply, process_facts
+    from ai_generator import assistant_chat, canvas_copilot_reply, classify_intent, process_facts
 
     text1 = (Path(__file__).resolve().parent / "examples" / "example_1_substation_repair.txt").read_text(
         encoding="utf-8"
@@ -207,6 +207,35 @@ def main() -> None:
     assert new_text and "со службой" in new_text, new_text
     new_step = next((ln for ln in new_text.splitlines() if "со службой" in ln), "")
     assert new_step, new_text
+    eco_svc = "Добавь согласование со службой экологии"
+    assert classify_intent(eco_svc) == "edit"
+    side_svc, svc_text, svc_xml, _ = assistant_chat(
+        eco_svc, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1
+    )
+    assert svc_xml and svc_text and svc_text != text1
+    assert "со службой" in svc_text
+
+    audit_q = "Провести аналитический аудит текущей оптимизации. Не изменяй BPMN."
+    assert classify_intent(audit_q) == "analysis"
+    assert classify_intent("Провести аналитический аудит текущей оптимизации") == "analysis"
+    audit_reply, audit_text, audit_xml, audit_audit = assistant_chat(
+        audit_q, [], xml1, audit1, text1, use_llm=False, tobe_delta=delta1
+    )
+    assert audit_text is None and audit_xml is None and audit_audit is None
+    assert "Добавь " not in audit_reply
+    assert "Удали " not in audit_reply
+    assert "Сделай шаги параллельными" not in audit_reply
+    assert "| Изменение |" in audit_reply
+    assert "Подтверждено регламентом" in audit_reply
+    assert "Параллельно" in audit_reply
+    assert "это ход оптимизатора, в регламенте такой формулировки нет" in audit_reply
+    ppe_rows = [ln for ln in audit_reply.splitlines() if "СИЗ" in ln]
+    assert ppe_rows, audit_reply
+    assert "| да |" in ppe_rows[0], ppe_rows[0]
+    assert "высокая" in ppe_rows[0], ppe_rows[0]
+    repair_rows = [ln for ln in audit_reply.splitlines() if "Ремонт остаётся" in ln]
+    assert repair_rows, audit_reply
+    assert "| да |" in repair_rows[0], repair_rows[0]
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
     print("NEW_STEP", new_step)

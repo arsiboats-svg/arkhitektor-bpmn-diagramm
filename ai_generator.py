@@ -2185,6 +2185,7 @@ def build_process_context(
         "facts": {},
         "cp_hours_as_is": None,
         "cp_hours_to_be": None,
+        "regulation_text": current_text or "",
     }
     facts = process_facts(audit, tobe_delta)
     ctx["facts"] = facts
@@ -2302,14 +2303,34 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
 
 # --------------------------- классификация намерения --------------------------- #
 _EDIT_VERB_RE = re.compile(
-    r"\b(добав\w+|вставь\w*|вставить|включи\w*|дополни\w*|удал\w+|убер\w+|убрать|исключ\w+|сдела\w+|измени\w*|изменить|"
-    r"замени\w*|заменить|перенес\w+|перемест\w+|поменя\w+|сократ\w+|увелич\w+|постав\w+|установи\w*|передай\w*|назначь\w*)\b",
+    r"\b(добав\w+|вставь\w*|вставить|удал\w+|убер\w+|убрать|исключ\w+|"
+    r"перепиши\w*|переписать|"
+    r"сделай(?:те)?\s+.{0,80}параллел|"
+    r"измени(?:ть)?\s+(?:срок|шаг|роль|название|пункт)|"
+    r"замени\w*|заменить|перенес\w+|перемест\w+|поменя\w+|"
+    r"передай\w+|назначь\w+|установи\w*\s+целев\w+\s+срок)\b",
+    re.I,
+)
+_NO_EDIT_RE = re.compile(
+    r"не\s+изменяй|не\s+менять|не\s+правь|не\s+править|не\s+трогай|"
+    r"не\s+перестраивай|не\s+редактир|без\s+изменен|не\s+меняй\s+bpmn",
+    re.I,
+)
+_ANALYSIS_HINT_RE = re.compile(
+    r"аудит|анализ|аналитическ|сравни|as-is|to-be|tobe|риск|"
+    r"что\s+изменил|подтвержд|разбор",
     re.I,
 )
 _QUESTION_START_RE = re.compile(r"^\s*(?:как|почему|что|зачем|можно ли|стоит ли|какие|какой|какая|сколько|где|когда|кто|в чем|в чём|есть ли)\b", re.I)
 _INSTRUCTION_RE = re.compile(
     r"инструкци|памятк|регламент для исполнител|для исполнител|должностн|чем занимается|что делает|опиши работу|обязанност", re.I)
 _NEXT_STEP_RE = re.compile(r"следующ\w+ шаг|что дальше|чего не хватает|предложи\w* шаг|что добавить|каких шагов", re.I)
+_OPT_AUDIT_Q_RE = re.compile(
+    r"аудит|аналитическ|что\s+изменил|подтвержд|"
+    r"не\s+изменяй|не\s+правь|не\s+менять|"
+    r"разбор.{0,24}оптимиз|оптимизац.{0,40}(аудит|анализ)",
+    re.I,
+)
 
 
 def classify_intent(message: str) -> str:
@@ -2319,6 +2340,8 @@ def classify_intent(message: str) -> str:
         return "instruction"
     if _NEXT_STEP_RE.search(msg):
         return "next_step"
+    if _NO_EDIT_RE.search(msg) or (_ANALYSIS_HINT_RE.search(msg) and not _EDIT_VERB_RE.search(msg)):
+        return "analysis"
     if _EDIT_VERB_RE.search(msg) and not msg.endswith("?") and not _QUESTION_START_RE.match(msg):
         return "edit"
     return "analysis"
@@ -2613,6 +2636,9 @@ def _suggested_command(ctx: Dict[str, Any]) -> str:
 def _sidebar_shape(body: str, ctx: Dict[str, Any], intent: str) -> str:
     """Сайдбар: вывод → шаги/роли → одна команда в ёлочках. Не больше 10 строк."""
     lines = [ln.rstrip() for ln in (body or "").splitlines() if ln.strip() and not ln.strip().startswith("<sub>")]
+    table = any("| Изменение |" in ln or "Подтверждено регламентом" in ln for ln in lines)
+    if table:
+        return "\n".join(lines[:24])
     if intent in ("analysis", "next_step"):
         lines = lines[:9]
         if not any("«" in ln and "»" in ln for ln in lines):
@@ -2710,9 +2736,210 @@ def _analysis_quality_score(ctx: Dict[str, Any]) -> str:
     return _analysis_readability(ctx)
 
 
+_OPTIMIZER_MOVE = "это ход оптимизатора, в регламенте такой формулировки нет"
+
+
+def _audit_cell(value: Any) -> str:
+    return str(value if value is not None and value != "" else "—").replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
+def _audit_snip(text: str, limit: int = 88) -> str:
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    t = re.sub(r"^\d+[.)]\s*", "", t)
+    if len(t) > limit:
+        t = t[: limit - 1].rstrip(" ,;:") + "…"
+    return t
+
+
+def _analysis_opt_audit(ctx: Dict[str, Any]) -> str:
+    """Сверка To-Be с исходным регламентом: таблица, без команд правки XML."""
+    facts = ctx.get("facts") or {}
+    steps = ctx.get("steps") or []
+    reg = ctx.get("regulation_text") or ""
+    try:
+        _, raw = _split_steps(normalize_regulation(reg)) if reg.strip() else ([], [])
+    except Exception:  # noqa: BLE001
+        raw = []
+    bodies = {int(s["num"]): s["body"] for s in raw if s.get("num") is not None}
+    titles: Dict[int, str] = {}
+    for s in steps:
+        try:
+            titles[int(s["num"])] = str(s.get("title") or "").strip()
+        except (TypeError, ValueError):
+            continue
+    for num, body in bodies.items():
+        if not titles.get(num):
+            titles[num] = _step_title(body)
+
+    def step_cell(num: Optional[int], extra: str = "") -> str:
+        if num is None:
+            return extra or "—"
+        body = bodies.get(num, "")
+        name = extra
+        if body:
+            name = _audit_snip(
+                re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", body, flags=re.I),
+                72,
+            )
+            name = re.sub(r"\s*\(\d+[^\)]*\)\s*$", "", name).rstrip(" .")
+        if not name:
+            name = titles.get(num) or _step_title(body)
+        return f"{num}. {name}" if name else str(num)
+
+    rows: List[List[str]] = []
+    ppe_num: Optional[int] = None
+    for s in raw:
+        body = s.get("body") or ""
+        if _is_prepare_ppe_ground(body):
+            ppe_num = int(s["num"])
+            quote = ""
+            m = re.search(r"(Параллельно\s*[:,—–-]?\s*.{0,80})", body, re.I)
+            if m:
+                quote = _audit_snip(m.group(1))
+            elif re.search(r"параллельно", body, re.I):
+                quote = _audit_snip(body)
+            if quote:
+                rows.append(
+                    [
+                        "Подготовка СИЗ, инструмента и переносных заземлений параллельно оперативным переключениям",
+                        step_cell(ppe_num),
+                        "да",
+                        f"«{quote}»",
+                        "низкий",
+                        "высокая",
+                    ]
+                )
+            break
+
+    repair_num = brief_num = None
+    for s in raw:
+        body = s.get("body") or ""
+        num = int(s["num"])
+        if repair_num is None and _REPAIR_WORK_RE.search(body) and not re.search(r"закрыва", body, re.I):
+            repair_num = num
+        if re.search(r"инструктаж", body, re.I):
+            brief_num = num
+    if repair_num is not None and brief_num is not None and repair_num > brief_num:
+        quotes = [_audit_snip(bodies[brief_num], 80), _audit_snip(bodies[repair_num], 80)]
+        rows.append(
+            [
+                "Ремонт остаётся после допуска и целевого инструктажа",
+                step_cell(repair_num),
+                "да",
+                "«" + "; ".join(quotes) + "»",
+                "низкий",
+                "высокая",
+            ]
+        )
+
+    zero_nums: List[int] = []
+    for act in ctx.get("tobe_actions") or []:
+        if not isinstance(act, dict):
+            continue
+        kind = str(act.get("kind") or "")
+        detail = str(act.get("detail") or "")
+        found = [int(x) for x in re.findall(r"шаг(?:и)?\s+(\d+)", detail, re.I)]
+        if kind == "parallel":
+            ppe_hit = ppe_num is not None and (ppe_num in found or any(_is_prepare_ppe_ground(bodies.get(n, "")) for n in found))
+            already = False
+            if len(found) >= 2 and found[1] in bodies and _is_parallel_body(bodies[found[1]]):
+                already = True
+            if ppe_hit or already:
+                continue
+            rows.append(
+                [
+                    "Параллельное выполнение независимых шагов",
+                    " и ".join(step_cell(n) for n in found[:2]) if found else "—",
+                    "нет",
+                    _OPTIMIZER_MOVE,
+                    "средний",
+                    "средняя",
+                ]
+            )
+        elif kind == "zero_rework":
+            zero_nums.extend(found[:1] or [])
+        elif kind == "automation":
+            n = found[0] if found else None
+            body = bodies.get(n, "") if n else ""
+            if n and re.search(r"систем\w+\s+автоматическ|автоматически:", body, re.I):
+                rows.append(
+                    [
+                        "Автоматизация журнальной фиксации",
+                        step_cell(n),
+                        "да",
+                        f"«{_audit_snip(body)}»",
+                        "низкий",
+                        "высокая",
+                    ]
+                )
+            else:
+                rows.append(
+                    [
+                        "Автоматизация журнальной фиксации",
+                        step_cell(n) if n else "—",
+                        "нет",
+                        _OPTIMIZER_MOVE,
+                        "низкий",
+                        "средняя",
+                    ]
+                )
+
+    if zero_nums or (
+        facts.get("tobe_ready")
+        and facts.get("loops_after") is not None
+        and int(facts.get("loops_before") or 0) > int(facts.get("loops_after") or 0)
+    ):
+        uniq = list(dict.fromkeys(zero_nums))
+        step_lbl = ", ".join(step_cell(n) for n in uniq[:3]) if uniq else "циклы возврата"
+        rows.append(
+            [
+                "Замена циклов возврата на эскалацию",
+                step_lbl,
+                "нет",
+                _OPTIMIZER_MOVE,
+                "средний",
+                "средняя",
+            ]
+        )
+
+    if not rows:
+        rows.append(
+            [
+                "Сверка As-Is и To-Be",
+                "—",
+                "нет",
+                _OPTIMIZER_MOVE,
+                "средний",
+                "низкая",
+            ]
+        )
+
+    head: List[str] = []
+    if facts.get("tobe_ready"):
+        lb, la = int(facts.get("loops_before") or 0), int(facts.get("loops_after") or 0)
+        rw_b, rw_a = float(facts.get("rw_before") or 0), float(facts.get("rw_after") or 0)
+        cp_b = float(facts.get("cp_before") or 0)
+        cp_a = float(facts.get("cp_after") or 0)
+        head.append(
+            f"Циклы {lb} → {la}; срок с возвратами {_fh(rw_b)} → {_fh(rw_a)}; "
+            f"голый КП {_fh(cp_b)} → {_fh(cp_a)}."
+        )
+    else:
+        head.append("To-Be ещё не посчитан — сверка шагов с исходным регламентом.")
+    table = [
+        "| Изменение | Шаг (номер и название) | Подтверждено регламентом | Основание | Риск | Уверенность |",
+        "|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        table.append("| " + " | ".join(_audit_cell(c) for c in row) + " |")
+    return "\n".join(head + table)
+
+
 def heuristic_analysis(message: str, ctx: Dict[str, Any]) -> str:
     low = message.lower()
     roles = _roles_in_message(message, _roles_of(ctx))
+    if _OPT_AUDIT_Q_RE.search(low):
+        return _analysis_opt_audit(ctx)
     if _QUALITY_Q_RE.search(low):
         return _analysis_quality_score(ctx)
     if _WHY_SAVED_RE.search(low):
@@ -3445,6 +3672,7 @@ def assistant_chat(
         low = message.lower()
         force_local = bool(
             _QUALITY_Q_RE.search(low) or _WHY_SAVED_RE.search(low) or _FACT_OVERRIDE_RE.search(low)
+            or _OPT_AUDIT_Q_RE.search(low)
         )
         if use_llm and not force_local:
             system = CHAT_SYSTEM + format_context_for_prompt(ctx)
