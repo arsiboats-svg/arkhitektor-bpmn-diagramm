@@ -339,7 +339,7 @@ def execute_generated_code(
     Любые исключения перехватываются: при ошибке возвращается ("", {}, "описание").
     """
     try:
-        code = _strip_markdown(code_str or "")
+        code = _code_for_sandbox(_strip_markdown(code_str or ""))
         if len(code.strip()) < 10:
             return "", {}, "Пустой код: модель не вернула инструкций для DIAGRAM."
         try:
@@ -377,6 +377,7 @@ def execute_generated_code(
 
         sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
         diagram.heal_graph()
+        _complete_return_edges(diagram, regulation_text)
         structure_issues = _structure_issues(diagram)
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
@@ -384,10 +385,7 @@ def execute_generated_code(
         expected_returns = _explicit_return_count(regulation_text)
         actual_returns = len(audit.get("rework_loops") or [])
         if expected_returns > actual_returns:
-            audit["quality"]["critical"].append(
-                f"В регламенте {expected_returns} явных возврата, в графе обратных рёбер {actual_returns}."
-            )
-            audit["quality"]["ok"] = False
+            return "", {}, _return_diagram_not_ready(expected_returns, actual_returns)
         if sla_enriched:
             audit["sla_enriched_nodes"] = sla_enriched
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
@@ -1654,8 +1652,7 @@ def _ensure_return_decision(text: str, decision: Optional[Decision], step_num: i
     return decision
 
 
-def _explicit_return_count(text: str) -> int:
-    """Сколько пунктов регламента содержат явный возврат. Каждый такой пункт — одно ребро."""
+def _numbered_chunks(text: str) -> List[str]:
     raw = normalize_regulation(text or "")
     chunks: List[str] = []
     current = ""
@@ -1668,9 +1665,300 @@ def _explicit_return_count(text: str) -> int:
             current = f"{current} {line.strip()}"
     if current:
         chunks.append(current)
-    if not chunks and _has_explicit_return(raw):
+    return chunks
+
+
+def _code_for_sandbox(code: str) -> str:
+    """В exec попадает только код DIAGRAM. Дорисовка возвратов вызывается снаружи."""
+    if "_complete_return_edges" not in (code or ""):
+        return code or ""
+    kept = [line for line in (code or "").splitlines() if "_complete_return_edges" not in line]
+    return "\n".join(kept)
+
+
+def _explicit_return_count(text: str) -> int:
+    """Сколько пунктов регламента содержат явный возврат. Каждый такой пункт — одно ребро."""
+    chunks = _numbered_chunks(text)
+    if not chunks and _has_explicit_return(normalize_regulation(text or "")):
         return 1
     return sum(1 for chunk in chunks if _has_explicit_return(chunk))
+
+
+def _return_diagram_not_ready(expected: int, actual: int) -> str:
+    """После дорисовки рёбер всё ещё меньше, чем фраз: схему не отдаём как готовую."""
+    return (
+        f"Схема не готова: в регламенте {expected} явных возврата, "
+        f"в графе обратных рёбер {actual}."
+    )
+
+
+def _model_return_incomplete(err: str) -> bool:
+    """Дыра возврата в уже собранной схеме модели. Эмулятор вместо неё не подставляем."""
+    return "Схема не готова" in (err or "") and "явных возврата" in (err or "")
+
+
+def _return_phrase_specs(text: str) -> List[Dict[str, Any]]:
+    """Каждая фраза «вернуть на п.N» или «иначе … назад» — источник, цель и подпись ветки."""
+    raw = normalize_regulation(text or "")
+    if not raw.strip() or _explicit_return_count(raw) <= 0:
+        return []
+    try:
+        parsed = parse_regulation(raw)
+    except Exception:  # noqa: BLE001
+        return []
+    by_num = {step.num: step for step in parsed.steps}
+
+    def _step_for(chunk: str, num: Optional[int]) -> Any:
+        if num is not None and num in by_num:
+            return by_num[num]
+        best, score = None, 0
+        for step in parsed.steps:
+            got = _sla_title_score(step.title or "", chunk)
+            if got > score:
+                best, score = step, got
+        return best if score >= 2 else None
+
+    specs: List[Dict[str, Any]] = []
+    chunks = _numbered_chunks(raw)
+    if not chunks and _has_explicit_return(raw):
+        chunks = [raw]
+    for chunk in chunks:
+        if not _has_explicit_return(chunk):
+            continue
+        num_m = re.match(r"\s*(\d+)", chunk)
+        num = int(num_m.group(1)) if num_m else None
+        step = _step_for(chunk, num)
+        target_num: Optional[int] = None
+        label = "Возврат"
+        if step and step.decision:
+            decision = step.decision
+            if decision.no_ref is not None and (decision.no_back or decision.no_ref < step.num):
+                target_num = decision.no_ref
+            elif decision.yes_ref is not None and decision.yes_ref < step.num:
+                target_num = decision.yes_ref
+            label = (decision.no_label or label)[:40]
+        if target_num is None:
+            ref_m = _REF_RE.search(chunk)
+            if ref_m and step and int(ref_m.group(1)) < step.num:
+                target_num = int(ref_m.group(1))
+        target = by_num.get(target_num) if target_num is not None else None
+        specs.append(
+            {
+                "source_num": step.num if step else num,
+                "target_num": target.num if target else target_num,
+                "label": label or "Возврат",
+                "source_title": (step.title if step else "") or "",
+                "target_title": (target.title if target else "") or "",
+            }
+        )
+    return specs
+
+
+def _bind_step_nodes(diagram: BPMNDiagramBuilder, titles: Dict[int, str]) -> Dict[int, Any]:
+    """Шаг регламента → задача с именем из глагола, не контейнер подпроцесса."""
+    task_kinds = WORK_KINDS | {"manualTask", "serviceTask", "sendTask", "receiveTask", "businessRuleTask"}
+    work = [node for node in diagram.nodes.values() if node.kind in task_kinds]
+    scored: List[Tuple[int, int, str]] = []
+    for num, title in titles.items():
+        if not title:
+            continue
+        for node in work:
+            score = _sla_title_score(title, node.name or "")
+            if score >= 2:
+                scored.append((score, num, node.id))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    used_steps: set = set()
+    used_nodes: set = set()
+    bound: Dict[int, Any] = {}
+    for _score, num, node_id in scored:
+        if num in used_steps or node_id in used_nodes:
+            continue
+        bound[num] = diagram.nodes[node_id]
+        used_steps.add(num)
+        used_nodes.add(node_id)
+    return bound
+
+
+def _reachable_from(diagram: BPMNDiagramBuilder, start_id: str) -> set:
+    seen: set = set()
+    stack = [start_id]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for link in diagram.links:
+            if link.source_id == current and link.target_id not in seen:
+                stack.append(link.target_id)
+    seen.discard(start_id)
+    return seen
+
+
+def _owner_holds(diagram: BPMNDiagramBuilder, node_id: str, owner_id: str) -> bool:
+    node = diagram.nodes.get(node_id)
+    seen: set = set()
+    while node and node.owner_id and node.owner_id not in seen:
+        if node.owner_id == owner_id:
+            return True
+        seen.add(node.owner_id)
+        node = diagram.nodes.get(node.owner_id)
+    return False
+
+
+def _back_link_list(diagram: BPMNDiagramBuilder) -> List[Any]:
+    found: List[Any] = []
+    owners = [pool.process_id for pool in diagram.pools.values()][:1] or [diagram.process_id]
+    owners += [node.id for node in diagram.nodes.values() if node.kind == "subProcess"]
+    for owner in owners:
+        nodes = diagram._children(owner)
+        if not nodes:
+            continue
+        start_id = diagram._scope_start_end(owner)[0]
+        back = diagram._back_links(nodes, start_id)
+        ids = {node.id for node in nodes}
+        for link in diagram._scope_links(ids):
+            if link.id in back:
+                found.append(link)
+    return found
+
+
+def _gateway_after(diagram: BPMNDiagramBuilder, node: Any) -> Any:
+    outs = [link for link in diagram.links if link.source_id == node.id]
+    if len(outs) != 1:
+        return node
+    nxt = diagram.nodes.get(outs[0].target_id)
+    if nxt and nxt.kind in ("exclusiveGateway", "inclusiveGateway") and nxt.owner_id == node.owner_id:
+        return nxt
+    return node
+
+
+def _pick_return_source(diagram: BPMNDiagramBuilder, target: Any, source: Optional[Any], reachable: set) -> Optional[Any]:
+    """Узел того же процесса, из которого ребро на цель замыкает цикл."""
+    task_kinds = WORK_KINDS | {"manualTask", "serviceTask", "sendTask", "receiveTask", "businessRuleTask"}
+
+    def usable(node: Any) -> bool:
+        if node is None or node.id == target.id or node.id not in reachable:
+            return False
+        if node.owner_id != target.owner_id or node.kind in ("startEvent", "endEvent", "subProcess", "parallelGateway"):
+            return False
+        return not any(link.source_id == node.id and link.target_id == target.id for link in diagram.links)
+
+    ordered: List[Any] = []
+    if source is not None:
+        gate = _gateway_after(diagram, source)
+        ordered.append(gate)
+        if gate is not source:
+            ordered.append(source)
+    ordered.extend(
+        node for node in diagram.nodes.values()
+        if node.kind in ("exclusiveGateway", "inclusiveGateway")
+    )
+    ordered.extend(node for node in diagram.nodes.values() if node.kind in task_kinds)
+    for node in ordered:
+        if usable(node):
+            return node
+    return None
+
+
+def _complete_return_edges(diagram: BPMNDiagramBuilder, regulation_text: str) -> None:
+    """Недостающие явные возвраты дорисовываются в эту же схему, до analyze_bottlenecks.
+
+    Цель ребра — задача с глаголом, в том числе внутри подпроцесса.
+    Чужой граф эмулятора сюда не подставляется.
+    """
+    specs = _return_phrase_specs(regulation_text)
+    if not specs:
+        return
+    titles: Dict[int, str] = {}
+    for spec in specs:
+        if spec.get("source_num") is not None and spec.get("source_title"):
+            titles[int(spec["source_num"])] = str(spec["source_title"])
+        if spec.get("target_num") is not None and spec.get("target_title"):
+            titles[int(spec["target_num"])] = str(spec["target_title"])
+    bound = _bind_step_nodes(diagram, titles)
+    claimed: set = set()
+
+    def _refresh() -> List[Any]:
+        return _back_link_list(diagram)
+
+    back = _refresh()
+
+    def _covers(link: Any, target: Any, title: str) -> bool:
+        node = diagram.nodes.get(link.target_id)
+        if node is None:
+            return False
+        if target is not None and link.target_id == target.id:
+            return True
+        if title and node.kind != "subProcess" and _sla_title_score(title, node.name or "") >= 2:
+            return True
+        if target is not None and _owner_holds(diagram, target.id, link.target_id):
+            return True
+        if target is not None and node.kind in GATEWAY_KINDS:
+            return any(item.source_id == node.id and item.target_id == target.id for item in diagram.links)
+        return False
+
+    pending: List[Dict[str, Any]] = []
+    for spec in specs:
+        target_num = spec.get("target_num")
+        target = bound.get(int(target_num)) if target_num is not None else None
+        title = str(spec.get("target_title") or "")
+        hit = next((link for link in back if link.id not in claimed and _covers(link, target, title)), None)
+        if hit is not None:
+            claimed.add(hit.id)
+            continue
+        pending.append(spec)
+
+    def _cp_hours() -> float:
+        root = [pool.process_id for pool in diagram.pools.values()][:1] or [diagram.process_id]
+        start_id = diagram.root_start_id if diagram.root_start_id in diagram.nodes else None
+        hours, _ = diagram._critical_path(root[0], start_id, {})
+        return float(hours)
+
+    def _keep_link(link_id: Optional[str], cp_before: float) -> bool:
+        if not link_id or not any(link.id == link_id for link in _refresh()):
+            return False
+        return abs(_cp_hours() - cp_before) <= 1e-6
+
+    for spec in pending:
+        if len(_refresh()) >= len(specs):
+            break
+        target_num = spec.get("target_num")
+        target = bound.get(int(target_num)) if target_num is not None else None
+        if target is None:
+            continue
+        source = bound.get(int(spec["source_num"])) if spec.get("source_num") is not None else None
+        reachable = _reachable_from(diagram, target.id)
+        picked = _pick_return_source(diagram, target, source, reachable)
+        if picked is None:
+            continue
+        cp_before = _cp_hours()
+        linked = diagram.add_link(picked.id, target.id, str(spec.get("label") or "Возврат"))
+        if _keep_link(linked, cp_before):
+            claimed.add(linked)
+            continue
+        if linked:
+            diagram.links = [link for link in diagram.links if link.id != linked]
+
+    def _forward_ok(cp_before: float) -> bool:
+        if abs(_cp_hours() - cp_before) > 1e-6:
+            return False
+        start_id = diagram.root_start_id if diagram.root_start_id in diagram.nodes else None
+        end_id = diagram.root_end_id if diagram.root_end_id in diagram.nodes else None
+        if start_id and end_id and end_id not in _reachable_from(diagram, start_id):
+            return False
+        return True
+
+    if len(_refresh()) > len(specs):
+        cp_before = _cp_hours()
+        for link in list(_refresh()):
+            if len(_refresh()) <= len(specs):
+                break
+            if link.id in claimed:
+                continue
+            saved = list(diagram.links)
+            diagram.links = [item for item in diagram.links if item.id != link.id]
+            if not _forward_ok(cp_before):
+                diagram.links = saved
 
 
 def _limit_escalation_actions(
@@ -1903,7 +2191,13 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
         ):
             j += 1
         run = blocks[i:j]
-        role = blocks[i].role
+        # Цель «вернуть на п.N» не прячем внутрь подпроцесса: иначе ребро садится на имя этапа.
+        while run and run[0].steps[0].num in targets:
+            merged.append(run.pop(0))
+        if not run:
+            i = j
+            continue
+        role = run[0].role
         ahead = 0
         if j < len(blocks) and blocks[j].kind == "decision" and blocks[j].role == role:
             ahead = 1
@@ -2207,6 +2501,18 @@ def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
     return engines
 
 
+def _reject_cloud_diagram(err: str, quality: Optional[Dict[str, Any]]) -> bool:
+    """Ответ облака не берём, если код не собрался, граф битый или возвратов меньше, чем фраз.
+
+    Нехватку рёбер чинит дорисовка в execute_generated_code. Если после неё фраз
+    всё ещё больше, схема не готова: целиком подменять её эмулятором нельзя.
+    """
+    if err:
+        return True
+    critical = [str(item) for item in ((quality or {}).get("critical") or [])]
+    return bool(critical)
+
+
 def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple[str, Dict[str, Any], str]:
     """Регламент (RU) → (bpmn_xml, audit_data, error).
 
@@ -2234,6 +2540,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
 
     trace: List[str] = []
     rejected: List[Dict[str, Any]] = []  # отклонённые ответы LLM — для разбора в «Технических деталях»
+    incomplete_model = ""
     if use_llm:
         max_attempts = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
         retry_limit_s = float(os.getenv("LLM_RETRY_MAX_CALL_S", "90"))
@@ -2254,7 +2561,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{engine_label}: {unit_note}")
                 xml, audit, err = execute_generated_code(raw, process_name, sla, regulation_text=text)
                 quality = audit.get("quality", {}) if not err else {}
-                if not err and quality.get("ok"):
+                if not _reject_cloud_diagram(err, quality):
                     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
                     audit["generation"] = {
                         "engine": engine_label,
@@ -2266,6 +2573,8 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                         "elapsed_s": round(time.time() - started, 2),
                     }
                     return xml, audit, ""
+                if _model_return_incomplete(err):
+                    incomplete_model = err
                 problems = [err] if err else quality["critical"]
                 if err and (
                     err == _UNRECOGNIZED_PROCESS
@@ -2284,6 +2593,9 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{engine_label}: повтор пропущен — модель отвечала дольше {retry_limit_s:.0f} с")
                     break
                 prompt = build_repair_prompt(text, _strip_markdown(raw), problems)
+
+    if incomplete_model:
+        return "", {}, incomplete_model
 
     try:
         code, info = emulate_generation(text)
@@ -5147,8 +5459,14 @@ def _cut_rework_loop(body: str) -> str:
         body,
         flags=re.I,
     )
-    return re.sub(
+    text = re.sub(
         r"«[^»]*(?:доработ|замечан|повторн)[^»]*»\s*[—–-]\s*(?:вернуть|возврат)\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+",
+        "иначе эскалация руководителю процесса",
+        text,
+        flags=re.I,
+    )
+    return re.sub(
+        r"(?:если|иначе|при)\b[^.]{0,80}\bназад\b",
         "иначе эскалация руководителю процесса",
         text,
         flags=re.I,

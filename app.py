@@ -61,6 +61,8 @@ ROOT = Path(__file__).resolve().parent
 EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
+USE_LLM_ON_OPEN = True
+GENERATION_BUSY_LABEL = "Генерация BPMN 2.0…"
 DIAGRAM_HEIGHT = 580  # ноутбук ~900 px: холст + карточки без бесконечной прокрутки
 DIAGRAM_HEIGHT_WIDE = 640
 VIEW_WIDE = "🖥  Широкий вид"
@@ -105,7 +107,7 @@ def read_asset(name: str) -> Optional[str]:
 
 
 def _reg_hash(text: str, *parts: object) -> str:
-    payload = "\u001f".join(["palette-corporate-v5", text or "", *[str(p) for p in parts]])
+    payload = "\u001f".join(["palette-corporate-v7", text or "", *[str(p) for p in parts]])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -126,14 +128,14 @@ def _audit_cache_slice(audit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False)
 def cached_generate_bpmn(text_hash: str, text: str, use_llm: bool) -> Tuple[str, Dict[str, Any], str]:
-    """Генерация XML + аудит по sha256 текста регламента. Повторный вызов — из кэша Streamlit."""
+    """Генерация XML + аудит. Кэш v7: не отдаёт прошлую схему с другим числом обратных рёбер."""
     _ = text_hash
     return generate_bpmn_from_text(text, use_llm=use_llm)
 
 
 @st.cache_data(show_spinner=False)
 def cached_optimize_to_be(text_hash: str, text: str, asis_core: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """To-Be по хешу регламента: вкладки и смена вида не пересчитывают граф."""
+    """To-Be по хешу регламента и числу рёбер этой сборки. Прошлый delta с другим числом петель не берётся."""
     _ = text_hash
     return optimize_process_to_be(text, asis_core)
 
@@ -244,6 +246,54 @@ div[data-testid="stDownloadButton"] button, .stDownloadButton > button {{
 .stButton > button[kind="primary"]:hover {{ filter:brightness(1.08); transform: translateY(-1px); }}
 .stDownloadButton > button {{ border:2px solid {BLUE}; color:{BLUE}; background:#fff; }}
 .stDownloadButton > button:hover {{ background:#E3F2FD; color:{BLUE_DARK}; border-color:{BLUE_DARK}; }}
+/* Ряд из четырёх выгрузок: паспорт и DOCX тем же видом, что BPMN и SVG. */
+.st-key-export_row [data-testid="stButton"],
+.st-key-export_row [data-testid="stDownloadButton"] {{
+  margin: 0 !important;
+}}
+.st-key-export_row .stButton > button,
+.st-key-export_row .stDownloadButton > button {{
+  width: 100% !important;
+  height: 40px !important;
+  min-height: 40px !important;
+  max-height: 40px !important;
+  box-sizing: border-box !important;
+  border: 2px solid {BLUE} !important;
+  border-radius: 12px !important;
+  color: {BLUE} !important;
+  background: #fff !important;
+  font-weight: 700 !important;
+  font-size: 0.82rem !important;
+  padding: 0 0.7rem !important;
+  box-shadow: none !important;
+  white-space: nowrap !important;
+  line-height: 1.1 !important;
+}}
+.st-key-export_row .stButton > button:hover,
+.st-key-export_row .stDownloadButton > button:hover {{
+  background: #E3F2FD !important;
+  color: {BLUE_DARK} !important;
+  border-color: {BLUE_DARK} !important;
+}}
+.st-key-export_row .stButton > button p,
+.st-key-export_row .stDownloadButton > button p,
+.st-key-export_row .stButton > button span,
+.st-key-export_row .stDownloadButton > button span {{
+  color: inherit !important;
+  font-weight: 700 !important;
+  font-size: 0.82rem !important;
+}}
+.st-key-export_row [data-testid="stIFrame"],
+.st-key-export_row [data-testid="stCustomComponentV1"] {{
+  height: 40px !important;
+  border: 0 !important;
+  background: transparent !important;
+}}
+.st-key-export_row iframe {{
+  height: 40px !important;
+  border: 0 !important;
+  background: transparent !important;
+}}
 textarea, [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {{
   font-size:.9rem !important; line-height:1.45 !important; border-radius:14px !important;
   transition: all 0.2s ease !important;
@@ -1368,7 +1418,7 @@ def render_methodology(audit: Dict[str, Any]) -> None:
         f'<div class="meth-score" style="background:linear-gradient(105deg,{color},{BLUE})">'
         f'<div class="k" style="opacity:.85;font-size:.75rem;letter-spacing:.5px">QUALITY SCORE</div>'
         f'<div class="v">{score}%</div>'
-        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">интегральная оценка модели</div></div>'
+        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">доля регламента без нарушений</div></div>'
     ]
     for chk in meth.get("checks") or []:
         passed = bool(chk.get("passed"))
@@ -1382,9 +1432,12 @@ def render_methodology(audit: Dict[str, Any]) -> None:
             f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
         )
     st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
+    for gap in meth.get("violations") or []:
+        if "явных возврата" in str(gap):
+            st.markdown(f'<div class="rec bad">{esc(gap)}</div>', unsafe_allow_html=True)
     with st.expander("Детали проверок нотации"):
         for chk in meth.get("checks") or []:
-            st.markdown(f"**{_meth_title(chk)}** — {chk.get('points')} / {chk.get('weight')} баллов. {chk.get('detail')}")
+            st.markdown(f"**{_meth_title(chk)}** — {chk.get('detail')}")
             for fnd in chk.get("findings") or []:
                 st.markdown(f"- {fnd}")
 
@@ -1610,6 +1663,13 @@ def _annotate_tobe_facts(
     return view
 
 
+def _delta_matches_edges(delta: Dict[str, Any], audit: Dict[str, Any]) -> bool:
+    """Delta этой сборки: число петель до оптимизации равно обратным рёбрам её аудита."""
+    edges = len((audit or {}).get("rework_loops") or [])
+    reported = (delta or {}).get("rework_before")
+    return reported is not None and int(reported) == edges
+
+
 def prepare_regulation(
     text: str,
     use_llm: bool = False,
@@ -1617,11 +1677,12 @@ def prepare_regulation(
 ) -> Dict[str, Any]:
     """Общий вход кнопки «Сгенерировать», быстрого старта первого примера и тестов.
 
-    As-Is и To-Be считаются одним проходом. Кандидат, который длиннее голого пути
-    или не снял циклы, не попадает в список шагов: остаётся предыдущий допустимый To-Be.
+    As-Is и To-Be считаются одним проходом. На экране только эта сборка:
+    прошлый To-Be не подмешивается, даже если текст регламента тот же.
     """
+    _ = previous
     xml, audit, error = cached_generate_bpmn(
-        _reg_hash(text or "", bool(use_llm)),
+        _reg_hash(text or "", bool(use_llm), "edges-v7"),
         text or "",
         bool(use_llm),
     )
@@ -1642,27 +1703,19 @@ def prepare_regulation(
         pack["facts"] = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
         return pack
     opt_text, delta = cached_optimize_to_be(
-        _reg_hash(text or "", _audit_cache_slice(audit)),
+        _reg_hash(text or "", _audit_cache_slice(audit), "edges-v7"),
         text or "",
         audit,
     )
     delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
+    if not _delta_matches_edges(delta, audit):
+        opt_text, delta = optimize_process_to_be(text or "", audit)
+        delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
     facts = process_facts(audit, delta)
     tobe_audit = dict(delta.get("tobe_audit") or {})
     tobe_xml = str(delta.get("tobe_xml") or "")
     accepted = _tobe_accepted(facts) and bool(tobe_xml)
     if not accepted:
-        prev = previous or {}
-        same_text = (prev.get("asis_text") or "") == (text or "")
-        if prev.get("tobe_ok") and prev.get("tobe_xml") and same_text:
-            pack["tobe_text"] = prev.get("tobe_text") or ""
-            pack["tobe_xml"] = prev.get("tobe_xml") or ""
-            pack["tobe_audit"] = prev.get("tobe_audit") or {}
-            pack["delta"] = prev.get("delta") or {}
-            pack["tobe_ok"] = True
-            facts = process_facts(audit, pack["delta"])
-            pack["facts"] = _annotate_tobe_facts(facts, audit, pack["tobe_audit"], show_steps=True)
-            return pack
         pack["delta"] = delta or {}
         pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
         return pack
@@ -1700,17 +1753,19 @@ def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None
     progress = st.progress(0, text="Запуск конвейера…") if show_progress else None
     if progress:
         progress.progress(45, text="Генерация BPMN 2.0…")
-    previous = st.session_state.get("tobe_pack")
-    pack = prepare_regulation(text, use_llm=bool(use_llm), previous=previous if isinstance(previous, dict) else None)
+    pack = prepare_regulation(text, use_llm=bool(use_llm))
     if progress:
         progress.progress(100, text="Аудит узких мест готов")
         progress.empty()
     _store_regulation_pack(pack)
+    st.session_state["gen_fingerprint"] = _reg_hash(text or "", bool(use_llm))
 
 
 def on_example_change() -> None:
     examples = load_examples()
     choice = st.session_state["example_choice"]
+    if choice == st.session_state.get("applied_example"):
+        return
     if choice in examples:
         st.session_state["reg_text"] = examples[choice]["text"]
         st.session_state["file_stem"] = examples[choice]["stem"]
@@ -1728,6 +1783,58 @@ def on_example_change() -> None:
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
+    st.session_state["applied_example"] = choice
+
+
+def _align_choice_text() -> None:
+    """Новый пример в сессии подставляет свой текст до отрисовки старой схемы."""
+    if st.session_state.get("example_choice") == st.session_state.get("applied_example"):
+        return
+    on_example_change()
+    st.session_state.pop("result", None)
+    st.session_state.pop("gen_fingerprint", None)
+
+
+def _page_is_live() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _generation_pending() -> bool:
+    """Нужна ли сборка. Сама генерация здесь не стартует: форма уже на экране."""
+    if not _page_is_live():
+        return False
+    if "use_llm" not in st.session_state:
+        st.session_state["use_llm"] = USE_LLM_ON_OPEN
+    text = st.session_state.get("reg_text") or ""
+    use_llm = bool(st.session_state.get("use_llm"))
+    if not text.strip():
+        st.session_state.pop("result", None)
+        st.session_state.pop("tobe_pack", None)
+        st.session_state.pop("gen_fingerprint", None)
+        return False
+    fingerprint = _reg_hash(text, use_llm)
+    ready = bool((st.session_state.get("result") or {}).get("xml"))
+    if st.session_state.get("gen_fingerprint") == fingerprint and ready:
+        return False
+    st.session_state.pop("result", None)
+    st.session_state.pop("tobe_pack", None)
+    return True
+
+
+def _sync_generation() -> None:
+    """После виджетов формы. Облачный вызов не стоит перед первой отрисовкой."""
+    if not _generation_pending():
+        return
+    text = st.session_state.get("reg_text") or ""
+    use_llm = bool(st.session_state.get("use_llm"))
+    with st.status(GENERATION_BUSY_LABEL, expanded=True) as gen_status:
+        run_generation(text, use_llm, show_progress=False)
+        gen_status.update(label="Схема готова", state="complete", expanded=False)
 
 
 def _read_txt_bytes(data: bytes) -> str:
@@ -1807,6 +1914,7 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state["file_stem"] = stem
     st.session_state["_keep_custom_text"] = True
     st.session_state["example_choice"] = CUSTOM_LABEL
+    st.session_state["applied_example"] = CUSTOM_LABEL
     st.session_state["upload_badge"] = {"name": name, "chars": len(text)}
     st.session_state["chat_messages"] = []
     st.session_state["chat_cleared_toast"] = True
@@ -1814,6 +1922,8 @@ def apply_uploaded_regulation(uploaded: Any) -> None:
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
+    st.session_state.pop("gen_fingerprint", None)
+    st.rerun()
 
 
 def _export_slot(token: str) -> Dict[str, Any]:
@@ -1849,53 +1959,55 @@ def render_downloads(key: str) -> None:
             slot[kind] = "" if kind == "md" else b""
         return slot[kind]
 
-    slots = st.columns(4, gap="small")
-    with slots[0]:
-        st.download_button(
-            "⬇️ BPMN 2.0",
-            data=(result["xml"] if ok else ""),
-            file_name=f"{stem}.bpmn",
-            mime="application/xml",
-            disabled=not ok,
-            key=f"dl_bpmn_{key}",
-            use_container_width=True,
-        )
-    with slots[1]:
-        if ok:
-            page = svg_export_html(result["xml"], f"{stem}.svg")
-            if hasattr(st, "iframe"):
-                st.iframe(page, height=44)
-            else:
-                components.html(page, height=44, scrolling=False)
-        else:
-            st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
-    def _lazy_file(col: Any, kind: str, label: str, file_name: str, mime: str) -> None:
-        with col:
-            if not ok:
-                st.button(label, disabled=True, key=f"dl_off_{kind}_{key}", use_container_width=True)
-                return
-            data = slot.get(kind)
-            if data is None and st.button(label, key=f"dl_build_{kind}_{key}", use_container_width=True):
-                data = _materialize(kind)
-            if not data:
-                return
+    with st.container(key="export_row"):
+        slots = st.columns(4, gap="small")
+        with slots[0]:
             st.download_button(
-                label,
-                data=data,
-                file_name=file_name,
-                mime=mime,
-                key=f"dl_save_{kind}_{key}",
+                "⬇️ BPMN 2.0",
+                data=(result["xml"] if ok else ""),
+                file_name=f"{stem}.bpmn",
+                mime="application/xml",
+                disabled=not ok,
+                key=f"dl_bpmn_{key}",
                 use_container_width=True,
             )
+        with slots[1]:
+            if ok:
+                page = svg_export_html(result["xml"], f"{stem}.svg")
+                if hasattr(st, "iframe"):
+                    st.iframe(page, height=40)
+                else:
+                    components.html(page, height=40, scrolling=False)
+            else:
+                st.button("⬇️ SVG вектор", disabled=True, key=f"dl_svg_{key}", use_container_width=True)
 
-    _lazy_file(slots[2], "md", "⬇️ Паспорт .md", f"{stem}_passport.md", "text/markdown")
-    _lazy_file(
-        slots[3],
-        "docx",
-        "⬇️ Регламент .docx",
-        f"{stem}_reglament.docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
+        def _lazy_file(col: Any, kind: str, label: str, file_name: str, mime: str) -> None:
+            with col:
+                if not ok:
+                    st.button(label, disabled=True, key=f"dl_off_{kind}_{key}", use_container_width=True)
+                    return
+                data = slot.get(kind)
+                if data is None and st.button(label, key=f"dl_build_{kind}_{key}", use_container_width=True):
+                    data = _materialize(kind)
+                if not data:
+                    return
+                st.download_button(
+                    label,
+                    data=data,
+                    file_name=file_name,
+                    mime=mime,
+                    key=f"dl_save_{kind}_{key}",
+                    use_container_width=True,
+                )
+
+        _lazy_file(slots[2], "md", "⬇️ Паспорт .md", f"{stem}_passport.md", "text/markdown")
+        _lazy_file(
+            slots[3],
+            "docx",
+            "⬇️ Регламент .docx",
+            f"{stem}_reglament.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
 
 def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
@@ -1910,15 +2022,18 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
     text = st.session_state.get("reg_text") or ""
     audit = result.get("audit") or {}
     if not audit.get("sla"):
-        pack = prepare_regulation(text, use_llm=False, previous=cached if isinstance(cached, dict) else None)
+        pack = prepare_regulation(text, use_llm=False)
         _store_regulation_pack(pack)
         return st.session_state.get("tobe_pack")
     opt_text, delta = cached_optimize_to_be(
-        _reg_hash(text, _audit_cache_slice(audit)),
+        _reg_hash(text, _audit_cache_slice(audit), "edges-v7"),
         text,
         audit,
     )
     delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
+    if not _delta_matches_edges(delta, audit):
+        opt_text, delta = optimize_process_to_be(text, audit)
+        delta = copy.deepcopy(delta) if isinstance(delta, dict) else {}
     facts = process_facts(audit, delta)
     tobe_xml = str((delta or {}).get("tobe_xml") or "")
     tobe_audit = dict((delta or {}).get("tobe_audit") or {})
@@ -1941,17 +2056,7 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
         pack["tobe_ok"] = True
         pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
     else:
-        prev = cached if isinstance(cached, dict) else {}
-        if prev.get("tobe_ok") and prev.get("tobe_xml") and (prev.get("asis_text") or "") == text:
-            pack["tobe_text"] = prev.get("tobe_text") or ""
-            pack["tobe_xml"] = prev.get("tobe_xml") or ""
-            pack["tobe_audit"] = prev.get("tobe_audit") or {}
-            pack["delta"] = prev.get("delta") or {}
-            pack["tobe_ok"] = True
-            kept = process_facts(audit, pack["delta"])
-            pack["facts"] = _annotate_tobe_facts(kept, audit, pack["tobe_audit"], show_steps=True)
-        else:
-            pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+        pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
     _store_regulation_pack(pack)
     return st.session_state.get("tobe_pack")
 
@@ -2193,11 +2298,13 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             height=220 if compact else 360,
         )
     with box_right:
+        if "use_llm" not in st.session_state:
+            st.session_state["use_llm"] = USE_LLM_ON_OPEN
         use_llm = st.checkbox(
             "Использовать LLM (Ollama / OpenAI), если доступна",
-            value=False,
-            help="По умолчанию выключено: первый пример при открытии страницы считает эмулятор. "
-            "Включите, чтобы кнопка генерации сходила в облако.",
+            key="use_llm",
+            help="При открытии страницы галочка включена. Снимите её, чтобы строить схему только эмулятором. "
+            "Смена галочки или текста регламента пересчитывает схему.",
         )
         # Имена секретов — только если ключа нет (диагностика настройки), иначе строка для жюри лишняя.
         secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
@@ -2207,7 +2314,11 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             if not st.session_state["reg_text"].strip():
                 st.warning("Введите текст регламента.")
             else:
-                run_generation(st.session_state["reg_text"], use_llm)
+                # Одна и та же анимация с галочкой LLM и без неё: видна, пока схема не готова.
+                with st.status(GENERATION_BUSY_LABEL, expanded=True) as gen_status:
+                    run_generation(st.session_state["reg_text"], use_llm)
+                    gen_status.update(label="Схема готова", state="complete", expanded=False)
+        _sync_generation()
 
         result = st.session_state.get("result")
         if result and not result["error"]:
@@ -2220,8 +2331,6 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
                 note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
             elif gen.get("attempts", 1) > 1:
                 note = f" · исправлено со {gen['attempts']}-й попытки"
-            if st.session_state.get("quickstart"):
-                note += " · режим быстрого старта"
             xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
             st.markdown(
                 f'<div class="engine">Движок: <b>{esc(engine)}</b> · {elapsed} с{xsd}{note}</div>',
@@ -2262,22 +2371,29 @@ def _sync_canvas_from_query() -> None:
         st.session_state["canvas_variant"] = ASIS_LABEL
 
 
+def engine_badge_text(engine: str, fallback: bool = False) -> str:
+    """Имя модели, которая собрала схему. Эмулятор не подписывается чужим облаком."""
+    if fallback:
+        return "Эмулятор"
+    label = (engine or "").strip()
+    low = label.lower()
+    if not label or low == "semantic-emulator":
+        return "Эмулятор"
+    if low.startswith("ollama"):
+        model = label.split(":", 1)[1].strip() if ":" in label else ""
+        return f"Ollama {model}".strip()
+    if ":" in label:
+        return label.split(":", 1)[1].strip() or label
+    return label
+
+
 def _hero_engine_badge() -> str:
-    """Бейдж шапки: Online только если последняя успешная схема реально от облака."""
+    """Бейдж шапки: модель облака только если эта схема им собрана."""
     result = st.session_state.get("result") or {}
     if result.get("error") or not result.get("xml"):
         return "Эмулятор"
-    engine = str(((result.get("audit") or {}).get("generation") or {}).get("engine") or "")
-    low = engine.lower()
-    if not engine or low == "semantic-emulator":
-        return "Эмулятор"
-    if low.startswith("ollama"):
-        return "Ollama"
-    if "gpt-oss-120b" in low or "groq" in low:
-        return "🟢 Groq 120B Online"
-    if low.startswith("openai") or low.startswith("fallback"):
-        return "🟢 Online"
-    return engine
+    gen = (result.get("audit") or {}).get("generation") or {}
+    return engine_badge_text(str(gen.get("engine") or ""), bool(gen.get("fallback")))
 
 
 def _hero_html() -> str:
@@ -2378,6 +2494,9 @@ def _send_assistant(prompt: str) -> None:
     if new_text and new_xml and new_audit:
         st.session_state["reg_text"] = new_text
         st.session_state["result"] = {"xml": new_xml, "audit": new_audit, "error": ""}
+        st.session_state["gen_fingerprint"] = _reg_hash(
+            new_text, bool(st.session_state.get("use_llm", USE_LLM_ON_OPEN))
+        )
         st.session_state["diagram_updated_by_assistant"] = True
         st.session_state["file_stem"] = st.session_state.get("file_stem") or "custom_process"
         st.session_state.pop("inspector_cache", None)
@@ -2437,22 +2556,10 @@ def main() -> None:
         st.session_state["example_choice"] = first
         st.session_state["reg_text"] = examples[first]["text"] if labels else ""
         st.session_state["file_stem"] = examples[first]["stem"] if labels else "custom_process"
-    first_text = examples[labels[0]]["text"] if labels else ""
-    on_first = bool(first_text) and st.session_state.get("reg_text") == first_text
-    stored_engine = str(
-        (((st.session_state.get("result") or {}).get("audit") or {}).get("generation") or {}).get("engine") or ""
-    )
-    pack_now = st.session_state.get("tobe_pack") or {}
-    need_emulator = on_first and (
-        "result" not in st.session_state
-        or not pack_now.get("facts")
-        or (st.session_state.get("quickstart") and stored_engine not in ("", "semantic-emulator"))
-    )
-    if need_emulator and st.session_state["reg_text"].strip():
-        with st.spinner("Готовим эталонный пример…"):
-            # Эталон при открытии — эмулятором: галочка LLM не подменяет первую схему.
-            run_generation(st.session_state["reg_text"], use_llm=False, show_progress=False)
-            st.session_state["quickstart"] = True
+        st.session_state["applied_example"] = first
+    if "use_llm" not in st.session_state:
+        st.session_state["use_llm"] = USE_LLM_ON_OPEN
+    _align_choice_text()
 
     st.markdown(_hero_html(), unsafe_allow_html=True)
     view = st.radio(

@@ -101,6 +101,35 @@ def main() -> None:
     assert opened["tobe_ok"] and opened_facts.get("show_steps")
     opened_ppe = next(s for s in parse_regulation(opened["asis_text"]).steps if s.num == 12)
     assert opened_ppe.title == ppe.title and opened_ppe.role == "Ремонтная бригада"
+    stale_one = {
+        "asis_text": text,
+        "tobe_ok": True,
+        "tobe_xml": "<bpmn:definitions stale='1'/>",
+        "tobe_text": "старый to-be",
+        "tobe_audit": {"rework_loops": [{"from": "a", "to": "b"}]},
+        "delta": {
+            "rework_before": 1,
+            "rework_after": 0,
+            "rework_removed": 1,
+            "actions": [{
+                "kind": "zero_rework",
+                "detail": "Шаг 99 «старый цикл»: цикл заменён эскалацией на исключительной ветке.",
+            }],
+        },
+    }
+    second = bpmn_app.prepare_regulation(text, use_llm=False, previous=stale_one)
+    second_edges = len(second["audit"]["rework_loops"])
+    assert second_edges == 2, second_edges
+    assert int(second["facts"]["loops_before"]) == second_edges
+    assert int(second["facts"]["loops_after"]) == 0
+    assert int(second["delta"]["rework_before"]) == second_edges
+    assert second.get("tobe_xml") != stale_one["tobe_xml"]
+    second_lines = [
+        a for a in (second["delta"].get("actions") or [])
+        if "цикл заменён эскалацией" in str(a.get("detail") or "")
+    ]
+    assert len(second_lines) == second_edges, second_lines
+    assert all("Шаг 99" not in str(a.get("detail") or "") for a in second_lines)
 
     matrix = generate_raci_matrix(parsed.steps, parsed.roles)
     assert matrix, "пустая матрица RACI"
@@ -433,6 +462,77 @@ DIAGRAM.add_link(f, ROOT_END_TASK_ID)
     assert not err_bare, err_bare
     assert audit_bare["methodology"]["long_chains"], audit_bare["methodology"]
     assert audit_bare["methodology"]["score"] < 100
+    bare_violations = audit_bare["methodology"]["violations"]
+    assert any("Диспетчер" in item for item in bare_violations), bare_violations
+    assert audit_chain["methodology"]["score"] > audit_bare["methodology"]["score"]
+
+    wide = """
+pool_id, lanes = DIAGRAM.add_pool(
+    ROOT_PROCESS_ID,
+    ["Диспетчер", "Начальник смены", "Служба безопасности", "Ремонтная бригада"],
+)
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+titles = [
+    "Принять заявку диспетчера",
+    "Проверить комплект документов",
+    "Осмотреть площадку работ",
+    "Подготовить инструмент бригады",
+    "Зафиксировать запись в журнале",
+    "Согласовать объём работ",
+    "Проверить допуск персонала",
+    "Собрать комплект инструмента",
+    "Передать смену диспетчеру",
+    "Утвердить наряд смены",
+    "Закрыть допуск персонала",
+    "Выполнить ремонт оборудования",
+]
+nodes = [DIAGRAM.add_user_task(title, lanes[i % 4]) for i, title in enumerate(titles)]
+gw = DIAGRAM.add_exclusive_gateway("Комплект полный?", lanes[1])
+DIAGRAM.add_link(ROOT_START_TASK_ID, nodes[0])
+prev = nodes[0]
+for node in nodes[1:6]:
+    DIAGRAM.add_link(prev, node)
+    prev = node
+DIAGRAM.add_link(prev, gw)
+DIAGRAM.add_link(gw, nodes[6], "Да")
+DIAGRAM.add_link(gw, ROOT_END_TASK_ID, "Нет")
+prev = nodes[6]
+for node in nodes[7:]:
+    DIAGRAM.add_link(prev, node)
+    prev = node
+DIAGRAM.add_link(prev, ROOT_END_TASK_ID)
+"""
+    _, audit_wide, err_wide = execute_generated_code(wide, "Двенадцать ролей")
+    assert not err_wide, err_wide
+    assert audit_wide["methodology"]["score"] == 100, audit_wide["methodology"]["violations"]
+    assert not audit_wide["methodology"]["long_chains"]
+
+    inner = """
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+sp = DIAGRAM.create_subprocess("Провести диагностику оборудования", lanes[0])
+prev = DIAGRAM.nodes[sp].inner_start_id
+for title in (
+    "Принять заявку диспетчера",
+    "Зафиксировать запись в журнале",
+    "Сверить оперативную схему",
+    "Подготовить бланк переключений",
+    "Передать смену диспетчеру",
+    "Закрыть оперативную заявку",
+):
+    step = DIAGRAM.add_user_task(title, sp)
+    DIAGRAM.add_link(prev, step)
+    prev = step
+DIAGRAM.add_link(prev, DIAGRAM.nodes[sp].inner_end_id)
+DIAGRAM.add_link(ROOT_START_TASK_ID, sp)
+DIAGRAM.add_link(sp, ROOT_END_TASK_ID)
+"""
+    _, audit_inner, err_inner = execute_generated_code(inner, "Цепочка внутри подпроцесса")
+    assert not err_inner, err_inner
+    assert audit_inner["methodology"]["score"] < 100
+    assert any("Диспетчер" in item for item in audit_inner["methodology"]["violations"])
 
     from ai_generator import _explicit_return_count
 
@@ -466,6 +566,83 @@ DIAGRAM.add_link(f, ROOT_END_TASK_ID)
     assert loops_two == 2, loops_two
     assert loops_one == 1, loops_one
     assert loops_zero == 0, loops_zero
+
+    one_pn = (
+        "Регламент: Одно вернуть\n"
+        "1. Диспетчер принимает заявку (10 минут).\n"
+        "2. Начальник смены проверяет комплект (20 минут). "
+        "Если комплект полный — перейти к п.3, иначе «замечания» — вернуть на п.1.\n"
+        "3. Служба закрывает заявку (15 минут).\n"
+    )
+    two_pn = (
+        "Регламент: Два вернуть\n"
+        "1. Диспетчер принимает заявку (10 минут).\n"
+        "2. Диспетчер фиксирует журнал (10 минут).\n"
+        "3. Диспетчер сверяет схему (10 минут).\n"
+        "4. Диспетчер готовит бланк (10 минут).\n"
+        "5. Диспетчер передаёт смену (10 минут). Если смена не принята — вернуть на п.2.\n"
+        "6. Диспетчер закрывает заявку (10 минут). Если есть замечания — вернуть на п.4.\n"
+    )
+    zero_pn = (
+        "Регламент: Ни вернуть ни назад\n"
+        "1. Диспетчер принимает заявку (10 минут).\n"
+        "2. Начальник смены проверяет комплект (20 минут).\n"
+        "3. Служба закрывает заявку (15 минут).\n"
+    )
+    _, audit_one_pn, err_one_pn = generate_bpmn_from_text(one_pn, use_llm=False)
+    _, audit_two_pn, err_two_pn = generate_bpmn_from_text(two_pn, use_llm=False)
+    _, audit_zero_pn, err_zero_pn = generate_bpmn_from_text(zero_pn, use_llm=False)
+    assert not err_one_pn and not err_two_pn and not err_zero_pn
+    edges_one = len(audit_one_pn["rework_loops"])
+    edges_two = len(audit_two_pn["rework_loops"])
+    edges_zero = len(audit_zero_pn["rework_loops"])
+    assert edges_one == 1, edges_one
+    assert edges_two == 2, audit_two_pn["rework_loops"]
+    assert edges_zero == 0, edges_zero
+
+    def _escalation_lines(delta: dict) -> list:
+        return [
+            a for a in (delta.get("actions") or [])
+            if "цикл заменён эскалацией" in str(a.get("detail") or "")
+        ]
+
+    _, delta_one_pn = optimize_process_to_be(one_pn, audit_one_pn)
+    _, delta_two_pn = optimize_process_to_be(two_pn, audit_two_pn)
+    _, delta_zero_pn = optimize_process_to_be(zero_pn, audit_zero_pn)
+    lines_one = len(_escalation_lines(delta_one_pn))
+    lines_two = len(_escalation_lines(delta_two_pn))
+    lines_zero = len(_escalation_lines(delta_zero_pn))
+    assert lines_one == edges_one == int(delta_one_pn.get("rework_removed") or 0), delta_one_pn.get("actions")
+    assert lines_two == edges_two == int(delta_two_pn.get("rework_removed") or 0), delta_two_pn.get("actions")
+    assert lines_zero == edges_zero == int(delta_zero_pn.get("rework_removed") or 0)
+    parsed_two = parse_regulation(two_pn)
+    blocks_two, _ = _build_blocks(parsed_two)
+    for step in parsed_two.steps:
+        if not step.decision:
+            continue
+        host = next(b for b in blocks_two if any(item.num == step.num for item in b.steps))
+        assert host.kind == "decision", (step.num, host.kind, [item.num for item in host.steps])
+    named = parse_regulation(
+        "Регламент: Имя шага\n"
+        "1. Ремонтная бригада проводит визуальный осмотр ячейки "
+        "(этап «Комплексная диагностика повреждений») (10 минут).\n"
+        "2. Диспетчер закрывает заявку (15 минут).\n"
+    )
+    assert named.steps[0].title == "Провести визуальный осмотр ячейки", named.steps[0].title
+    assert named.steps[0].stage == "Комплексная диагностика повреждений"
+    assert any("визуальный осмотр" in item["to"] for item in audit["rework_loops"])
+    assert bpmn_app.GENERATION_BUSY_LABEL == "Генерация BPMN 2.0…"
+    from ai_generator import build_prompt, _code_for_sandbox
+
+    emu_code, _ = emulate_generation(text)
+    assert "_complete_return_edges" not in emu_code
+    assert "_complete_return_edges" not in build_prompt(text)
+    poison = emu_code + "\n_complete_return_edges(DIAGRAM)\n"
+    assert "_complete_return_edges" not in _code_for_sandbox(poison)
+    _, audit_poison, err_poison = execute_generated_code(poison, regulation_text=text)
+    assert not err_poison, err_poison
+    assert "NameError" not in err_poison
+    assert len(audit_poison["rework_loops"]) == 2
     assert _explicit_return_count(two_returns) == loops_two
     assert _explicit_return_count(one_return) == loops_one
     assert _explicit_return_count(no_return) == loops_zero
@@ -497,9 +674,51 @@ DIAGRAM.add_link(a, b)
 DIAGRAM.add_link(b, ROOT_END_TASK_ID)
 """
     _, audit_gap, err_gap = execute_generated_code(linear, "Дыра возврата", regulation_text=one_return)
-    assert not err_gap, err_gap
-    assert audit_gap["quality"]["ok"] is False
-    assert any("явных возврата" in item for item in audit_gap["quality"]["critical"])
+    assert audit_gap == {}
+    assert "Схема не готова" in err_gap and "явных возврата" in err_gap, err_gap
+
+    from ai_generator import _reject_cloud_diagram, process_facts
+
+    assert bpmn_app.USE_LLM_ON_OPEN is True
+    assert bpmn_app.engine_badge_text("semantic-emulator") == "Эмулятор"
+    assert bpmn_app.engine_badge_text("openai:openai/gpt-oss-120b", fallback=True) == "Эмулятор"
+    assert "groq" not in bpmn_app.engine_badge_text("semantic-emulator").lower()
+    assert bpmn_app.engine_badge_text("openai:openai/gpt-oss-120b") == "openai/gpt-oss-120b"
+    assert _reject_cloud_diagram("таймаут", {}) is True
+    assert _reject_cloud_diagram("", {"critical": ["Тупик «Шаг»"]}) is True
+    gap_only = {"critical": ["В регламенте 2 явных возврата, в графе обратных рёбер 1."]}
+    assert _reject_cloud_diagram("", gap_only) is True
+    assert _reject_cloud_diagram("", {"critical": ["Тупик «Шаг»", gap_only["critical"][0]]}) is True
+
+    one_edge = """
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер", "Начальник смены"])
+DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
+DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
+a = DIAGRAM.add_user_task("Принять заявку диспетчера", lanes[0])
+b = DIAGRAM.add_user_task("Проверить комплект документов", lanes[1])
+g = DIAGRAM.add_exclusive_gateway("Комплект полный?", lanes[1])
+DIAGRAM.add_link(ROOT_START_TASK_ID, a)
+DIAGRAM.add_link(a, b)
+DIAGRAM.add_link(b, g)
+DIAGRAM.add_link(g, ROOT_END_TASK_ID, "Да")
+DIAGRAM.add_link(g, a, "Вернуть")
+"""
+    _, audit_miss, err_miss = execute_generated_code(one_edge, "Одно ребро при двух возвратах", regulation_text=two_returns)
+    assert not err_miss, err_miss
+    assert len(audit_miss["rework_loops"]) == 2, audit_miss["rework_loops"]
+    assert not any("явных возврата" in item for item in (audit_miss["quality"].get("critical") or []))
+    assert _reject_cloud_diagram("", audit_miss["quality"]) is False
+    facts_miss = process_facts(audit_miss, None)
+    assert facts_miss["loops_before"] == 2
+    assert facts_miss["rw_before"] == round(float(audit_miss["sla"]["with_rework_hours"]), 1)
+    _, delta_miss = optimize_process_to_be(two_returns, audit_miss)
+    assert int(delta_miss.get("rework_before") or 0) == 2
+    removed_miss = int(delta_miss.get("rework_before") or 0) - int(delta_miss.get("rework_after") or 0)
+    escal_miss = [
+        a for a in (delta_miss.get("actions") or [])
+        if "цикл заменён эскалацией" in str(a.get("detail") or "")
+    ]
+    assert len(escal_miss) == removed_miss, (len(escal_miss), removed_miss, escal_miss)
 
     sla_code = """
 pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
@@ -557,6 +776,18 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
         f"proc_q={q_before}→{q_after}",
         f"returns={loops_two}/{loops_one}/{loops_zero}",
         f"example1_loops={said}→0",
+        f"q6={audit_bare['methodology']['score']}",
+        f"q6cut={audit_chain['methodology']['score']}",
+        f"q12={audit_wide['methodology']['score']}",
+        f"example1_q={audit['methodology']['score']}→{delta.get('quality_after')}",
+        f"example1_violations={audit['methodology'].get('violations')}",
+        f"llm_on_open={bpmn_app.USE_LLM_ON_OPEN}",
+        f"badge_offline={bpmn_app.engine_badge_text('semantic-emulator')}",
+        f"edges_pn={edges_one}/{edges_two}/{edges_zero}",
+        f"lines_pn={lines_one}/{lines_two}/{lines_zero}",
+        f"ps_edges={len(audit['rework_loops'])}",
+        f"ps_lines={len(escalations)}",
+        f"second_run={second_edges}",
     )
 
 
