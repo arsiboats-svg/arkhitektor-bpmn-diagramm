@@ -12,7 +12,9 @@
 Публичный API:
     generate_bpmn_from_text(regulation_text) -> (bpmn_xml, audit_data, error)
     execute_generated_code(code_str)         -> (bpmn_xml, audit_data, error)
-    assistant_chat(...)                      -> диалог (аналитика / правка / реверс)
+    assistant_chat(...)                      -> диалог сайдбара (аналитика / правка / реверс)
+    process_facts(audit, tobe_delta)         -> общие цифры SLA/циклов/bus-factor/To-Be
+    canvas_copilot_reply(...)                -> локальный ответ плавающего копайлота (без XML)
     generate_process_passport(xml, audit, text) -> Markdown «Паспорт процесса»
     inspect_task_details(task_name, task_role, process_context) -> операционная карточка
     build_diagram_catalog(xml, audit, text) -> метаданные узлов для клика по холсту
@@ -31,14 +33,17 @@ from __future__ import annotations
 
 import ast
 import builtins
+from collections import defaultdict
 import io
 import json
 import os
 import re
+import signal
+import threading
 import time
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 from validate_bpmn import xsd_errors_xml
@@ -156,6 +161,10 @@ class UnsafeCodeError(ValueError):
     """Сгенерированный код нарушает правила песочницы."""
 
 
+class _DiagramExecTimeout(BaseException):
+    """Таймаут exec. BaseException, чтобы except Exception внутри кода его не съел."""
+
+
 def _strip_markdown(code: str) -> str:
     fenced = re.findall(r"```(?:python|py)?\s*\n(.*?)```", code, flags=re.S | re.I)
     if fenced:
@@ -242,17 +251,34 @@ def _insert_missing_gateways(diagram: BPMNDiagramBuilder) -> List[str]:
     return actions
 
 
-# Ошибки, при которых ответ модели отклоняется (остальные — предупреждения).
-# «Шлюз ничего не разветвляет» — лишь предупреждение: так бывает, когда ветка из подпроцесса
-# переадресована движком на сам подпроцесс; схема при этом корректна.
-_CRITICAL_MARKERS = ("ветвление без шлюза", "без входа", "Несуществующие")
+def _quality_report(
+    structure_issues: List[str],
+    audit: Dict[str, Any],
+    diagram: Optional[BPMNDiagramBuilder] = None,
+) -> Dict[str, Any]:
+    """Отчёт по графу после heal. Журнал лечения («без входа», «Тупик») отказ не вызывает.
 
-
-def _quality_report(structure_issues: List[str], audit: Dict[str, Any]) -> Dict[str, Any]:
+    Критично только то, что осталось в графе: нет старта или конца, тупик, узел без входа.
+    Битый XML отсекается отдельно, проверкой XSD.
+    """
     issues = list(structure_issues)
-    issues += [h for h in audit.get("auto_healed", []) if "без входа" in h or "Тупик" in h]
     issues += [f"Связь пропущена: {s['reason']}" for s in audit.get("skipped_links", [])]
-    critical = [i for i in issues if any(m in i for m in _CRITICAL_MARKERS)]
+    critical: List[str] = []
+    nodes = list(diagram.nodes.values()) if diagram is not None else []
+    if diagram is not None:
+        if not any(n.kind == "startEvent" for n in nodes):
+            critical.append("В графе нет стартового события")
+        if not any(n.kind == "endEvent" for n in nodes):
+            critical.append("В графе нет конечного события")
+    for item in audit.get("dead_ends") or []:
+        msg = item.get("message") if isinstance(item, dict) else str(item)
+        if msg:
+            critical.append(str(msg))
+    for oid in audit.get("orphans_without_incoming") or []:
+        name = str(oid)
+        if diagram is not None and oid in diagram.nodes:
+            name = diagram.nodes[oid].name or name
+        critical.append(f"Узел «{name}» без входящего потока")
     return {"issues": issues, "critical": critical, "ok": not critical}
 
 
@@ -294,12 +320,11 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
         return 0
     applied = 0
     used_nodes: set = set()
-    used_steps: set = set()
 
     def _free(node: Any) -> bool:
         return node.id not in used_nodes and _sla_looks_default(node)
 
-    for idx, step in enumerate(steps):
+    for step in steps:
         title = step.title or ""
         best, score = None, 0
         for node in work:
@@ -311,15 +336,29 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
         if best is not None and score >= 1:
             best.sla_hours = float(step.hours)
             used_nodes.add(best.id)
-            used_steps.add(idx)
             applied += 1
 
-    leftover_nodes = [n for n in work if _free(n)]
-    leftover_steps = [s for i, s in enumerate(steps) if i not in used_steps]
-    for step, node in zip(leftover_steps, leftover_nodes):
-        node.sla_hours = float(step.hours)
-        applied += 1
     return applied
+
+
+def _run_diagram_exec(code: Any, namespace: Dict[str, Any]) -> None:
+    """Исполняет код DIAGRAM. На главном потоке обрывает зависший цикл по таймеру."""
+    timeout = float(os.getenv("DIAGRAM_EXEC_TIMEOUT", "12"))
+
+    def _handle(signum: int, frame: Any) -> None:
+        raise _DiagramExecTimeout(f"дольше {timeout:g} с")
+
+    on_main = threading.current_thread() is threading.main_thread()
+    if timeout <= 0 or not on_main or not hasattr(signal, "setitimer"):
+        exec(code, namespace)  # noqa: S102 — песочница: AST-фильтр + whitelist builtins
+        return
+    old = signal.signal(signal.SIGALRM, _handle)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        exec(code, namespace)  # noqa: S102 — песочница: AST-фильтр + whitelist builtins
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
 
 def execute_generated_code(
@@ -333,7 +372,7 @@ def execute_generated_code(
     Любые исключения перехватываются: при ошибке возвращается ("", {}, "описание").
     """
     try:
-        code = _strip_markdown(code_str or "")
+        code = _code_for_sandbox(_strip_markdown(code_str or ""))
         if len(code.strip()) < 10:
             return "", {}, "Пустой код: модель не вернула инструкций для DIAGRAM."
         try:
@@ -360,7 +399,10 @@ def execute_generated_code(
             "ROOT_START_TASK_ID": ROOT_START_TASK_ID,
             "ROOT_END_TASK_ID": ROOT_END_TASK_ID,
         }
-        exec(compile(tree, "<generated>", "exec"), namespace)  # noqa: S102 — песочница: AST-фильтр + whitelist builtins
+        try:
+            _run_diagram_exec(compile(tree, "<generated>", "exec"), namespace)
+        except _DiagramExecTimeout as exc:
+            return "", {}, f"Исполнение кода прервано по таймауту: {exc}"
 
         work_nodes = [n for n in diagram.nodes.values() if n.kind not in ("startEvent", "endEvent")]
         if len(work_nodes) < 2:
@@ -369,10 +411,15 @@ def execute_generated_code(
         sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
         diagram.healed.extend(_insert_missing_gateways(diagram))
         diagram.heal_graph()
+        _complete_return_edges(diagram, regulation_text)
         structure_issues = _structure_issues(diagram)
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
-        audit["quality"] = _quality_report(structure_issues, audit)
+        audit["quality"] = _quality_report(structure_issues, audit, diagram)
+        expected_returns = _explicit_return_count(regulation_text)
+        actual_returns = len(audit.get("rework_loops") or [])
+        if expected_returns > actual_returns:
+            return "", {}, _return_diagram_not_ready(expected_returns, actual_returns)
         if sla_enriched:
             audit["sla_enriched_nodes"] = sla_enriched
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
@@ -548,6 +595,11 @@ _DUR_RE = re.compile(
 _REF_RE = re.compile(r"(?:п(?:ункт\w*|\.|п\.)?|шаг\w*)\s*(\d+)", re.I)
 _END_KW = re.compile(r"завершить|завершается|завершение процесса|прекрат|закрыть\s+(?:заявку|процесс|закупку)", re.I)
 _BACK_KW = re.compile(r"верну|возврат|возвраща|доработ|повтор|заново|перенос\s+срок", re.I)
+_EXPLICIT_RETURN_RE = re.compile(
+    r"верну\w*|возврат\w*|возвраща\w*|на\s+доработк\w*|\bповторно\b|при\s+замечаниях",
+    re.I,
+)
+_NAZAD_RETURN_RE = re.compile(r"(?:если|иначе|при)\b[^.]{0,80}\bназад\b", re.I)
 _CASE_RE = re.compile(r"\b(?:если|в случае(?:\s+если)?)\b", re.I)
 _RETURN_RE = re.compile(
     r"(?:возвраща\w+|верну\w+|направляется\s+на\s+доработ|на\s+доработк|перенос\s+срок)",
@@ -650,6 +702,30 @@ def _promote_lettered_parallels(text: str) -> str:
         s = raw.strip()
         num_m = re.match(r"^(\d+)[.)]\s+(.*)$", s)
         if not num_m:
+            if _PAR_WORD_RE.search(s) and _is_parallel_fork_intro(s):
+                kids: List[str] = []
+                j = i + 1
+                skipped_blank = 0
+                while j < len(raw_lines):
+                    stripped = raw_lines[j].strip()
+                    if not stripped:
+                        skipped_blank += 1
+                        j += 1
+                        continue
+                    lb = _letter_line_body(stripped)
+                    if lb is None:
+                        j -= skipped_blank
+                        break
+                    kids.append(lb)
+                    skipped_blank = 0
+                    j += 1
+                if len(kids) >= 2:
+                    for k, kid in enumerate(kids):
+                        mark = "Параллельно*: " if k == 0 else "Параллельно: "
+                        let = _CYR_SUB_LETTERS[k] if k < len(_CYR_SUB_LETTERS) else _LAT_SUB_LETTERS[min(k, 25)]
+                        out.append(f"{let}) {mark}{kid}")
+                    i = j
+                    continue
             out.append(raw)
             i += 1
             continue
@@ -839,7 +915,10 @@ def _merge_homogeneous(parts: List[str]) -> List[str]:
 
 
 def _atomize_step_body(text: str) -> List[str]:
-    """Смысловые шаги: ; / после чего / затем / смена роли. Не дробит «если» и однородные «и»."""
+    """Смысловые шаги: ; / после чего / затем / смена роли. Не дробит «если» и однородные «и».
+
+    Несколько длительностей в одном абзаце остаются на своих предложениях и не суммируются.
+    """
     t = re.sub(r"\s+", " ", (text or "").strip())
     if not t:
         return []
@@ -847,11 +926,26 @@ def _atomize_step_body(text: str) -> List[str]:
         return [t]
     if _CASE_RE.search(t):
         return [t]
+    owned = _split_owned_durations(t)
+    if owned:
+        return owned
     parts: List[str] = []
     for seq in _split_seq_conjunctions(t):
         parts.extend(_split_role_handoff(seq))
     merged = _merge_homogeneous(parts)
     return [p for p in merged if len(p.strip()) > 8] or [t]
+
+
+def _split_owned_durations(text: str) -> Optional[List[str]]:
+    """«(5 минут). … (30 мин).» → два шага. Чужой срок в этот шаг не входит."""
+    parts = [p.strip(" ;") for p in _SENTENCE_SPLIT_RE.split(text or "") if len(p.strip(" ;")) > 8]
+    if len(parts) < 2:
+        return None
+    if any(_CASE_RE.search(p) or _RETURN_RE.search(p) for p in parts[1:]):
+        return None
+    if sum(1 for p in parts if _DUR_RE.search(p)) < 2:
+        return None
+    return parts
 
 
 def _atomize_numbered_lines(text: str) -> str:
@@ -912,6 +1006,8 @@ def _segment_unnumbered_prose(text: str) -> str:
     src = (text or "").strip()
     if not src or _count_explicit_numbers(src) >= 2:
         return src
+    if re.search(r"(?m)^[а-яёa-z]\)\s+", src, re.I):
+        return src
     headers: List[str] = []
     body: List[str] = []
     for line in src.splitlines():
@@ -955,6 +1051,155 @@ def _segment_unnumbered_prose(text: str) -> str:
     return "\n".join([*headers, *numbered]).strip()
 
 
+_WML = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _docx_style_numbering(zf: Any) -> Dict[str, Tuple[str, str]]:
+    """styleId → (numId, ilvl). Автонумерация часто висит на стиле, а не на абзаце."""
+    direct: Dict[str, Tuple[str, str]] = {}
+    based: Dict[str, str] = {}
+    if "word/styles.xml" not in zf.namelist():
+        return direct
+    root = _ET.fromstring(zf.read("word/styles.xml"))
+    for style in root.findall(f"{_WML}style"):
+        sid = style.get(f"{_WML}styleId") or ""
+        based_el = style.find(f"{_WML}basedOn")
+        if based_el is not None and based_el.get(f"{_WML}val"):
+            based[sid] = based_el.get(f"{_WML}val") or ""
+        p_pr = style.find(f"{_WML}pPr")
+        num_pr = p_pr.find(f"{_WML}numPr") if p_pr is not None else None
+        if num_pr is None:
+            continue
+        num_id_el = num_pr.find(f"{_WML}numId")
+        if num_id_el is None or not num_id_el.get(f"{_WML}val"):
+            continue
+        ilvl_el = num_pr.find(f"{_WML}ilvl")
+        direct[sid] = (
+            num_id_el.get(f"{_WML}val") or "",
+            (ilvl_el.get(f"{_WML}val") if ilvl_el is not None else None) or "0",
+        )
+
+    resolved: Dict[str, Tuple[str, str]] = {}
+
+    def walk(sid: str, seen: Tuple[str, ...]) -> Optional[Tuple[str, str]]:
+        if sid in resolved:
+            return resolved[sid]
+        if sid in direct:
+            resolved[sid] = direct[sid]
+            return direct[sid]
+        parent = based.get(sid)
+        if not parent or parent in seen:
+            return None
+        found = walk(parent, seen + (sid,))
+        if found:
+            resolved[sid] = found
+        return found
+
+    for sid in set(direct) | set(based):
+        walk(sid, ())
+    return resolved
+
+
+def _docx_numbering_maps(
+    data: bytes,
+) -> Tuple[Dict[str, str], Dict[Tuple[str, str], Tuple[int, str]], Dict[str, Tuple[str, str]]]:
+    """numId → abstractNumId, (abstract, ilvl) → (start, fmt), styleId → (numId, ilvl)."""
+    import zipfile
+
+    num_to_abs: Dict[str, str] = {}
+    levels: Dict[Tuple[str, str], Tuple[int, str]] = {}
+    styles: Dict[str, Tuple[str, str]] = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            styles = _docx_style_numbering(zf)
+            if "word/numbering.xml" not in zf.namelist():
+                return num_to_abs, levels, styles
+            root = _ET.fromstring(zf.read("word/numbering.xml"))
+    except Exception:  # noqa: BLE001
+        return num_to_abs, levels, styles
+    for abstract in root.findall(f"{_WML}abstractNum"):
+        aid = abstract.get(f"{_WML}abstractNumId") or ""
+        for lvl in abstract.findall(f"{_WML}lvl"):
+            ilvl = lvl.get(f"{_WML}ilvl") or "0"
+            start_el = lvl.find(f"{_WML}start")
+            fmt_el = lvl.find(f"{_WML}numFmt")
+            start = int(start_el.get(f"{_WML}val") or "1") if start_el is not None else 1
+            fmt = (fmt_el.get(f"{_WML}val") if fmt_el is not None else None) or "decimal"
+            levels[(aid, ilvl)] = (start, fmt)
+    for num in root.findall(f"{_WML}num"):
+        nid = num.get(f"{_WML}numId") or ""
+        abs_el = num.find(f"{_WML}abstractNumId")
+        if nid and abs_el is not None:
+            num_to_abs[nid] = abs_el.get(f"{_WML}val") or ""
+    return num_to_abs, levels, styles
+
+
+def _docx_num_pr(paragraph: Any, styles: Dict[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    p_pr = getattr(paragraph._p, "pPr", None)
+    if p_pr is not None and p_pr.numPr is not None:
+        num_pr = p_pr.numPr
+        num_id = num_pr.numId.val if num_pr.numId is not None else None
+        if num_id is not None and str(num_id) != "0":
+            ilvl = num_pr.ilvl.val if num_pr.ilvl is not None and num_pr.ilvl.val is not None else 0
+            return str(num_id), str(ilvl)
+    style = getattr(paragraph, "style", None)
+    sid = getattr(style, "style_id", None) if style is not None else None
+    found = styles.get(sid or "")
+    if found and found[0] != "0":
+        return found
+    return None
+
+
+def _docx_next_label(
+    num_id: str,
+    ilvl: str,
+    counters: Dict[Tuple[str, str], int],
+    num_to_abs: Dict[str, str],
+    levels: Dict[Tuple[str, str], Tuple[int, str]],
+) -> str:
+    key = (num_id, ilvl)
+    for deeper in [k for k in counters if k[0] == num_id and int(k[1]) > int(ilvl)]:
+        counters.pop(deeper, None)
+    start, _fmt = levels.get((num_to_abs.get(num_id, ""), ilvl), (1, "decimal"))
+    if key not in counters:
+        counters[key] = start
+    else:
+        counters[key] += 1
+    return f"{counters[key]}. "
+
+
+def read_docx_regulation(data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """Текст .docx. Автонумерация Word не лежит в абзаце — номер берётся из numbering и пишется перед пунктом."""
+    try:
+        from docx import Document  # type: ignore[import-untyped]
+    except ImportError:
+        return None, "Для чтения .docx установите пакет: `pip install python-docx>=1.0.0`"
+    try:
+        doc = Document(io.BytesIO(data))
+        num_to_abs, levels, styles = _docx_numbering_maps(data)
+        counters: Dict[Tuple[str, str], int] = {}
+        parts: List[str] = []
+        for paragraph in doc.paragraphs:
+            raw = (paragraph.text or "").strip()
+            if not raw:
+                continue
+            num = _docx_num_pr(paragraph, styles)
+            if num and not re.match(r"^\d+[.)]\s+", raw):
+                raw = _docx_next_label(num[0], num[1], counters, num_to_abs, levels) + raw
+            parts.append(raw)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        text = "\n".join(parts).strip()
+        if not text:
+            return None, "В файле .docx не найден текстовый слой (пустые абзацы и таблицы)."
+        return text, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Не удалось прочитать .docx: {type(exc).__name__}: {exc}"
+
+
 def normalize_regulation(text: str) -> str:
     """Чистит текст, скопированный из PDF/Word, до вида «шаг на строке».
 
@@ -982,8 +1227,10 @@ def normalize_regulation(text: str) -> str:
         text = _MULTI_NUM_RE.sub(lambda m: mapping[m.group(1)] + ". " if m.group(1) in mapping else m.group(0), text)
         for num in sorted(mapping, key=len, reverse=True):
             text = re.sub(r"(?<![\d.])" + re.escape(num) + r"(?![\d])", mapping[num], text)
+    text = _promote_lettered_parallels(text)
+    text = _expand_corporate_numbering(text)
     text = _segment_unnumbered_prose(text)
-    return _atomize_numbered_lines(_expand_corporate_numbering(_promote_lettered_parallels(text)))
+    return _atomize_numbered_lines(text)
 
 
 def _to_hours(value: str, unit: str) -> float:
@@ -1086,6 +1333,10 @@ def _match_inverted_role(text: str) -> Optional[Tuple[str, str, str]]:
     action = src[: m.start()].strip(" .,;:—–-")
     tail = src[m.end() :].strip()
     if not action or not tail or len(action.split()) > 12:
+        return None
+    # «Ремонтная бригада готовит СИЗ» — обычный порядок, не инверсия.
+    # Иначе объект «СИЗ» становится дорожкой, а бригада — названием задачи.
+    if any((mm := rx.search(action)) and mm.start() <= 1 for rx, _ in _ROLE_RE):
         return None
     head = action.split()[0].lower().strip("«»\"'")
     if any(rx.search(head) for rx, _ in _ROLE_RE):
@@ -1272,6 +1523,7 @@ class Step:
     hours: Optional[float] = None
     system: bool = False
     decision: Optional[Decision] = None
+    back_ref: Optional[int] = None  # «на п.N» без развилки: одно ребро, шаг остаётся обычным
     action: bool = True  # есть ли собственное действие перед шлюзом
     artifacts: List[str] = field(default_factory=list)  # документы шага: наряд-допуск, акт, договор…
     systems: List[str] = field(default_factory=list)  # ИТ-системы шага: АСУ ТП, CRM, 1С…
@@ -1309,13 +1561,31 @@ def _derive_no_label(clause: str) -> str:
     return "Иначе"
 
 
+def _explicit_alternative(src: str) -> Optional[re.Match]:
+    """«либо … либо» и «или … или/иначе» — развилка. Одиночное «или» шлюзом не становится."""
+    for word in ("либо", "или"):
+        m = re.search(rf"\b{word}\b", src or "", re.I)
+        if not m:
+            continue
+        rest = src[m.end():]
+        if re.search(rf"\b(?:{word}|иначе|в противном случае)\b", rest, re.I):
+            return m
+    return None
+
+
 def _parse_decision(text: str) -> Tuple[str, Optional[Decision]]:
     src = text or ""
     m = _CASE_RE.search(src)
+    if m is None:
+        m = _explicit_alternative(src)
     if m:
         action = src[: m.start()].strip(" .;,—–-")
         rest = src[m.end():]
-        else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае)\b[,:]?", rest, re.I)
+        opener = m.group(0).lower()
+        if opener in ("либо", "или"):
+            else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае|либо|или)\b[,:]?", rest, re.I)
+        else:
+            else_m = re.search(r"[,;.]?\s*\b(?:иначе|в противном случае)\b[,:]?", rest, re.I)
         yes_part = rest[: else_m.start()] if else_m else rest
         no_part = rest[else_m.end():] if else_m else ""
         pieces = re.split(r"\s+[—–-]\s+|,\s+|:\s+", yes_part.strip(), maxsplit=1)
@@ -1369,20 +1639,388 @@ def _parse_decision(text: str) -> Tuple[str, Optional[Decision]]:
             decision.no_ref = int(no_ref_m.group(1))
         return action, decision
 
-    rm = _RETURN_RE.search(src)
-    if rm and _BACK_KW.search(src):
-        action = src[: rm.start()].strip(" .;,—–-")
-        clause = src[rm.start():]
-        ref_m = _REF_RE.search(clause)
-        decision = Decision(
-            yes_label="Замечаний нет",
-            no_label=_derive_no_label(clause),
-            no_ref=int(ref_m.group(1)) if ref_m else None,
-            no_back=True,
-            back_clause=clause,
-        )
-        return action, decision
     return src, None
+
+
+def _has_explicit_return(text: str) -> bool:
+    """Одно обратное ребро: «на п.N» при глаголе возврата или «иначе … назад».
+
+    Голые «возвращает», «вернуть» и «возврат» без номера пункта — обычный шаг, не цикл.
+    """
+    src = text or ""
+    if _NAZAD_RETURN_RE.search(src):
+        return True
+    return bool(_EXPLICIT_RETURN_RE.search(src) and _REF_RE.search(src))
+
+
+def _bare_return_ref(text: str) -> Optional[int]:
+    """«Вернуть на п.N» без «если»: номер цели. Развилку это не создаёт."""
+    src = text or ""
+    if _CASE_RE.search(src) or _NAZAD_RETURN_RE.search(src):
+        return None
+    if not (_EXPLICIT_RETURN_RE.search(src) and _REF_RE.search(src)):
+        return None
+    ref = _REF_RE.search(src)
+    return int(ref.group(1)) if ref else None
+
+
+def _decision_points_back(decision: Optional[Decision], step_num: int) -> bool:
+    if decision is None:
+        return False
+    if decision.no_back:
+        return True
+    if decision.no_ref is not None and decision.no_ref < step_num:
+        return True
+    if decision.yes_ref is not None and decision.yes_ref < step_num:
+        return True
+    return False
+
+
+def _ensure_return_decision(text: str, decision: Optional[Decision], step_num: int) -> Optional[Decision]:
+    """«Если … назад» дополняет уже найденную развилку. Голый глагол возврата шаг не превращает."""
+    if not _has_explicit_return(text) or _decision_points_back(decision, step_num):
+        return decision
+    if decision is None:
+        return None
+    decision.no_back = True
+    if not decision.back_clause:
+        decision.back_clause = text
+    if not decision.no_label or decision.no_label == "Иначе":
+        decision.no_label = "На доработку"
+    return decision
+
+
+def _numbered_chunks(text: str) -> List[str]:
+    raw = normalize_regulation(text or "")
+    chunks: List[str] = []
+    current = ""
+    for line in raw.splitlines():
+        if re.match(r"^\s*\d+[.)]\s+\S", line):
+            if current:
+                chunks.append(current)
+            current = line
+        elif current:
+            current = f"{current} {line.strip()}"
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _code_for_sandbox(code: str) -> str:
+    """В exec попадает только код DIAGRAM. Дорисовка возвратов вызывается снаружи."""
+    if "_complete_return_edges" not in (code or ""):
+        return code or ""
+    kept = [line for line in (code or "").splitlines() if "_complete_return_edges" not in line]
+    return "\n".join(kept)
+
+
+def _explicit_return_count(text: str) -> int:
+    """Сколько пунктов регламента содержат явный возврат. Каждый такой пункт — одно ребро."""
+    chunks = _numbered_chunks(text)
+    if not chunks and _has_explicit_return(normalize_regulation(text or "")):
+        return 1
+    return sum(1 for chunk in chunks if _has_explicit_return(chunk))
+
+
+def _return_diagram_not_ready(expected: int, actual: int) -> str:
+    """После дорисовки рёбер всё ещё меньше, чем фраз: схему не отдаём как готовую."""
+    return (
+        f"Схема не готова: в регламенте {expected} явных возврата, "
+        f"в графе обратных рёбер {actual}."
+    )
+
+
+def _model_return_incomplete(err: str) -> bool:
+    """Дыра возврата в уже собранной схеме модели. Эмулятор вместо неё не подставляем."""
+    return "Схема не готова" in (err or "") and "явных возврата" in (err or "")
+
+
+def _return_phrase_specs(text: str) -> List[Dict[str, Any]]:
+    """Каждая фраза «вернуть на п.N» или «иначе … назад» — источник, цель и подпись ветки."""
+    raw = normalize_regulation(text or "")
+    if not raw.strip() or _explicit_return_count(raw) <= 0:
+        return []
+    try:
+        parsed = parse_regulation(raw)
+    except Exception:  # noqa: BLE001
+        return []
+    by_num = {step.num: step for step in parsed.steps}
+
+    def _step_for(chunk: str, num: Optional[int]) -> Any:
+        if num is not None and num in by_num:
+            return by_num[num]
+        best, score = None, 0
+        for step in parsed.steps:
+            got = _sla_title_score(step.title or "", chunk)
+            if got > score:
+                best, score = step, got
+        return best if score >= 2 else None
+
+    specs: List[Dict[str, Any]] = []
+    chunks = _numbered_chunks(raw)
+    if not chunks and _has_explicit_return(raw):
+        chunks = [raw]
+    for chunk in chunks:
+        if not _has_explicit_return(chunk):
+            continue
+        num_m = re.match(r"\s*(\d+)", chunk)
+        num = int(num_m.group(1)) if num_m else None
+        step = _step_for(chunk, num)
+        target_num: Optional[int] = None
+        label = "Возврат"
+        if step and step.decision:
+            decision = step.decision
+            if decision.no_ref is not None and (decision.no_back or decision.no_ref < step.num):
+                target_num = decision.no_ref
+            elif decision.yes_ref is not None and decision.yes_ref < step.num:
+                target_num = decision.yes_ref
+            label = (decision.no_label or label)[:40]
+        if target_num is None and step is not None and step.back_ref and step.back_ref < step.num:
+            target_num = step.back_ref
+            label = "Возврат"
+        if target_num is None:
+            ref_m = _REF_RE.search(chunk)
+            if ref_m and step and int(ref_m.group(1)) < step.num:
+                target_num = int(ref_m.group(1))
+        target = by_num.get(target_num) if target_num is not None else None
+        specs.append(
+            {
+                "source_num": step.num if step else num,
+                "target_num": target.num if target else target_num,
+                "label": label or "Возврат",
+                "source_title": (step.title if step else "") or "",
+                "target_title": (target.title if target else "") or "",
+            }
+        )
+    return specs
+
+
+def _bind_step_nodes(diagram: BPMNDiagramBuilder, titles: Dict[int, str]) -> Dict[int, Any]:
+    """Шаг регламента → задача с именем из глагола, не контейнер подпроцесса."""
+    task_kinds = WORK_KINDS | {"manualTask", "serviceTask", "sendTask", "receiveTask", "businessRuleTask"}
+    work = [node for node in diagram.nodes.values() if node.kind in task_kinds]
+    scored: List[Tuple[int, int, str]] = []
+    for num, title in titles.items():
+        if not title:
+            continue
+        for node in work:
+            score = _sla_title_score(title, node.name or "")
+            if score >= 2:
+                scored.append((score, num, node.id))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    used_steps: set = set()
+    used_nodes: set = set()
+    bound: Dict[int, Any] = {}
+    for _score, num, node_id in scored:
+        if num in used_steps or node_id in used_nodes:
+            continue
+        bound[num] = diagram.nodes[node_id]
+        used_steps.add(num)
+        used_nodes.add(node_id)
+    return bound
+
+
+def _reachable_from(diagram: BPMNDiagramBuilder, start_id: str) -> set:
+    seen: set = set()
+    stack = [start_id]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for link in diagram.links:
+            if link.source_id == current and link.target_id not in seen:
+                stack.append(link.target_id)
+    seen.discard(start_id)
+    return seen
+
+
+def _owner_holds(diagram: BPMNDiagramBuilder, node_id: str, owner_id: str) -> bool:
+    node = diagram.nodes.get(node_id)
+    seen: set = set()
+    while node and node.owner_id and node.owner_id not in seen:
+        if node.owner_id == owner_id:
+            return True
+        seen.add(node.owner_id)
+        node = diagram.nodes.get(node.owner_id)
+    return False
+
+
+def _back_link_list(diagram: BPMNDiagramBuilder) -> List[Any]:
+    found: List[Any] = []
+    owners = [pool.process_id for pool in diagram.pools.values()][:1] or [diagram.process_id]
+    owners += [node.id for node in diagram.nodes.values() if node.kind == "subProcess"]
+    for owner in owners:
+        nodes = diagram._children(owner)
+        if not nodes:
+            continue
+        start_id = diagram._scope_start_end(owner)[0]
+        back = diagram._back_links(nodes, start_id)
+        ids = {node.id for node in nodes}
+        for link in diagram._scope_links(ids):
+            if link.id in back:
+                found.append(link)
+    return found
+
+
+def _gateway_after(diagram: BPMNDiagramBuilder, node: Any) -> Any:
+    outs = [link for link in diagram.links if link.source_id == node.id]
+    if len(outs) != 1:
+        return node
+    nxt = diagram.nodes.get(outs[0].target_id)
+    if nxt and nxt.kind in ("exclusiveGateway", "inclusiveGateway") and nxt.owner_id == node.owner_id:
+        return nxt
+    return node
+
+
+def _pick_return_source(diagram: BPMNDiagramBuilder, target: Any, source: Optional[Any], reachable: set) -> Optional[Any]:
+    """Узел того же процесса, из которого ребро на цель замыкает цикл."""
+    task_kinds = WORK_KINDS | {"manualTask", "serviceTask", "sendTask", "receiveTask", "businessRuleTask"}
+
+    def usable(node: Any) -> bool:
+        if node is None or node.id == target.id or node.id not in reachable:
+            return False
+        if node.owner_id != target.owner_id or node.kind in ("startEvent", "endEvent", "subProcess", "parallelGateway"):
+            return False
+        return not any(link.source_id == node.id and link.target_id == target.id for link in diagram.links)
+
+    ordered: List[Any] = []
+    if source is not None:
+        gate = _gateway_after(diagram, source)
+        ordered.append(gate)
+        if gate is not source:
+            ordered.append(source)
+    ordered.extend(
+        node for node in diagram.nodes.values()
+        if node.kind in ("exclusiveGateway", "inclusiveGateway")
+    )
+    ordered.extend(node for node in diagram.nodes.values() if node.kind in task_kinds)
+    for node in ordered:
+        if usable(node):
+            return node
+    return None
+
+
+def _complete_return_edges(diagram: BPMNDiagramBuilder, regulation_text: str) -> None:
+    """Недостающие явные возвраты дорисовываются в эту же схему, до analyze_bottlenecks.
+
+    Цель ребра — задача с глаголом, в том числе внутри подпроцесса.
+    Чужой граф эмулятора сюда не подставляется.
+    """
+    specs = _return_phrase_specs(regulation_text)
+    if not specs:
+        return
+    titles: Dict[int, str] = {}
+    for spec in specs:
+        if spec.get("source_num") is not None and spec.get("source_title"):
+            titles[int(spec["source_num"])] = str(spec["source_title"])
+        if spec.get("target_num") is not None and spec.get("target_title"):
+            titles[int(spec["target_num"])] = str(spec["target_title"])
+    bound = _bind_step_nodes(diagram, titles)
+    claimed: set = set()
+
+    def _refresh() -> List[Any]:
+        return _back_link_list(diagram)
+
+    back = _refresh()
+
+    def _covers(link: Any, target: Any, title: str) -> bool:
+        node = diagram.nodes.get(link.target_id)
+        if node is None:
+            return False
+        if target is not None and link.target_id == target.id:
+            return True
+        if title and node.kind != "subProcess" and _sla_title_score(title, node.name or "") >= 2:
+            return True
+        if target is not None and _owner_holds(diagram, target.id, link.target_id):
+            return True
+        if target is not None and node.kind in GATEWAY_KINDS:
+            return any(item.source_id == node.id and item.target_id == target.id for item in diagram.links)
+        return False
+
+    pending: List[Dict[str, Any]] = []
+    for spec in specs:
+        target_num = spec.get("target_num")
+        target = bound.get(int(target_num)) if target_num is not None else None
+        title = str(spec.get("target_title") or "")
+        hit = next((link for link in back if link.id not in claimed and _covers(link, target, title)), None)
+        if hit is not None:
+            claimed.add(hit.id)
+            continue
+        pending.append(spec)
+
+    def _cp_hours() -> float:
+        root = [pool.process_id for pool in diagram.pools.values()][:1] or [diagram.process_id]
+        start_id = diagram.root_start_id if diagram.root_start_id in diagram.nodes else None
+        hours, _ = diagram._critical_path(root[0], start_id, {})
+        return float(hours)
+
+    def _keep_link(link_id: Optional[str], cp_before: float) -> bool:
+        if not link_id or not any(link.id == link_id for link in _refresh()):
+            return False
+        return abs(_cp_hours() - cp_before) <= 1e-6
+
+    for spec in pending:
+        if len(_refresh()) >= len(specs):
+            break
+        target_num = spec.get("target_num")
+        target = bound.get(int(target_num)) if target_num is not None else None
+        if target is None:
+            continue
+        source = bound.get(int(spec["source_num"])) if spec.get("source_num") is not None else None
+        reachable = _reachable_from(diagram, target.id)
+        picked = _pick_return_source(diagram, target, source, reachable)
+        if picked is None:
+            continue
+        cp_before = _cp_hours()
+        linked = diagram.add_link(picked.id, target.id, str(spec.get("label") or "Возврат"))
+        if _keep_link(linked, cp_before):
+            claimed.add(linked)
+            continue
+        if linked:
+            diagram.links = [link for link in diagram.links if link.id != linked]
+
+    def _forward_ok(cp_before: float) -> bool:
+        if abs(_cp_hours() - cp_before) > 1e-6:
+            return False
+        start_id = diagram.root_start_id if diagram.root_start_id in diagram.nodes else None
+        end_id = diagram.root_end_id if diagram.root_end_id in diagram.nodes else None
+        if start_id and end_id and end_id not in _reachable_from(diagram, start_id):
+            return False
+        return True
+
+    if len(_refresh()) > len(specs):
+        cp_before = _cp_hours()
+        for link in list(_refresh()):
+            if len(_refresh()) <= len(specs):
+                break
+            if link.id in claimed:
+                continue
+            saved = list(diagram.links)
+            diagram.links = [item for item in diagram.links if item.id != link.id]
+            if not _forward_ok(cp_before):
+                diagram.links = saved
+
+
+def _limit_escalation_actions(
+    actions: List[Dict[str, str]],
+    asis_audit: Optional[dict],
+    tobe_audit: Optional[dict],
+) -> List[Dict[str, str]]:
+    """«Цикл заменён эскалацией» только для ребра, которое было в As-Is и снято в To-Be."""
+    before = len((asis_audit or {}).get("rework_loops") or [])
+    after = len((tobe_audit or {}).get("rework_loops") or [])
+    removed = max(0, before - after)
+    kept: List[Dict[str, str]] = []
+    used = 0
+    for act in actions or []:
+        detail = str(act.get("detail") or "")
+        if re.search(r"цикл заменён эскалацией|петля возврата снята", detail, re.I):
+            if used >= removed:
+                continue
+            used += 1
+        kept.append(act)
+    return kept
 
 
 def _resolve_implicit_returns(steps: List[Step]) -> None:
@@ -1512,8 +2150,16 @@ def parse_regulation(text: str) -> ParsedRegulation:
             t = (t[: dm.start()] + " " + t[dm.end():]).strip()
         t = _INTRO_CLAUSE_RE.sub("", t).strip(" .;,:—–-")
         t = _CONNECTORS_RE.sub("", t).strip(" .;,:—–-")
+        bare_ref = _bare_return_ref(t)
+        if bare_ref is not None:
+            # Номер пункта — ребро, не часть названия и не имя этапа.
+            t = _REF_RE.sub(" ", t)
+            t = re.sub(r"\bна\s+(?=\s|$)", " ", t)
+            t = re.sub(r"\s+", " ", t).strip(" .;,:—–-")
         action, decision = _parse_decision(t)
-        step.decision = decision
+        step.decision = _ensure_return_decision(t, decision, step.num)
+        if step.decision is None:
+            step.back_ref = bare_ref
         step.action = bool(action)
         source = action if action else t
         joint = _split_joint_role(source)
@@ -1558,6 +2204,7 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
     steps = parsed.steps
     targets = {s.decision.yes_ref for s in steps if s.decision and s.decision.yes_ref}
     targets |= {s.decision.no_ref for s in steps if s.decision and s.decision.no_ref}
+    targets |= {s.back_ref for s in steps if s.back_ref}
 
     blocks: List[Block] = []
     for step in steps:
@@ -1578,6 +2225,34 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
         if block.kind == "parallel" and len(block.steps) < 2:
             block.kind = "step"
 
+    # Явная граница «(этап «…»)» на соседних шагах — тот же подпроцесс, даже если шагов меньше пяти.
+    staged: List[Block] = []
+    i = 0
+    while i < len(blocks):
+        stage = blocks[i].steps[0].stage if blocks[i].kind == "step" and blocks[i].steps else None
+        if not stage:
+            staged.append(blocks[i])
+            i += 1
+            continue
+        j = i + 1
+        while (
+            j < len(blocks)
+            and blocks[j].kind == "step"
+            and blocks[j].steps
+            and blocks[j].steps[0].stage == stage
+            and blocks[j].role == blocks[i].role
+        ):
+            j += 1
+        run = blocks[i:j]
+        while run and run[0].steps[0].num in targets:
+            staged.append(run.pop(0))
+        if len(run) >= 2:
+            staged.append(Block("subprocess", [b.steps[0] for b in run], name=stage))
+        else:
+            staged.extend(run)
+        i = j
+    blocks = staged
+
     merged: List[Block] = []
     i = 0
     while i < len(blocks):
@@ -1594,17 +2269,11 @@ def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]
         ):
             j += 1
         run = blocks[i:j]
-        if len(run) > 3:  # строго больше 3 действий подразделения → подпроцесс
-            pieces = 1 if len(run) <= 7 else -(-len(run) // 5)
-            size = -(-len(run) // pieces)
-            for k in range(0, len(run), size):
-                chunk = run[k:k + size]
-                chunk_steps = [b.steps[0] for b in chunk]
-                stage = next((s.stage for s in chunk_steps if s.stage), None)
-                name = stage or f"{chunk[0].role}: {chunk_steps[0].title[:38].rstrip('…')}"
-                merged.append(Block("subprocess", chunk_steps, name=name))
-        else:
-            merged.extend(run)
+        # Цель «вернуть на п.N» не прячем внутрь подпроцесса: иначе ребро садится на имя этапа.
+        # Шлюз серию не режет и кусок из-за него в подпроцесс не кладём: шаг остаётся отдельным.
+        while run and run[0].steps[0].num in targets:
+            merged.append(run.pop(0))
+        merged.extend(run)
         i = j
 
     number_to_block: Dict[int, int] = {}
@@ -1886,12 +2555,25 @@ def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
     return engines
 
 
+def _reject_cloud_diagram(err: str, quality: Optional[Dict[str, Any]]) -> bool:
+    """Ответ облака не берём, если код не собрался, граф битый или возвратов меньше, чем фраз.
+
+    Нехватку рёбер чинит дорисовка в execute_generated_code. Если после неё фраз
+    всё ещё больше, схема не готова: целиком подменять её эмулятором нельзя.
+    """
+    if err:
+        return True
+    critical = [str(item) for item in ((quality or {}).get("critical") or [])]
+    return bool(critical)
+
+
 def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple[str, Dict[str, Any], str]:
     """Регламент (RU) → (bpmn_xml, audit_data, error).
 
     Порядок: облачный API (если задан OPENAI_API_KEY) → локальная Ollama (qwen2.5-coder / llama3) →
     встроенный семантический эмулятор. Исключения сети наружу не выходят.
-    Ответ модели с ошибками структуры (висящие узлы, ветвление без шлюза) отклоняется;
+    Ответ модели отклоняется по графу после heal (нет старта/конца, тупик или дыра) или по XSD,
+    не по тексту журнала лечения. Нет ключа, ошибка сети или пустой ответ — эмулятор.
     модель получает список ошибок и одну попытку исправиться (LLM_MAX_ATTEMPTS).
     """
     started = time.time()
@@ -1912,6 +2594,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
 
     trace: List[str] = []
     rejected: List[Dict[str, Any]] = []  # отклонённые ответы LLM — для разбора в «Технических деталях»
+    incomplete_model = ""
     if use_llm:
         max_attempts = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
         retry_limit_s = float(os.getenv("LLM_RETRY_MAX_CALL_S", "90"))
@@ -1932,7 +2615,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{engine_label}: {unit_note}")
                 xml, audit, err = execute_generated_code(raw, process_name, sla, regulation_text=text)
                 quality = audit.get("quality", {}) if not err else {}
-                if not err and quality.get("ok"):
+                if not _reject_cloud_diagram(err, quality):
                     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
                     audit["generation"] = {
                         "engine": engine_label,
@@ -1944,6 +2627,8 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                         "elapsed_s": round(time.time() - started, 2),
                     }
                     return xml, audit, ""
+                if _model_return_incomplete(err):
+                    incomplete_model = err
                 problems = [err] if err else quality["critical"]
                 if err and (
                     err == _UNRECOGNIZED_PROCESS
@@ -1962,6 +2647,9 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     trace.append(f"{engine_label}: повтор пропущен — модель отвечала дольше {retry_limit_s:.0f} с")
                     break
                 prompt = build_repair_prompt(text, _strip_markdown(raw), problems)
+
+    if incomplete_model:
+        return "", {}, incomplete_model
 
     try:
         code, info = emulate_generation(text)
@@ -2007,18 +2695,12 @@ _GATE_TAGS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway", "eventB
 
 CHAT_SYSTEM = """Ты — «AI-Ассистент Бизнес-Архитектора» ПАО «Интер РАО». Собеседник — эксперт Дирекции бизнес-архитектуры.
 Правила:
-- Отвечай по-русски, по делу, не более 12 строк, Markdown. Опирайся ТОЛЬКО на данные процесса ниже; числа и названия не выдумывай.
-- Причины и рекомендации подкрепляй конкретными шагами, ролями и цифрами из данных (срок, доля нагрузки, циклы возврата).
-- Если в данных есть блок «СРАВНЕНИЕ AS-IS / TO-BE», на вопросы «сравни», «as-is / to-be», «до и после»
-  отвечай цифрами: дельта SLA (часы и %), петли возврата до/после, замена журналов на scriptTask, Quality Score.
-- На «как сократили / за счёт чего / объясни подробнее» дай декомпозицию экономии To-Be:
-  1) петли доработки (часы циклов до/после), 2) параллелизация с номерами шагов, 3) автоматизация journal→scriptTask.
-- На «почему Quality Score / упал балл нотации»: если 100% — стандарты соблюдены полностью; если был перепад —
-  объясни, что добавлены AND-шлюзы и входной контроль, а правило «глагол + объект» сохранено. Это НЕ ответ про «метро Токио».
-- Не начинай каждый ответ одной и той же заглушкой «N шагов / M узлов». Отвечай на заданный вопрос.
-- Если предлагаешь изменить процесс, заверши ответ ГОТОВОЙ командой в кавычках «…», которую пользователь может отправить
-  в чат, например: «Сделай шаги 4 и 5 параллельными» или «Добавь согласование с экологами после шага 3».
-- Если данных для ответа нет — так и скажи.
+- Отвечай по-русски, не более 10 строк. Сначала вывод с цифрой из блока ФАКТЫ, затем шаги и роли, в конце одна команда в «ёлочках», если уместна правка.
+- Часы, проценты и число циклов бери ТОЛЬКО из ФАКТОВ. Не выдумывай числа.
+- На SLA / As-Is/To-Be / циклы / bus-factor: цифры только из ФАКТОВ. «Без ускорения» — только если не укоротились ни голый путь, ни путь с возвратами.
+- На «сравни as-is / to-be»: путь с возвратами, циклы N → M, голый КП.
+- Предлог «со» перед творительным на с, з, ж, ш, щ («со службой экологии», не «с службой»).
+- Не начинай с заглушки «N шагов / M узлов». Если данных нет — так и скажи.
 
 ДАННЫЕ АКТИВНОГО ПРОЦЕССА:
 """
@@ -2107,6 +2789,70 @@ def _fh(hours: float) -> str:
     return f"{hours:.0f} ч (≈ {hours / 8:.0f} раб. дн.)"
 
 
+def process_facts(audit: Optional[Dict[str, Any]] = None, tobe_delta: Optional[dict] = None) -> Dict[str, Any]:
+    """Единый набор цифр для копайлота и сайдбара: КП, срок с возвратами, циклы, bus-factor, To-Be."""
+    data = audit or {}
+    sla = data.get("sla") or {}
+    bus = data.get("bus_factor") or {}
+    loops = list(data.get("rework_loops") or [])
+    delta = tobe_delta if isinstance(tobe_delta, dict) else {}
+    if not delta:
+        cmp = data.get("tobe_compare")
+        delta = cmp if isinstance(cmp, dict) else {}
+
+    cp = float(sla.get("critical_path_hours") or 0)
+    rw = float(sla.get("with_rework_hours") or cp)
+    cp_b = delta.get("sla_before_hours")
+    cp_a = delta.get("sla_after_hours")
+    rw_b = delta.get("with_rework_before")
+    rw_a = delta.get("with_rework_after")
+    lb = delta.get("rework_before")
+    la = delta.get("rework_after")
+    tobe_ready = cp_a is not None or rw_a is not None or lb is not None
+
+    cp_before = round(float(cp_b if cp_b is not None else cp), 1)
+    rw_before = round(float(rw_b if rw_b is not None else rw), 1)
+    loops_before = int(lb if lb is not None else len(loops))
+    cp_after = round(float(cp_a), 1) if cp_a is not None else (round(cp_before, 1) if tobe_ready else None)
+    rw_after = round(float(rw_a), 1) if rw_a is not None else (round(rw_before, 1) if tobe_ready else None)
+    loops_after = int(la) if la is not None else (0 if tobe_ready else None)
+
+    rw_saved = round(rw_before - float(rw_after or 0), 1) if tobe_ready else 0.0
+    cp_ok = cp_after is None or float(cp_after) <= float(cp_before) + 0.05
+    speedup = bool(tobe_ready and rw_saved > 0 and cp_ok)
+    return {
+        "critical_path_hours": round(cp, 1),
+        "with_rework_hours": round(rw, 1),
+        "rework_loops_n": len(loops),
+        "rework_loops": loops,
+        "critical_path": list(data.get("critical_path") or []),
+        "lane_load": list(data.get("lane_load") or []),
+        "bus_role": str(bus.get("top_role") or ""),
+        "bus_share": float(bus.get("max_share") or 0),
+        "bus_threshold": float(bus.get("threshold") or 0.45),
+        "bus_status": str(bus.get("status") or ""),
+        "tobe_ready": bool(tobe_ready),
+        "cp_before": cp_before,
+        "cp_after": cp_after,
+        "rw_before": rw_before,
+        "rw_after": rw_after,
+        "loops_before": loops_before,
+        "loops_after": loops_after,
+        "rw_saved_hours": rw_saved,
+        "rw_saved_pct": int(round(100.0 * rw_saved / rw_before)) if tobe_ready and rw_before else 0,
+        "speedup_via_rework": speedup,
+        "cp_grew": bool(tobe_ready and cp_after is not None and cp_after > cp_before),
+        "quality_before": int(delta.get("quality_before") or (data.get("methodology") or {}).get("score") or 0),
+        "quality_after": int(delta.get("quality_after") or 0),
+        "tobe_actions": [a for a in (delta.get("actions") or []) if isinstance(a, dict)],
+    }
+
+
+def _limit_lines(text: str, n: int) -> str:
+    lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+    return "\n".join(lines[:n])
+
+
 def build_process_context(
     current_text: str,
     current_xml: str,
@@ -2160,62 +2906,45 @@ def build_process_context(
         "quality_score_as_is": None,
         "quality_score_to_be": None,
         "tobe_actions": [],
+        "facts": {},
+        "cp_hours_as_is": None,
+        "cp_hours_to_be": None,
+        "regulation_text": current_text or "",
     }
+    facts = process_facts(audit, tobe_delta)
+    ctx["facts"] = facts
     _attach_tobe_compare(ctx, audit, tobe_delta)
     return ctx
 
 
 def _attach_tobe_compare(ctx: Dict[str, Any], audit: Dict[str, Any], tobe_delta: Optional[dict]) -> None:
-    """Пишет в контекст sla_hours_as_is / sla_hours_to_be и соседние поля, если To-Be уже посчитан."""
-    d = tobe_delta or (audit or {}).get("tobe_compare") or {}
-    if not isinstance(d, dict) or not d:
-        return
-    if d.get("sla_after_hours") is None and d.get("sla_hours_to_be") is None:
-        return
+    """Пишет в контекст цифры To-Be из process_facts: срок с возвратами отдельно от голого КП."""
+    facts = ctx.get("facts") or process_facts(audit, tobe_delta)
+    ctx["facts"] = facts
     sla = (audit or {}).get("sla") or {}
     meth = (audit or {}).get("methodology") or {}
-    as_is = d.get("sla_hours_as_is")
-    if as_is is None:
-        as_is = d.get("sla_before_hours")
-    if as_is is None:
-        as_is = sla.get("with_rework_hours") or sla.get("critical_path_hours") or 0
-    to_be = d.get("sla_hours_to_be")
-    if to_be is None:
-        to_be = d.get("sla_after_hours") or 0
-    pct = d.get("delta_sla_percent")
-    if pct is None:
-        pct = d.get("sla_saved_pct") or 0
-    q_as = d.get("quality_score_as_is")
-    if q_as is None:
-        q_as = d.get("quality_before")
+    d = tobe_delta if isinstance(tobe_delta, dict) else {}
+    if not facts.get("tobe_ready"):
+        return
+    ctx["tobe_ready"] = True
+    ctx["sla_hours_as_is"] = facts["rw_before"]
+    ctx["sla_hours_to_be"] = facts["rw_after"]
+    ctx["delta_sla_percent"] = facts["rw_saved_pct"]
+    ctx["sla_saved_hours"] = facts["rw_saved_hours"]
+    ctx["cp_hours_as_is"] = facts["cp_before"]
+    ctx["cp_hours_to_be"] = facts["cp_after"]
+    ctx["rework_loops_as_is"] = facts["loops_before"]
+    ctx["rework_loops_to_be"] = facts["loops_after"]
+    q_as = d.get("quality_before")
     if q_as is None:
         q_as = int(meth.get("score") or 0)
-    q_to = d.get("quality_score_to_be")
-    if q_to is None:
-        q_to = d.get("quality_after")
+    q_to = d.get("quality_after")
     if q_to is None:
         q_to = q_as
-    rw_as = d.get("rework_loops_as_is")
-    if rw_as is None:
-        rw_as = d.get("rework_before")
-    if rw_as is None:
-        rw_as = len((audit or {}).get("rework_loops") or [])
-    rw_to = d.get("rework_loops_to_be")
-    if rw_to is None:
-        rw_to = d.get("rework_after")
-    if rw_to is None:
-        rw_to = rw_as
-    ctx["tobe_ready"] = True
-    ctx["sla_hours_as_is"] = round(float(as_is or 0), 3)
-    ctx["sla_hours_to_be"] = round(float(to_be or 0), 3)
-    ctx["delta_sla_percent"] = round(float(pct or 0), 1)
-    ctx["rework_loops_as_is"] = int(rw_as or 0)
-    ctx["rework_loops_to_be"] = int(rw_to or 0)
     ctx["quality_score_as_is"] = int(q_as or 0)
     ctx["quality_score_to_be"] = int(q_to or 0)
-    ctx["tobe_actions"] = [a for a in (d.get("actions") or []) if isinstance(a, dict)]
-    ctx["sla_saved_hours"] = round(float(d.get("sla_saved_hours") or max(0.0, float(as_is or 0) - float(to_be or 0))), 3)
-    ctx["rework_hours_as_is"] = round(float(d.get("rework_hours_before") or 0), 3)
+    ctx["tobe_actions"] = facts.get("tobe_actions") or []
+    ctx["rework_hours_as_is"] = round(float(d.get("rework_hours_before") or sla.get("rework_hours") or 0), 3)
     ctx["rework_hours_to_be"] = round(float(d.get("rework_hours_after") or 0), 3)
 
 
@@ -2267,17 +2996,27 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
         for chk in (meth.get("checks") or [])[:4]:
             mark = "ok" if chk.get("passed") else "fail"
             lines.append(f"  [{mark}] {chk.get('title')}: {chk.get('detail')}")
+    facts = ctx.get("facts") or {}
+    if facts:
+        lines.append(
+            f"ФАКТЫ: КП {_fh(float(facts.get('critical_path_hours') or 0))}; "
+            f"с возвратами {_fh(float(facts.get('with_rework_hours') or 0))}; "
+            f"циклов {int(facts.get('rework_loops_n') or 0)}; "
+            f"bus-factor «{facts.get('bus_role') or '—'}» {float(facts.get('bus_share') or 0):.0%}"
+        )
     if ctx.get("tobe_ready"):
         lines += [
             "СРАВНЕНИЕ AS-IS / TO-BE:",
-            f"  sla_hours_as_is: {ctx.get('sla_hours_as_is')}",
-            f"  sla_hours_to_be: {ctx.get('sla_hours_to_be')}",
-            f"  delta_sla_percent: {ctx.get('delta_sla_percent')}",
-            f"  rework_loops_as_is: {ctx.get('rework_loops_as_is')}",
-            f"  rework_loops_to_be: {ctx.get('rework_loops_to_be')}",
+            f"  путь_с_возвратами: {ctx.get('sla_hours_as_is')} → {ctx.get('sla_hours_to_be')} ч (−{ctx.get('delta_sla_percent')}%)",
+            f"  голый_критический_путь: {ctx.get('cp_hours_as_is')} → {ctx.get('cp_hours_to_be')} ч",
+            f"  циклы: {ctx.get('rework_loops_as_is')} → {ctx.get('rework_loops_to_be')}",
             f"  quality_score_as_is: {ctx.get('quality_score_as_is')}",
             f"  quality_score_to_be: {ctx.get('quality_score_to_be')}",
         ]
+        if facts.get("speedup_via_rework"):
+            lines.append("  НЕ говорить «Без ускорения»: путь с возвратами короче, голый КП не длиннее As-Is.")
+        elif facts.get("cp_grew"):
+            lines.append("  Голый КП вырос — не выдавай это за оптимум To-Be.")
         for act in (ctx.get("tobe_actions") or [])[:6]:
             lines.append(f"  действие To-Be [{act.get('kind')}]: {act.get('detail')}")
         lines.append(f"  rework_hours_as_is: {ctx.get('rework_hours_as_is')}")
@@ -2288,14 +3027,34 @@ def format_context_for_prompt(ctx: Dict[str, Any], max_steps: int = 60) -> str:
 
 # --------------------------- классификация намерения --------------------------- #
 _EDIT_VERB_RE = re.compile(
-    r"\b(добав\w+|вставь\w*|вставить|включи\w*|дополни\w*|удал\w+|убер\w+|убрать|исключ\w+|сдела\w+|измени\w*|изменить|"
-    r"замени\w*|заменить|перенес\w+|перемест\w+|поменя\w+|сократ\w+|увелич\w+|постав\w+|установи\w*|передай\w*|назначь\w*)\b",
+    r"\b(добав\w+|вставь\w*|вставить|удал\w+|убер\w+|убрать|исключ\w+|"
+    r"перепиши\w*|переписать|"
+    r"сделай(?:те)?\s+.{0,80}параллел|"
+    r"измени(?:ть)?\s+(?:срок|шаг|роль|название|пункт)|"
+    r"замени\w*|заменить|перенес\w+|перемест\w+|поменя\w+|"
+    r"передай\w+|назначь\w+|установи\w*\s+целев\w+\s+срок)\b",
+    re.I,
+)
+_NO_EDIT_RE = re.compile(
+    r"не\s+изменяй|не\s+менять|не\s+правь|не\s+править|не\s+трогай|"
+    r"не\s+перестраивай|не\s+редактир|без\s+изменен|не\s+меняй\s+bpmn",
+    re.I,
+)
+_ANALYSIS_HINT_RE = re.compile(
+    r"аудит|анализ|аналитическ|сравни|as-is|to-be|tobe|риск|"
+    r"что\s+изменил|подтвержд|разбор",
     re.I,
 )
 _QUESTION_START_RE = re.compile(r"^\s*(?:как|почему|что|зачем|можно ли|стоит ли|какие|какой|какая|сколько|где|когда|кто|в чем|в чём|есть ли)\b", re.I)
 _INSTRUCTION_RE = re.compile(
     r"инструкци|памятк|регламент для исполнител|для исполнител|должностн|чем занимается|что делает|опиши работу|обязанност", re.I)
 _NEXT_STEP_RE = re.compile(r"следующ\w+ шаг|что дальше|чего не хватает|предложи\w* шаг|что добавить|каких шагов", re.I)
+_OPT_AUDIT_Q_RE = re.compile(
+    r"аудит|аналитическ|что\s+изменил|подтвержд|"
+    r"не\s+изменяй|не\s+правь|не\s+менять|"
+    r"разбор.{0,24}оптимиз|оптимизац.{0,40}(аудит|анализ)",
+    re.I,
+)
 
 
 def classify_intent(message: str) -> str:
@@ -2305,6 +3064,8 @@ def classify_intent(message: str) -> str:
         return "instruction"
     if _NEXT_STEP_RE.search(msg):
         return "next_step"
+    if _NO_EDIT_RE.search(msg) or (_ANALYSIS_HINT_RE.search(msg) and not _EDIT_VERB_RE.search(msg)):
+        return "analysis"
     if _EDIT_VERB_RE.search(msg) and not msg.endswith("?") and not _QUESTION_START_RE.match(msg):
         return "edit"
     return "analysis"
@@ -2459,45 +3220,199 @@ def _analysis_summary(ctx: Dict[str, Any]) -> str:
 
 
 def _analysis_tobe(ctx: Dict[str, Any]) -> str:
-    if not ctx.get("tobe_ready"):
+    f = ctx.get("facts") or {}
+    if not f.get("tobe_ready"):
         sla = ctx.get("sla") or {}
         loops = ctx.get("rework_loops") or []
-        meth = ctx.get("methodology") or {}
         return (
-            "**As-Is пока без посчитанного To-Be.** Откройте вкладку «Оптимизация As-Is → To-Be» — "
-            "оптимизатор параллелит независимые роли, снимает петли возврата (Zero-Rework) и переводит журналы в scriptTask.\n"
-            f"Сейчас: путь {_fh(float(sla.get('with_rework_hours') or sla.get('critical_path_hours') or 0))}, "
-            f"петель возврата {len(loops)}, Quality Score {int(meth.get('score') or 0)}%."
+            f"**As-Is: срок с возвратами {_fh(float(sla.get('with_rework_hours') or sla.get('critical_path_hours') or 0))}, "
+            f"циклов {len(loops)}.** To-Be ещё не посчитан — откройте вкладку оптимизации."
         )
-    as_h = float(ctx.get("sla_hours_as_is") or 0)
-    to_h = float(ctx.get("sla_hours_to_be") or 0)
-    pct = float(ctx.get("delta_sla_percent") or 0)
-    saved = float(ctx.get("sla_saved_hours") or max(0.0, as_h - to_h))
-    rb, ra = int(ctx.get("rework_loops_as_is") or 0), int(ctx.get("rework_loops_to_be") or 0)
-    qb, qa = int(ctx.get("quality_score_as_is") or 0), int(ctx.get("quality_score_to_be") or 0)
-    stats = ctx.get("stats") or {}
-    out = [
-        f"**As-Is → To-Be для «{ctx.get('title')}».**",
-        f"SLA (с учётом возвратов): **{_fh(as_h)} → {_fh(to_h)}** (экономия {_fh(saved)}, **−{pct:g}%**).",
-        f"Петли возврата: **{rb} → {ra}** (ликвидировано {max(0, rb - ra)}).",
-        f"Quality Score нотации: **{qb}% → {qa}%**.",
-    ]
+    rw_b, rw_a = float(f.get("rw_before") or 0), float(f.get("rw_after") or 0)
+    cp_b, cp_a = float(f.get("cp_before") or 0), float(f.get("cp_after") or 0)
+    rb, ra = int(f.get("loops_before") or 0), int(f.get("loops_after") or 0)
+    pct = int(f.get("rw_saved_pct") or 0)
+    out: List[str] = []
+    if f.get("speedup_via_rework") or rw_a < rw_b:
+        out.append(
+            f"**Экономия пути с возвратами: {_fh(rw_b)} → {_fh(rw_a)} (−{pct}%), циклы {rb} → {ra}.**"
+        )
+    else:
+        out.append(f"**To-Be: путь с возвратами {_fh(rw_b)} → {_fh(rw_a)}, циклы {rb} → {ra}.**")
+    if f.get("cp_grew"):
+        out.append(f"Голый критический путь {_fh(cp_b)} → {_fh(cp_a)} — не оптимален, если есть кандидат без удлинения.")
+    else:
+        out.append(f"Голый критический путь: {_fh(cp_b)} → {_fh(cp_a)}.")
     kinds = {str(a.get("kind")) for a in (ctx.get("tobe_actions") or [])}
-    if "parallel" in kinds:
-        out.append("Параллелизация: независимые шаги разных ролей идут одновременно, а не цепочкой.")
     if "zero_rework" in kinds:
-        out.append("Zero-Rework: перед согласованиями входной контроль, возвраты заменены эскалацией.")
+        out.append("Zero-Rework: циклы заменены эскалацией на исключительной ветке, не на счастливом пути.")
+    if "parallel" in kinds:
+        out.append("Параллель: независимые роли идут одновременно, если нет стоп-листа охраны труда.")
     if "automation" in kinds:
-        out.append("Автоматизация: фиксация в журналах/реестрах переведена в scriptTask, а не ручной userTask.")
-    for act in (ctx.get("tobe_actions") or [])[:4]:
-        if act.get("detail"):
-            out.append(f"- {act['detail']}")
-    subs = int(stats.get("subprocesses") or 0)
-    out.append(
-        f"Читаемость: {'подпроцессы уже режут «метро Токио»' if subs else 'длинные цепочки лучше упаковать в subprocess'}; "
-        "снятие возвратных стрелок убирает пересечения как на карте метро."
-    )
+        out.append("Журналы переведены в scriptTask.")
+    bus_role = f.get("bus_role")
+    if bus_role:
+        out.append(f"Bus-factor: «{bus_role}» держит {float(f.get('bus_share') or 0):.0%} шагов.")
+    if abs(rw_a - cp_a) < 0.051:
+        out.append("Одинаковые цифры справа: циклы сняты, добавки за возврат нет.")
     return "\n".join(out)
+
+
+_ASK_STOP = {
+    "что", "как", "про", "для", "это", "шаг", "шага", "шаге", "шаги", "шагов", "пункт", "пункта",
+    "делает", "делают", "почему", "цифры", "цифра", "одинаковые", "одинаковых", "время", "срок",
+    "процесс", "схемы", "схеме", "схему", "расскажи", "текущей", "какие", "какой", "какая",
+    "роль", "роли", "ролей", "часов", "часы", "минут",
+}
+_FACTS_Q_RE = re.compile(
+    r"одинаков|сравни|as-is|as is|to-be|tobe|до и после|экономи|rework|"
+    r"цикл|возврат|сколько\s+времени",
+    re.I,
+)
+_ROLE_Q_RE = re.compile(r"рол|какие\s+шаги|что\s+делает|перечисл|шаги\s+|нагрузк|разгруз", re.I)
+_STEP_WORD_RE = re.compile(r"шаг\w*|пункт\w*|п\.\s*\d+|этап\w*", re.I)
+
+
+def _explicit_step_num(message: str) -> Optional[int]:
+    m = re.search(r"(?:шаг\w*|пункт\w*|этап\w*|п\.)\s*№?\s*(\d+)", message or "", re.I)
+    if not m:
+        m = re.search(r"\b(\d+)\s*(?:-?(?:й|ый|ой|го|м))?\s*шаг", message or "", re.I)
+    return int(m.group(1)) if m else None
+
+
+def _step_bodies(ctx: Dict[str, Any]) -> Dict[int, str]:
+    reg = ctx.get("regulation_text") or ""
+    if not str(reg).strip():
+        return {}
+    try:
+        _, raw = _split_steps(normalize_regulation(reg))
+    except Exception:  # noqa: BLE001
+        return {}
+    return {int(s["num"]): str(s.get("body") or "") for s in raw if s.get("num") is not None}
+
+
+def _ask_tokens(message: str) -> List[str]:
+    toks = []
+    for w in re.findall(r"[А-Яа-яЁёA-Za-z]{3,}", message or ""):
+        low = w.lower().replace("ё", "е")
+        if low in _ASK_STOP:
+            continue
+        toks.append(low)
+    return toks
+
+
+def _blob_has_token(blob: str, token: str) -> bool:
+    b = (blob or "").lower().replace("ё", "е")
+    if token in b:
+        return True
+    stem = token[:5]
+    return len(stem) >= 4 and stem in b
+
+
+def _match_asked_step(message: str, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    steps = list(ctx.get("steps") or [])
+    if not steps:
+        return None
+    bodies = _step_bodies(ctx)
+    tokens = _ask_tokens(message)
+    scored: List[Tuple[int, int, Dict[str, Any]]] = []
+    for s in steps:
+        blob = " ".join([str(s.get("title") or ""), str(s.get("role") or ""), bodies.get(int(s["num"]), "")])
+        hit = [t for t in tokens if _blob_has_token(blob, t)]
+        if hit:
+            scored.append((len(hit), max(len(t) for t in hit), s))
+    scored.sort(key=lambda pair: (-pair[0], -pair[1], int(pair[2]["num"])))
+    if not scored:
+        return None
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    best_n, best_len, best = scored[0]
+    if best_n >= 2:
+        return best
+    if best_len >= 6 and re.search(r"шаг|что\s+делает|про\s+|подготов", message or "", re.I):
+        return best
+    return None
+
+
+def _one_step_reply(step: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    num = int(step["num"])
+    title = str(step.get("title") or "").strip() or "—"
+    role = str(step.get("role") or "").strip() or "—"
+    hours = step.get("hours")
+    tail = f", {_fh(float(hours))}" if hours else ""
+    body = _step_bodies(ctx).get(num, "")
+    lines = [f"**Шаг {num}. «{title}»** — {role}{tail}."]
+    if body and title.lower() not in body.lower():
+        snip = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", body, flags=re.I)
+        snip = re.sub(r"\s*\([^)]*\)\s*$", "", snip).strip()
+        if snip:
+            lines.append(f"В регламенте: «{snip[:140]}».")
+    return "\n".join(lines)
+
+
+def _role_steps_reply(ctx: Dict[str, Any], role: str) -> str:
+    mine = [s for s in (ctx.get("steps") or []) if s.get("role") == role]
+    lines = [f"**«{role}»** — шаги по порядку:"]
+    if not mine:
+        lines.append("Шагов этой роли на схеме нет.")
+        return "\n".join(lines)
+    for s in mine:
+        hours = s.get("hours")
+        tail = f" — {_fh(float(hours))}" if hours else ""
+        lines.append(f"{s['num']}. «{s.get('title') or '—'}»{tail}")
+    return "\n".join(lines)
+
+
+def _steps_miss_reply(ctx: Dict[str, Any]) -> str:
+    f = ctx.get("facts") or {}
+    n = len(ctx.get("steps") or [])
+    cp = float(f.get("critical_path_hours") or (ctx.get("sla") or {}).get("critical_path_hours") or 0)
+    title = str(ctx.get("title") or "процесс")
+    return f"Шаг не найден. В схеме «{title}» {n} шагов, критический путь {_fh(cp)}."
+
+
+def _facts_time_reply(ctx: Dict[str, Any]) -> str:
+    """Срок, экономия, циклы — только числа process_facts, без подстановки шага 1."""
+    f = ctx.get("facts") or {}
+    if not f.get("tobe_ready"):
+        rw = float(f.get("with_rework_hours") or 0)
+        cp = float(f.get("critical_path_hours") or 0)
+        n = int(f.get("rework_loops_n") or 0)
+        return (
+            f"**As-Is: срок с возвратами {_fh(rw)}, голый КП {_fh(cp)}, циклов {n}.** "
+            "To-Be ещё не посчитан."
+        )
+    rw_b, rw_a = float(f.get("rw_before") or 0), float(f.get("rw_after") or 0)
+    cp_b, cp_a = float(f.get("cp_before") or 0), float(f.get("cp_after") or 0)
+    rb, ra = int(f.get("loops_before") or 0), int(f.get("loops_after") or 0)
+    pct = int(f.get("rw_saved_pct") or 0)
+    lines = [
+        f"**Экономия пути с возвратами: {_fh(rw_b)} → {_fh(rw_a)} (−{pct}%), циклы «{rb} → {ra}».**",
+        f"Голый критический путь: {_fh(cp_b)} → {_fh(cp_a)}.",
+    ]
+    if abs(rw_a - cp_a) < 0.051 or ra == 0:
+        lines.append("Одинаковые цифры справа: циклы сняты, добавки за возврат нет.")
+    return "\n".join(lines)
+
+
+def _visible_answer(message: str, ctx: Dict[str, Any]) -> Optional[str]:
+    """Шаг, роль или цифры To-Be по тексту вопроса. None — вопрос не про видимый шаг и не про срок."""
+    steps = list(ctx.get("steps") or [])
+    num = _explicit_step_num(message)
+    if num is not None:
+        hit = next((s for s in steps if int(s["num"]) == num), None)
+        return _one_step_reply(hit, ctx) if hit else _steps_miss_reply(ctx)
+    hit = _match_asked_step(message, ctx)
+    if hit is not None and not _FACTS_Q_RE.search(message or ""):
+        return _one_step_reply(hit, ctx)
+    if _FACTS_Q_RE.search(message or ""):
+        return _facts_time_reply(ctx)
+    roles = _roles_in_message(message, _roles_of(ctx))
+    if roles and _ROLE_Q_RE.search(message or ""):
+        return _role_steps_reply(ctx, roles[0])
+    if _STEP_WORD_RE.search(message or "") and hit is None:
+        return _steps_miss_reply(ctx)
+    return None
 
 
 def _analysis_readability(ctx: Dict[str, Any]) -> str:
@@ -2557,9 +3472,11 @@ def _analysis_open(message: str, ctx: Dict[str, Any]) -> str:
         l0 = max(loops, key=lambda x: float((x or {}).get("cycle_hours") or 0))
         out.append(f"Дороже всего цикл «{l0.get('label')}»: {_fh(float(l0.get('cycle_hours') or 0))}.")
     if ctx.get("tobe_ready"):
+        f = ctx.get("facts") or {}
         out.append(
-            f"To-Be уже есть: SLA {_fh(float(ctx.get('sla_hours_as_is') or 0))} → "
-            f"{_fh(float(ctx.get('sla_hours_to_be') or 0))} (−{ctx.get('delta_sla_percent')}%)."
+            f"To-Be: путь с возвратами {_fh(float(f.get('rw_before') or ctx.get('sla_hours_as_is') or 0))} → "
+            f"{_fh(float(f.get('rw_after') or ctx.get('sla_hours_to_be') or 0))} "
+            f"(циклы {f.get('loops_before')} → {f.get('loops_after')})."
         )
     if recs:
         out.append("Что делать архитектору:")
@@ -2580,6 +3497,34 @@ _WHY_SAVED_RE = re.compile(
     r"в ч[её]м причина.{0,30}(сократ|экономи|to-be|tobe)",
     re.I,
 )
+_FACT_OVERRIDE_RE = re.compile(
+    r"sla|срок|срыв|as-is|as is|to-be|tobe|цикл|возврат|bus.?factor|ускор|экономи",
+    re.I,
+)
+
+
+def _suggested_command(ctx: Dict[str, Any]) -> str:
+    loops = ctx.get("rework_loops") or []
+    steps = ctx.get("steps") or []
+    if loops:
+        return "Добавь входной контроль перед возвратом на доработку"
+    if len(steps) >= 5:
+        return "Сделай шаги 4 и 5 параллельными"
+    return "Добавь согласование с экологами после шага 3"
+
+
+def _sidebar_shape(body: str, ctx: Dict[str, Any], intent: str) -> str:
+    """Сайдбар: вывод → шаги/роли → одна команда в ёлочках. Не больше 10 строк."""
+    lines = [ln.rstrip() for ln in (body or "").splitlines() if ln.strip() and not ln.strip().startswith("<sub>")]
+    table = any("| Изменение |" in ln or "Подтверждено регламентом" in ln for ln in lines)
+    if table:
+        return "\n".join(lines[:24])
+    if intent in ("analysis", "next_step"):
+        lines = lines[:9]
+        if not any("«" in ln and "»" in ln for ln in lines):
+            lines.append(f"«{_suggested_command(ctx)}»")
+        return "\n".join(lines[:10])
+    return "\n".join(lines[:12])
 
 
 def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
@@ -2610,6 +3555,11 @@ def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
         f"(снято {max(0, rb - ra)} цикл.). Экономия циклов: **{_fh(loop_saved)}** "
         f"(худший возврат {_fh(rw_h_as)} → {_fh(rw_h_to)}).",
     ]
+    f = ctx.get("facts") or {}
+    if f.get("cp_grew"):
+        out.append(
+            f"   Голый путь {_fh(float(f.get('cp_before') or 0))} → {_fh(float(f.get('cp_after') or 0))}."
+        )
     loops = sorted(ctx.get("rework_loops") or [], key=lambda x: -float((x or {}).get("cycle_hours") or 0))
     for item in loops[:3]:
         out.append(f"   - цикл As-Is «{item.get('label')}»: {_fh(float(item.get('cycle_hours') or 0))}")
@@ -2666,13 +3616,217 @@ def _analysis_quality_score(ctx: Dict[str, Any]) -> str:
     return _analysis_readability(ctx)
 
 
+_OPTIMIZER_MOVE = "это ход оптимизатора, в регламенте такой формулировки нет"
+
+
+def _audit_cell(value: Any) -> str:
+    return str(value if value is not None and value != "" else "—").replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
+def _audit_snip(text: str, limit: int = 88) -> str:
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    t = re.sub(r"^\d+[.)]\s*", "", t)
+    if len(t) > limit:
+        t = t[: limit - 1].rstrip(" ,;:") + "…"
+    return t
+
+
+def _analysis_opt_audit(ctx: Dict[str, Any]) -> str:
+    """Сверка To-Be с исходным регламентом: таблица, без команд правки XML."""
+    facts = ctx.get("facts") or {}
+    steps = ctx.get("steps") or []
+    reg = ctx.get("regulation_text") or ""
+    try:
+        _, raw = _split_steps(normalize_regulation(reg)) if reg.strip() else ([], [])
+    except Exception:  # noqa: BLE001
+        raw = []
+    bodies = {int(s["num"]): s["body"] for s in raw if s.get("num") is not None}
+    titles: Dict[int, str] = {}
+    for s in steps:
+        try:
+            titles[int(s["num"])] = str(s.get("title") or "").strip()
+        except (TypeError, ValueError):
+            continue
+    for num, body in bodies.items():
+        if not titles.get(num):
+            titles[num] = _step_title(body)
+
+    def step_cell(num: Optional[int], extra: str = "") -> str:
+        if num is None:
+            return extra or "—"
+        body = bodies.get(num, "")
+        name = extra
+        if body:
+            name = _audit_snip(
+                re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", body, flags=re.I),
+                72,
+            )
+            name = re.sub(r"\s*\(\d+[^\)]*\)\s*$", "", name).rstrip(" .")
+        if not name:
+            name = titles.get(num) or _step_title(body)
+        return f"{num}. {name}" if name else str(num)
+
+    rows: List[List[str]] = []
+    ppe_num: Optional[int] = None
+    for s in raw:
+        body = s.get("body") or ""
+        if _is_prepare_ppe_ground(body):
+            ppe_num = int(s["num"])
+            quote = ""
+            m = re.search(r"(Параллельно\s*[:,—–-]?\s*.{0,80})", body, re.I)
+            if m:
+                quote = _audit_snip(m.group(1))
+            elif re.search(r"параллельно", body, re.I):
+                quote = _audit_snip(body)
+            if quote:
+                rows.append(
+                    [
+                        "Подготовка СИЗ, инструмента и переносных заземлений параллельно оперативным переключениям",
+                        step_cell(ppe_num),
+                        "да",
+                        f"«{quote}»",
+                        "низкий",
+                        "высокая",
+                    ]
+                )
+            break
+
+    repair_num = brief_num = None
+    for s in raw:
+        body = s.get("body") or ""
+        num = int(s["num"])
+        if repair_num is None and _REPAIR_WORK_RE.search(body) and not re.search(r"закрыва", body, re.I):
+            repair_num = num
+        if re.search(r"инструктаж", body, re.I):
+            brief_num = num
+    if repair_num is not None and brief_num is not None and repair_num > brief_num:
+        quotes = [_audit_snip(bodies[brief_num], 80), _audit_snip(bodies[repair_num], 80)]
+        rows.append(
+            [
+                "Ремонт остаётся после допуска и целевого инструктажа",
+                step_cell(repair_num),
+                "да",
+                "«" + "; ".join(quotes) + "»",
+                "низкий",
+                "высокая",
+            ]
+        )
+
+    zero_nums: List[int] = []
+    for act in ctx.get("tobe_actions") or []:
+        if not isinstance(act, dict):
+            continue
+        kind = str(act.get("kind") or "")
+        detail = str(act.get("detail") or "")
+        found = [int(x) for x in re.findall(r"шаг(?:и)?\s+(\d+)", detail, re.I)]
+        if kind == "parallel":
+            ppe_hit = ppe_num is not None and (ppe_num in found or any(_is_prepare_ppe_ground(bodies.get(n, "")) for n in found))
+            already = False
+            if len(found) >= 2 and found[1] in bodies and _is_parallel_body(bodies[found[1]]):
+                already = True
+            if ppe_hit or already:
+                continue
+            rows.append(
+                [
+                    "Параллельное выполнение независимых шагов",
+                    " и ".join(step_cell(n) for n in found[:2]) if found else "—",
+                    "нет",
+                    _OPTIMIZER_MOVE,
+                    "средний",
+                    "средняя",
+                ]
+            )
+        elif kind == "zero_rework":
+            zero_nums.extend(found[:1] or [])
+        elif kind == "automation":
+            n = found[0] if found else None
+            body = bodies.get(n, "") if n else ""
+            if n and re.search(r"систем\w+\s+автоматическ|автоматически:", body, re.I):
+                rows.append(
+                    [
+                        "Автоматизация журнальной фиксации",
+                        step_cell(n),
+                        "да",
+                        f"«{_audit_snip(body)}»",
+                        "низкий",
+                        "высокая",
+                    ]
+                )
+            else:
+                rows.append(
+                    [
+                        "Автоматизация журнальной фиксации",
+                        step_cell(n) if n else "—",
+                        "нет",
+                        _OPTIMIZER_MOVE,
+                        "низкий",
+                        "средняя",
+                    ]
+                )
+
+    if zero_nums or (
+        facts.get("tobe_ready")
+        and facts.get("loops_after") is not None
+        and int(facts.get("loops_before") or 0) > int(facts.get("loops_after") or 0)
+    ):
+        uniq = list(dict.fromkeys(zero_nums))
+        step_lbl = ", ".join(step_cell(n) for n in uniq[:3]) if uniq else "циклы возврата"
+        rows.append(
+            [
+                "Замена циклов возврата на эскалацию",
+                step_lbl,
+                "нет",
+                _OPTIMIZER_MOVE,
+                "средний",
+                "средняя",
+            ]
+        )
+
+    if not rows:
+        rows.append(
+            [
+                "Сверка As-Is и To-Be",
+                "—",
+                "нет",
+                _OPTIMIZER_MOVE,
+                "средний",
+                "низкая",
+            ]
+        )
+
+    head: List[str] = []
+    if facts.get("tobe_ready"):
+        lb, la = int(facts.get("loops_before") or 0), int(facts.get("loops_after") or 0)
+        rw_b, rw_a = float(facts.get("rw_before") or 0), float(facts.get("rw_after") or 0)
+        cp_b = float(facts.get("cp_before") or 0)
+        cp_a = float(facts.get("cp_after") or 0)
+        head.append(
+            f"Циклы {lb} → {la}; срок с возвратами {_fh(rw_b)} → {_fh(rw_a)}; "
+            f"голый КП {_fh(cp_b)} → {_fh(cp_a)}."
+        )
+    else:
+        head.append("To-Be ещё не посчитан — сверка шагов с исходным регламентом.")
+    table = [
+        "| Изменение | Шаг (номер и название) | Подтверждено регламентом | Основание | Риск | Уверенность |",
+        "|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        table.append("| " + " | ".join(_audit_cell(c) for c in row) + " |")
+    return "\n".join(head + table)
+
+
 def heuristic_analysis(message: str, ctx: Dict[str, Any]) -> str:
     low = message.lower()
     roles = _roles_in_message(message, _roles_of(ctx))
+    if _OPT_AUDIT_Q_RE.search(low):
+        return _analysis_opt_audit(ctx)
     if _QUALITY_Q_RE.search(low):
         return _analysis_quality_score(ctx)
-    if _WHY_SAVED_RE.search(low):
+    if _WHY_SAVED_RE.search(low) and not re.search(r"одинаков", low):
         return _analysis_why_saved(ctx)
+    visible = _visible_answer(message, ctx)
+    if visible:
+        return visible
     if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|до/после|целев\w+\s+схем|реинжинир", low):
         return _analysis_tobe(ctx)
     if re.search(r"читаем|метро|нотаци|подпроцесс|анти-метро|методолог", low):
@@ -2812,6 +3966,12 @@ def _default_duration(steps: List[Dict[str, Any]]) -> str:
     return "(1 рабочий день)" if median >= 8 else ("(2 часа)" if median >= 1 else "(30 минут)")
 
 
+def _so_or_s(word: str) -> str:
+    """Предлог «со» перед творительным на с, з, ж, ш, щ; иначе «с»."""
+    ch = (word or "").lstrip().lower()[:1]
+    return "со" if ch in "сзжшщ" else "с"
+
+
 def _role_instrumental(role: str) -> str:
     """«Служба экологии» → «службой экологии» (творительный для «с …»)."""
     words = role.split()
@@ -2847,6 +4007,8 @@ def _build_new_step(content: str, anchor_role: str, duration: str) -> str:
             if m_with:
                 prep = m_with.group(1).lower()
                 whom = _role_instrumental(extra_role) if prep in ("с", "со") else extra_role[:1].lower() + extra_role[1:]
+                if prep in ("с", "со"):
+                    prep = _so_or_s(whom)
                 with_whom = f"{prep} {whom}"
                 rest = (lead[: m_with.start()] + " " + content[re_:]).strip()
                 extra_role = None
@@ -3121,8 +4283,18 @@ def _audit_delta(old: Dict[str, Any], new: Dict[str, Any]) -> str:
     try:
         o, n = old.get("sla") or {}, new.get("sla") or {}
         lines = []
+        facts_o = process_facts(old)
+        facts_n = process_facts(new)
         if o and n:
-            lines.append(f"- критический путь: {_fh(float(o['critical_path_hours']))} → **{_fh(float(n['critical_path_hours']))}**")
+            lines.append(
+                f"- срок с возвратами: {_fh(facts_o['with_rework_hours'])} → **{_fh(facts_n['with_rework_hours'])}**"
+            )
+            lines.append(
+                f"- критический путь: {_fh(float(o['critical_path_hours']))} → **{_fh(float(n['critical_path_hours']))}**"
+            )
+            lines.append(
+                f"- циклы возврата: {facts_o['rework_loops_n']} → **{facts_n['rework_loops_n']}**"
+            )
             if bool(o.get("breach")) != bool(n.get("breach")):
                 lines.append(f"- срыв SLA: {'да' if o.get('breach') else 'нет'} → **{'да' if n.get('breach') else 'нет'}**")
         ob, nb = old.get("bus_factor") or {}, new.get("bus_factor") or {}
@@ -3177,6 +4349,228 @@ def parse_bpmn_structure(xml: str) -> Dict[str, Any]:
         node["lane"] = lane_of.get(owner, "")
         node["x"], node["y"] = pos.get(nid, (0.0, 0.0))
     return {"nodes": nodes, "flows": flows, "lanes": list(dict.fromkeys(lane_of.values()))}
+
+
+def _hours_phrase(hours: Optional[float]) -> str:
+    if hours is None:
+        return ""
+    minutes = hours * 60.0
+    if hours < 1 and abs(minutes - round(minutes)) < 0.05:
+        return f" ({int(round(minutes))} минут)"
+    if abs(hours - round(hours)) < 0.05:
+        return f" ({int(round(hours))} ч)"
+    return f" ({hours:.1f} ч)".replace(".0 ч", " ч")
+
+
+def render_result_regulation(source_text: str, xml: str) -> str:
+    """Текст результата: имена «глагол + объект», подписи веток и границы подпроцесса со схемы.
+
+    Без этих трёх кусков повторная сборка того, что видит пользователь, теряет балл.
+    Часы и фразы возврата берутся из исходного регламента, если шаг узнаётся.
+    """
+    source = (source_text or "").strip()
+    if not xml or not source:
+        return source
+    try:
+        struct = parse_bpmn_structure(xml)
+    except Exception:  # noqa: BLE001
+        return source
+    nodes: Dict[str, Dict[str, Any]] = struct["nodes"]
+    flows: List[Dict[str, str]] = struct["flows"]
+    if not nodes:
+        return source
+    try:
+        parsed = parse_regulation(normalize_regulation(source))
+    except Exception:  # noqa: BLE001
+        parsed = ParsedRegulation(title="Бизнес-процесс", sla_hours=None)
+
+    outgoing: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for flow in flows:
+        outgoing[flow["src"]].append(flow)
+
+    def _expand(owner: Optional[str]) -> List[Dict[str, Any]]:
+        kids = [
+            n for n in nodes.values()
+            if n.get("sub") == owner and (n["type"] in _TASK_TAGS or n["type"] == "subProcess")
+        ]
+        kids.sort(key=lambda n: (float(n.get("x") or 0), float(n.get("y") or 0), n.get("id") or ""))
+        ordered: List[Dict[str, Any]] = []
+        for node in kids:
+            if node["type"] == "subProcess":
+                ordered.extend(_expand(node["id"]))
+            else:
+                ordered.append(node)
+        return ordered
+
+    tasks = _expand(None)
+    if len(tasks) < 2:
+        return source
+
+    pool = list(tasks)
+    bound: Dict[int, Dict[str, Any]] = {}
+    for step in parsed.steps:
+        title = (step.title or "").strip().lower()
+        if not title:
+            continue
+        hit = next((t for t in pool if (t.get("name") or "").strip().lower() == title), None)
+        if hit is None:
+            continue
+        bound[step.num] = hit
+        pool.remove(hit)
+    # Похожее имя чужой срок не получает: неузнанный шаг остаётся без часов.
+    next_num = max((s.num for s in parsed.steps), default=0)
+    for task in pool:
+        next_num += 1
+        bound_extra = task.setdefault("_out_num", next_num)
+        _ = bound_extra
+    num_by_task = {task["id"]: num for num, task in bound.items()}
+    num_by_task.update({task["id"]: int(task["_out_num"]) for task in pool})
+
+    def _land(node_id: str, guard: int = 0) -> Optional[str]:
+        if guard > 8:
+            return None
+        node = nodes.get(node_id) or {}
+        if node.get("type") in _TASK_TAGS and node_id in num_by_task:
+            return node_id
+        if node.get("type") == "subProcess":
+            inner = _expand(node_id)
+            return inner[0]["id"] if inner else None
+        if node.get("type") == "endEvent" and not node.get("sub"):
+            return "END"
+        for flow in outgoing.get(node_id, []):
+            found = _land(flow["dst"], guard + 1)
+            if found:
+                return found
+        return None
+
+    def _stage_phrase(task: Optional[Dict[str, Any]], step: Optional[Step]) -> str:
+        if task is not None:
+            parent = nodes.get(task.get("sub") or "")
+            if parent and parent.get("type") == "subProcess" and parent.get("name"):
+                return f" (этап «{parent['name']}»)"
+        if step is not None and step.stage:
+            return f" (этап «{step.stage}»)"
+        return ""
+
+    def _gateway_sentence(task: Optional[Dict[str, Any]], step: Optional[Step]) -> str:
+        step_num = step.num if step is not None else 0
+        back_num = None
+        if step is not None and step.decision is not None and step.decision.no_ref:
+            if step.decision.no_back or step.decision.no_ref < step.num:
+                back_num = step.decision.no_ref
+        elif step is not None and step.back_ref:
+            back_num = step.back_ref
+        gateway = None
+        if task is not None:
+            for flow in outgoing.get(task["id"], []):
+                nxt = nodes.get(flow["dst"]) or {}
+                if nxt.get("type") in ("exclusiveGateway", "inclusiveGateway"):
+                    gateway = nxt
+                    break
+        if gateway is not None:
+            outs = outgoing.get(gateway["id"], [])
+            labeled = [(f, _land(f["dst"])) for f in outs]
+            labeled = [(f, dest) for f, dest in labeled if dest]
+            if len(labeled) >= 2:
+                question = str(gateway.get("name") or "Условие").rstrip("?").strip() or "Условие"
+
+                def _dest(dest: str, label: str, *, returning: bool) -> str:
+                    if dest == "END":
+                        return "завершить процесс"
+                    num = num_by_task.get(dest)
+                    quote = f"«{label}» — " if label else ""
+                    # Иначе-возврат из исходника держит свой номер, даже если ребро село на другой шаг.
+                    if returning and back_num is not None:
+                        return f"{quote}вернуть на п.{back_num}"
+                    if num is not None and num < step_num:
+                        return f"{quote}вернуть на п.{num}"
+                    if num is None:
+                        return "перейти дальше"
+                    return f"{quote}перейти к п.{num}"
+
+                yes_f, yes_to = labeled[0]
+                no_f, no_to = labeled[1]
+                yes_label = str(yes_f.get("name") or "Да").strip() or "Да"
+                no_label = str(no_f.get("name") or "Иначе").strip() or "Иначе"
+                return (
+                    f". Если {question} — {_dest(yes_to, yes_label, returning=False)}, "
+                    f"иначе {_dest(no_to, no_label, returning=back_num is not None)}"
+                )
+        if step is not None and step.decision is not None and step.decision.no_back and step.decision.no_ref:
+            return f". иначе «{step.decision.no_label}» — вернуть на п.{step.decision.no_ref}"
+        if step is not None and step.back_ref:
+            return f". вернуть на п.{step.back_ref}"
+        return ""
+
+    lines: List[str] = []
+    title = parsed.title or "Бизнес-процесс"
+    lines.append(f"Регламент: {title}")
+    if parsed.sla_hours:
+        lines.append(f"Целевой срок: {_hours_phrase(parsed.sla_hours).strip(' ()')}")
+    # Порядок и номер — из регламента, не из координат картинки.
+    for step in sorted(parsed.steps, key=lambda s: s.num):
+        task = bound.get(step.num)
+        name = (str(task.get("name") or "").strip() if task is not None else "") or (step.title or "Выполнить действие")
+        role = (str(task.get("lane") or "").strip() if task is not None else "") or step.role or "Исполнитель"
+        parallel = "Параллельно: " if step.parallel else ""
+        body = f"{parallel}{role}: {name}{_stage_phrase(task, step)}{_hours_phrase(step.hours)}{_gateway_sentence(task, step)}"
+        lines.append(f"{step.num}. {body}.")
+    for task in pool:
+        name = str(task.get("name") or "").strip() or "Выполнить действие"
+        role = str(task.get("lane") or "").strip() or "Исполнитель"
+        body = f"{role}: {name}{_stage_phrase(task, None)}{_gateway_sentence(task, None)}"
+        lines.append(f"{int(task['_out_num'])}. {body}.")
+    rendered = "\n".join(lines).strip()
+    return rendered or source
+
+
+def align_result_quality(
+    text: str,
+    xml: str,
+    audit: Dict[str, Any],
+    use_llm: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
+    """Текст результата и аудит карточки.
+
+    Карточка равна местной повторной сборке текста на экране, даже если она ниже рисунка в памяти.
+    Второй вызов Groq отсюда не уходит. Схема To-Be — эта сборка, не рисунок с большим баллом.
+    """
+    _ = use_llm
+    data = dict(audit or {})
+    memory = data.get("methodology") if isinstance(data.get("methodology"), dict) else {}
+    shown = render_result_regulation(text, xml) if xml else (text or "")
+    if not shown.strip():
+        shown = text or ""
+    same_text = normalize_regulation(shown) == normalize_regulation(text or "")
+    if same_text and not use_llm:
+        if memory:
+            data["methodology"] = dict(memory)
+        data["result_text"] = shown
+        return shown, data
+    rebuilt_xml, rebuilt, rebuild_err = generate_bpmn_from_text(shown, use_llm=False)
+    rebuilt_meth = (rebuilt or {}).get("methodology") if isinstance((rebuilt or {}).get("methodology"), dict) else None
+    if rebuilt and not rebuild_err and rebuilt_meth:
+        data["methodology"] = dict(rebuilt_meth)
+        data["result_xml"] = rebuilt_xml or ""
+        data["result_audit"] = rebuilt
+    data["result_text"] = shown
+    return shown, data
+
+
+def card_matches_paste(text: str, use_llm: bool = False) -> Dict[str, Any]:
+    """Балл карточки — повторная сборка текста, который показан как результат."""
+    xml, audit, err = generate_bpmn_from_text(text, use_llm=use_llm)
+    memory = int(((audit or {}).get("methodology") or {}).get("score") or 0)
+    shown, audit = align_result_quality(text, xml or "", audit or {}, use_llm=use_llm)
+    score = int(((audit.get("methodology") or {}).get("score") or 0))
+    return {
+        "shown": shown,
+        "memory": memory,
+        "card": score,
+        "xml": xml,
+        "audit": audit,
+        "error": err or "",
+    }
 
 
 def _work_neighbors(struct: Dict[str, Any], node_id: str, forward: bool) -> List[Tuple[Dict[str, Any], List[str]]]:
@@ -3333,6 +4727,9 @@ def assistant_chat(
         if not ctx["steps"] and not current_xml:
             return "Активного процесса пока нет: выберите регламент и нажмите «Сгенерировать BPMN 2.0».", None, None, None
         intent = classify_intent(message)
+        if intent == "instruction" and not re.search(r"инструкц|памятк|должностн", message, re.I):
+            if _visible_answer(message, ctx):
+                intent = "analysis"
         trace: List[str] = []
         hist = _normalize_history(history)[-8:]
 
@@ -3356,8 +4753,7 @@ def assistant_chat(
             reply = "✨ **Диаграмма обновлена ассистентом в диалоге.**\n\n" + "\n".join(f"- {c}" for c in changes)
             if delta:
                 reply += "\n\n**Влияние на метрики:**\n" + delta
-            reply += f"\n\n<sub>Правка: {label}; диаграмма перестроена через execute_generated_code</sub>"
-            return reply, new_text, xml, new_audit
+            return _limit_lines(reply, 12), new_text, xml, new_audit
 
         # ---- режим 3: реверс-генерация инструкции ----
         if intent == "instruction":
@@ -3380,15 +4776,19 @@ def assistant_chat(
 
         # ---- режим 1: аналитика ----
         if intent == "next_step" and not use_llm:
-            return suggest_next_steps(ctx) + _source_note(None, trace), None, None, None
-        force_local = bool(_QUALITY_Q_RE.search(message.lower()) or _WHY_SAVED_RE.search(message.lower()))
+            return _sidebar_shape(suggest_next_steps(ctx), ctx, intent), None, None, None
+        low = message.lower()
+        force_local = bool(
+            _QUALITY_Q_RE.search(low) or _WHY_SAVED_RE.search(low) or _FACT_OVERRIDE_RE.search(low)
+            or _OPT_AUDIT_Q_RE.search(low)
+        )
         if use_llm and not force_local:
             system = CHAT_SYSTEM + format_context_for_prompt(ctx)
             got = _chat_llm([{"role": "system", "content": system}, *hist, {"role": "user", "content": message}], trace)
             if got:
-                return got[1].strip() + _source_note(got[0], trace), None, None, None
+                return _sidebar_shape(got[1].strip(), ctx, intent), None, None, None
         body = suggest_next_steps(ctx) if intent == "next_step" else heuristic_analysis(message, ctx)
-        return body + _source_note(None, trace), None, None, None
+        return _sidebar_shape(body, ctx, intent), None, None, None
     except Exception as exc:  # noqa: BLE001 — диалог не должен ронять приложение
         return f"Не удалось обработать запрос: {type(exc).__name__}: {exc}. Процесс оставлен без изменений.", None, None, None
 
@@ -3939,8 +5339,100 @@ def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) 
             "role": role or "—",
             "critical": bool(crit),
             "comment": live_node_comment(name, role, kind, ctx),
+            "copilot": _copilot_node_brief(name, role, kind, ctx),
         }
     return catalog
+
+
+def _copilot_node_brief(name: str, role: str, kind: str, ctx: Dict[str, Any]) -> str:
+    """До 6 строк: вывод, блок/роль на схеме, одна причина (критический путь или цикл)."""
+    f = ctx.get("facts") or {}
+    crit_names = {str(c.get("name") or "") for c in (f.get("critical_path") or ctx.get("critical_path") or [])}
+    on_crit = bool(name) and (name in crit_names or any(name[:16] in (c or "") for c in crit_names))
+    loops = f.get("rework_loops") or ctx.get("rework_loops") or []
+    hit = next(
+        (l for l in loops if name and name[:12] in str(l.get("from", "")) + str(l.get("to", ""))),
+        None,
+    )
+    lines: List[str] = []
+    if on_crit:
+        lines.append(f"**На критическом пути:** «{name}» ({role or '—'}).")
+        lines.append(f"Голый КП {_fh(float(f.get('critical_path_hours') or 0))} без этого шага не сходится.")
+    elif hit:
+        lines.append(f"**В цикле возврата** «{hit.get('label')}»: «{name}» ({role or '—'}).")
+        lines.append(f"Повтор добавляет {_fh(float(hit.get('cycle_hours') or 0))} к сроку с возвратами.")
+    else:
+        lines.append(f"**«{name}»** — {role or 'исполнитель'}, не на узком месте SLA.")
+        lines.append(f"Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}.")
+    if f.get("speedup_via_rework"):
+        lines.append(
+            f"To-Be снимает возвраты: {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))}, "
+            f"циклы {f.get('loops_before')} → {f.get('loops_after')}."
+        )
+    return _limit_lines("\n".join(lines), 6)
+
+
+def _copilot_tobe(ctx: Dict[str, Any]) -> str:
+    return _limit_lines(_facts_time_reply(ctx), 6)
+
+
+def canvas_copilot_reply(
+    message: str,
+    xml_str: str = "",
+    audit_data: Optional[Dict[str, Any]] = None,
+    regulation_text: str = "",
+    tobe_delta: Optional[dict] = None,
+    selected_id: Optional[str] = None,
+    catalog: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Локальный копайлот холста: не вызывает облако, не меняет XML/регламент."""
+    ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {}, tobe_delta=tobe_delta)
+    msg = (message or "").strip()
+    if not msg:
+        return "Спросите про блок на схеме, SLA или As-Is/To-Be."
+    if classify_intent(msg) == "edit":
+        cmd = re.sub(r"\s+", " ", msg).strip(" .")
+        return f"Команду в сайдбар: «{cmd}»"
+    visible = _visible_answer(msg, ctx)
+    if visible:
+        return _limit_lines(visible, 12)
+    cat = catalog or {}
+    if selected_id and selected_id in cat:
+        packed = cat[selected_id].get("copilot")
+        if packed and re.search(r"этот|выбран|блок|почему|критич|цикл|путь|возврат", msg, re.I):
+            return packed
+    low = msg.lower()
+    f = ctx.get("facts") or {}
+    if re.search(r"сравни|as-is|as is|to-be|tobe|до и после|ускор|экономи", low):
+        return _copilot_tobe(ctx)
+    if re.search(r"sla|срок|срыв|критич|длительн", low):
+        return _limit_lines(
+            f"**Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}**, "
+            f"голый КП {_fh(float(f.get('critical_path_hours') or 0))}.\n"
+            f"Циклов {int(f.get('rework_loops_n') or 0)}.",
+            6,
+        )
+    if re.search(r"цикл|возврат|доработ|rework", low):
+        n = int(f.get("rework_loops_n") or 0)
+        if f.get("tobe_ready"):
+            return _limit_lines(
+                f"**Циклы {f.get('loops_before')} → {f.get('loops_after')}.**\n"
+                f"Путь с возвратами {_fh(float(f['rw_before']))} → {_fh(float(f['rw_after']))}.",
+                6,
+            )
+        return _limit_lines(f"**Циклов возврата: {n}.** " + (f.get("rework_loops") or [{}])[0].get("label", ""), 6)
+    if re.search(r"роль|нагруз|bus|исполнител", low):
+        return _limit_lines(
+            f"**Bus-factor: «{f.get('bus_role') or '—'}» {float(f.get('bus_share') or 0):.0%} шагов.**\n"
+            "На схеме эта дорожка держит процесс.",
+            6,
+        )
+    if selected_id and selected_id in cat:
+        return cat[selected_id].get("copilot") or _copilot_tobe(ctx)
+    return _copilot_tobe(ctx) if f.get("tobe_ready") else _limit_lines(
+        f"**«{ctx.get('title')}».** Срок с возвратами {_fh(float(f.get('with_rework_hours') or 0))}.",
+        6,
+    )
 
 
 def build_canvas_copilot(
@@ -3949,24 +5441,14 @@ def build_canvas_copilot(
     regulation_text: str,
     tobe_delta: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Пакет для плавающего ассистента на холсте: чипы и ответы по аудиту + сравнение As-Is/To-Be."""
+    """Пакет для плавающего ассистента на холсте: чипы и локальные ответы. Облако не вызывается."""
     ctx = build_process_context(regulation_text or "", xml_str or "", audit_data or {}, tobe_delta=tobe_delta)
     title = str(ctx.get("title") or "Бизнес-процесс")
-    try:
-        sla_a = heuristic_analysis("В чём причина срыва SLA?", ctx)
-        speed_a = heuristic_analysis("Как ускорить процесс?", ctx)
-        roles_a = _analysis_load(ctx, [])
-        compare_a = heuristic_analysis("Сравни As-Is и To-Be, до и после", ctx)
-        read_a = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx)
-        why_a = heuristic_analysis("Как мы сократили время? Объясни подробнее", ctx)
-        qual_a = heuristic_analysis("Почему изменился Quality Score?", ctx)
-        loops_a = heuristic_analysis("Циклы возврата на доработку", ctx)
-        land_a = heuristic_analysis("ИТ-ландшафт и документы процесса", ctx)
-        fallback = _analysis_open("краткий архитектурный разбор", ctx)
-    except Exception:  # noqa: BLE001 — холст не должен падать
-        sla_a = speed_a = roles_a = compare_a = read_a = why_a = qual_a = loops_a = land_a = fallback = (
-            "Сгенерируйте диаграмму, чтобы ассистент опирался на аудит процесса."
-        )
+    sla_a = canvas_copilot_reply("В чём причина срыва SLA?", xml_str, audit_data, regulation_text, tobe_delta)
+    speed_a = canvas_copilot_reply("Как ускорить процесс?", xml_str, audit_data, regulation_text, tobe_delta)
+    roles_a = canvas_copilot_reply("Как оптимизировать нагрузку ролей?", xml_str, audit_data, regulation_text, tobe_delta)
+    compare_a = canvas_copilot_reply("Сравни As-Is и To-Be", xml_str, audit_data, regulation_text, tobe_delta)
+    loops_a = canvas_copilot_reply("Циклы возврата на доработку", xml_str, audit_data, regulation_text, tobe_delta)
     chips = [
         {"id": "speed", "label": "⚡ Как ускорить?", "q": "Как ускорить процесс?", "a": speed_a},
         {"id": "sla", "label": "🔍 Анализ SLA", "q": "В чём причина срыва SLA?", "a": sla_a},
@@ -3976,16 +5458,15 @@ def build_canvas_copilot(
     return {
         "title": title,
         "greeting": (
-            f"Я ассистент процесса «{title}». Спросите про SLA, сравнение As-Is/To-Be, "
-            "читаемость или роли — отвечаю по цифрам аудита, в том числе в панораме."
+            f"Копайлот схемы «{title}»: объясняю то, что на холсте. Правки — в сайдбар."
         ),
-        "fallback": fallback,
+        "fallback": sla_a,
         "compare": compare_a,
-        "readability": read_a,
-        "why": why_a,
-        "quality": qual_a,
         "loops": loops_a,
-        "landscape": land_a,
+        "why": speed_a,
+        "quality": roles_a,
+        "readability": sla_a,
+        "landscape": roles_a,
         "chips": chips,
     }
 
@@ -4006,9 +5487,22 @@ _JOURNAL_RE = re.compile(
 )
 _CONTROL_HINT_RE = re.compile(r"входн\w+\s+контрол|комплектност\w+\s+документ", re.I)
 _OT_STOP_RE = re.compile(
-    r"допуск|наряд[\s-]*допуск|инструктаж|проверк|заземлен|отключен|разрешен|согласован|утвержден",
+    r"допуск|наряд[\s-]*допуск|инструктаж|"
+    r"проверк\w+\s+отсутств\w+\s+напряжен|"
+    r"установ\w+\s+заземлен|налож\w+\s+заземлен|включ\w+\s+заземляющ|"
+    r"(?<!зон[ауиеы]\s)отключен|"
+    r"разрешен|согласован|утвержден",
     re.I,
 )
+_PPE_PREPARE_RE = re.compile(
+    r"(?:подготов|готов\w*).{0,80}(?:сиз|инструмент|переносн\w+\s+заземлен)",
+    re.I,
+)
+_INSTALL_GROUND_RE = re.compile(
+    r"установ\w+\s+заземлен|налож\w+\s+заземлен|включ\w+\s+заземляющ",
+    re.I,
+)
+_TOBE_MINUTE = 1.0 / 60.0
 _REPAIR_WORK_RE = re.compile(
     r"аварийн\w+\s+ремонт|выполн\w+\s+.{0,40}ремонт|ремонт\s+оборудован|"
     r"строительно-монтаж|производств\w+\s+работ|выполн\w+\s+работ",
@@ -4024,11 +5518,14 @@ _CAUSAL_RE = re.compile(
 TOBE_SYSTEM = """Ты — ведущий бизнес-архитектор ПАО «Интер РАО».
 Перепиши регламент, сохранив заголовок и целевой SLA. Правила:
 1) Параллелизация: независимые шаги РАЗНЫХ ролей начинай с «Параллельно:».
-   СТОП-ЛИСТ охраны труда — НЕ ставь «Параллельно:», если шаг содержит:
-   допуск, наряд-допуск, инструктаж, проверк, заземлен, отключен, разрешен, согласован, утвержден.
+   СТОП-ЛИСТ охраны труда — НЕ ставь «Параллельно:», если шаг — допуск, наряд-допуск, целевой инструктаж,
+   отключение, проверка отсутствия напряжения, УСТАНОВКА заземлений (установить/наложить, ножи).
+   Подготовка СИЗ, инструмента и переносных заземлений («подготовить … заземления») — НЕ стоп-лист, её можно
+   параллелить с оперативными переключениями диспетчера.
    Фактический ремонт / выполнение работ — СТРОГО ПОСЛЕ допуска и инструктажа, никогда параллельно с ними.
-2) Zero-Rework: перед шлюзами согласования добавь шаг «Роль проводит предварительный входной контроль … перед шагом N»;
-   формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
+2) Zero-Rework: цикл замени эскалацией на ИСКЛЮЧИТЕЛЬНОЙ ветке, не на счастливом пути.
+   Входной контроль — параллельно независимому шагу ИЛИ не длиннее 5 минут (не 15 минут на критическом пути).
+   Формулировки «вернуть на п.N / на доработку» замени эскалацией руководителю без повторного цикла.
    Не начинай шаг с существительного («Входной контроль…») — только роль + глагол.
 3) Автоматизация: фиксацию в журналах пиши БЕЗ двоеточия после системы:
    «Информационная система автоматически регистрирует … (5 минут)».
@@ -4163,9 +5660,19 @@ def _ot_blob(step: Step, body: str = "") -> str:
     return f"{step.title or ''} {body or ''}"
 
 
+def _is_prepare_ppe_ground(blob: str) -> bool:
+    """«Готовит СИЗ, инструмент и переносные заземления» — подготовка, не установка заземлений."""
+    return bool(_PPE_PREPARE_RE.search(blob or "")) and not _INSTALL_GROUND_RE.search(blob or "")
+
+
 def _ot_sensitive(step: Step, body: str = "") -> bool:
-    """Стоп-лист охраны труда: допуск, инструктаж, заземление, отключения не распараллеливаются."""
-    return bool(_OT_STOP_RE.search(_ot_blob(step, body)))
+    """Стоп-лист ОТ. Существительное «заземления» в шаге «подготовить» стоп-лист не включает."""
+    blob = _ot_blob(step, body)
+    if _is_prepare_ppe_ground(blob):
+        return False
+    if _INSTALL_GROUND_RE.search(blob):
+        return True
+    return bool(_OT_STOP_RE.search(blob))
 
 
 def _is_repair_work(step: Step, body: str = "") -> bool:
@@ -4173,12 +5680,25 @@ def _is_repair_work(step: Step, body: str = "") -> bool:
 
 
 def _forbid_parallel(a: Step, b: Step, body_a: str = "", body_b: str = "") -> bool:
-    """AND запрещён, если шаг из стоп-листа ОТ либо ремонт идёт параллельно допуску/инструктажу."""
-    if _ot_sensitive(a, body_a) or _ot_sensitive(b, body_b):
-        return True
+    """AND запрещён между шагами стоп-листа ОТ; ремонт не параллелен допуску/инструктажу.
+
+    Подготовка СИЗ/инструмента/переносных заземлений может идти параллельно переключениям диспетчера.
+    """
+    a_ppe = _is_prepare_ppe_ground(_ot_blob(a, body_a))
+    b_ppe = _is_prepare_ppe_ground(_ot_blob(b, body_b))
+    a_ot, b_ot = _ot_sensitive(a, body_a), _ot_sensitive(b, body_b)
     a_repair, b_repair = _is_repair_work(a, body_a), _is_repair_work(b, body_b)
-    a_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(a, body_a), re.I))
-    b_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(b, body_b), re.I))
+    a_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(a, body_a), re.I)) and not a_ppe
+    b_permit = bool(re.search(r"допуск|наряд|инструктаж", _ot_blob(b, body_b), re.I)) and not b_ppe
+    if (a_ppe and (b_repair or b_permit)) or (b_ppe and (a_repair or a_permit)):
+        return True
+    if a_ppe or b_ppe:
+        return False
+    if a_ot and b_ot:
+        return True
+    if a_ot or b_ot:
+        if a_repair or b_repair or a_permit or b_permit:
+            return True
     if (a_repair and b_permit) or (b_repair and a_permit):
         return True
     return False
@@ -4215,15 +5735,128 @@ def _cut_rework_loop(body: str) -> str:
         body,
         flags=re.I,
     )
-    return re.sub(
+    text = re.sub(
         r"«[^»]*(?:доработ|замечан|повторн)[^»]*»\s*[—–-]\s*(?:вернуть|возврат)\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+",
+        "иначе эскалация руководителю процесса",
+        text,
+        flags=re.I,
+    )
+    return re.sub(
+        r"(?:если|иначе|при)\b[^.]{0,80}\bназад\b",
         "иначе эскалация руководителю процесса",
         text,
         flags=re.I,
     )
 
 
-def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
+def _is_parallel_body(body: str) -> bool:
+    return bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", body or "", re.I))
+
+
+def _tobe_metrics(audit: Optional[dict], text: str) -> Dict[str, float]:
+    data = audit or {}
+    sla = data.get("sla") or {}
+    cp = float(sla.get("critical_path_hours") or 0)
+    rw = float(sla.get("with_rework_hours") or cp)
+    _, steps = _split_steps(normalize_regulation(text or ""))
+    return {
+        "cp": cp,
+        "rw": rw,
+        "loops": float(len(data.get("rework_loops") or [])),
+        "q": float(int((data.get("methodology") or {}).get("score") or 0)),
+        "n": float(len(steps)),
+    }
+
+
+def _ppe_parallel_preserved(asis_text: str, tobe_text: str) -> bool:
+    """Подготовка СИЗ/инструмента/переносных заземлений остаётся параллельной, как в As-Is."""
+    _, asis_s = _split_steps(normalize_regulation(asis_text or ""))
+    asis_ppe = [s["body"] for s in asis_s if _is_prepare_ppe_ground(s["body"])]
+    if not asis_ppe or not any(_is_parallel_body(b) for b in asis_ppe):
+        return True
+    _, tobe_s = _split_steps(normalize_regulation(tobe_text or ""))
+    tobe_ppe = [s["body"] for s in tobe_s if _is_prepare_ppe_ground(s["body"])]
+    return bool(tobe_ppe) and any(_is_parallel_body(b) for b in tobe_ppe)
+
+
+def _ot_order_ok(text: str) -> bool:
+    """Ремонт после допуска/инструктажа; установка заземлений и допуск не параллельны; СИЗ-подготовка может быть AND."""
+    raw = normalize_regulation(text or "")
+    try:
+        parsed = parse_regulation(raw)
+        _, steps = _split_steps(raw)
+    except Exception:  # noqa: BLE001
+        return False
+    n = min(len(parsed.steps), len(steps))
+    if n == 0:
+        return True
+    bodies = [steps[i]["body"] for i in range(n)]
+    idx_repair = next((i for i in range(n) if _is_repair_work(parsed.steps[i], bodies[i])), None)
+    idx_brief = next(
+        (i for i in range(n) if re.search(r"инструктаж", _ot_blob(parsed.steps[i], bodies[i]), re.I)),
+        None,
+    )
+    idx_permit = next(
+        (
+            i
+            for i in range(n)
+            if re.search(r"наряд[\s-]*допуск|\bдопуск", _ot_blob(parsed.steps[i], bodies[i]), re.I)
+            and not _is_prepare_ppe_ground(_ot_blob(parsed.steps[i], bodies[i]))
+        ),
+        None,
+    )
+    if idx_repair is not None:
+        if _is_parallel_body(bodies[idx_repair]):
+            return False
+        if idx_permit is not None and idx_repair < idx_permit:
+            return False
+        if idx_brief is not None and idx_repair < idx_brief:
+            return False
+    for i in range(n):
+        if not _is_parallel_body(bodies[i]):
+            continue
+        blob = _ot_blob(parsed.steps[i], bodies[i])
+        if _is_prepare_ppe_ground(blob):
+            if i and _forbid_parallel(parsed.steps[i - 1], parsed.steps[i], bodies[i - 1], bodies[i]):
+                return False
+            continue
+        if _ot_sensitive(parsed.steps[i], bodies[i]) or _is_repair_work(parsed.steps[i], bodies[i]):
+            return False
+        if i and _forbid_parallel(parsed.steps[i - 1], parsed.steps[i], bodies[i - 1], bodies[i]):
+            return False
+    return True
+
+
+def _tobe_feasible(asis: Dict[str, float], cand: Dict[str, float], asis_text: str, cand_text: str) -> bool:
+    """Жёсткие ограничения + лексикографические откаты (голый путь, возвраты, циклы, quality, ОТ)."""
+    if cand["cp"] > asis["cp"] + _TOBE_MINUTE:
+        return False
+    if asis["loops"] > 0 and cand["rw"] >= asis["rw"] - 1e-9:
+        return False
+    if cand["loops"] > asis["loops"]:
+        return False
+    if cand["q"] + 1e-9 < asis["q"]:
+        return False
+    if not _ot_order_ok(cand_text):
+        return False
+    if not _ppe_parallel_preserved(asis_text, cand_text):
+        return False
+    return True
+
+
+def _heuristic_optimize_to_be(
+    regulation_text: str,
+    *,
+    do_auto: bool = True,
+    do_parallel: bool = True,
+    do_safety: bool = True,
+    do_loops: bool = True,
+    do_control: bool = False,
+    only_auto: Optional[Set[int]] = None,
+    only_parallel: Optional[Set[int]] = None,
+    only_loops: Optional[Set[int]] = None,
+    only_control: Optional[Set[int]] = None,
+) -> Tuple[str, List[Dict[str, str]]]:
     raw_text = normalize_regulation(regulation_text or "")
     header, raw_steps = _split_steps(raw_text)
     try:
@@ -4233,91 +5866,133 @@ def _heuristic_optimize_to_be(regulation_text: str) -> Tuple[str, List[Dict[str,
     n = min(len(parsed.steps), len(raw_steps))
     if n < 2:
         return raw_text, []
+    if not (do_auto or do_parallel or do_safety or do_loops or do_control):
+        return raw_text, []
     actions: List[Dict[str, str]] = []
     bodies = [raw_steps[i]["body"] for i in range(n)]
     nums = [parsed.steps[i].num for i in range(n)]
 
-    for i in range(n):
-        body = bodies[i]
-        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
-            bodies[i] = _automate_journal_body(body)
-            actions.append(
-                {
-                    "kind": "automation",
-                    "detail": f"Шаг {nums[i]} «{parsed.steps[i].title or 'фиксация'}»: scriptTask, фиксация в журнале выполняется системой.",
-                }
-            )
+    if do_auto:
+        for i in range(n):
+            if only_auto is not None and i not in only_auto:
+                continue
+            body = bodies[i]
+            if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+                bodies[i] = _automate_journal_body(body)
+                actions.append(
+                    {
+                        "kind": "automation",
+                        "detail": (
+                            f"Шаг {nums[i]} «{parsed.steps[i].title or 'фиксация'}»: "
+                            "scriptTask, фиксация в журнале выполняется системой."
+                        ),
+                    }
+                )
 
-    i = 0
-    while i < n - 1:
-        a, b = parsed.steps[i], parsed.steps[i + 1]
-        already = bool(re.match(r"^(?:параллельно|одновременно)\s*[:,—–-]?", bodies[i + 1], re.I))
-        if (
-            not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
-            and _independent_steps(a, b, bodies[i], bodies[i + 1])
-            and not already
-        ):
-            bodies[i + 1] = "Параллельно: " + bodies[i + 1]
-            b.parallel = True
-            actions.append(
-                {
-                    "kind": "parallel",
-                    "detail": f"Шаги {a.num} ({a.role}) и {b.num} ({b.role}) выполняются параллельно.",
-                }
-            )
-            i += 2
-            continue
-        i += 1
+    if do_parallel:
+        i = 0
+        while i < n - 1:
+            a, b = parsed.steps[i], parsed.steps[i + 1]
+            if only_parallel is not None and i not in only_parallel:
+                i += 1
+                continue
+            already = _is_parallel_body(bodies[i + 1])
+            if (
+                not _forbid_parallel(a, b, bodies[i], bodies[i + 1])
+                and _independent_steps(a, b, bodies[i], bodies[i + 1])
+                and not already
+            ):
+                bodies[i + 1] = "Параллельно: " + bodies[i + 1]
+                b.parallel = True
+                actions.append(
+                    {
+                        "kind": "parallel",
+                        "detail": f"Шаги {a.num} ({a.role}) и {b.num} ({b.role}) выполняются параллельно.",
+                    }
+                )
+                i += 2
+                continue
+            i += 1
 
-    for i in range(n):
-        st = parsed.steps[i]
-        if not (_ot_sensitive(st, bodies[i]) or _is_repair_work(st, bodies[i])):
-            continue
-        stripped = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", bodies[i], flags=re.I)
-        if stripped != bodies[i]:
-            bodies[i] = stripped
-            st.parallel = False
-            actions.append(
-                {
-                    "kind": "safety_seq",
-                    "detail": (
-                        f"Шаг {nums[i]} «{st.title or 'работы'}» оставлен строго последовательным: "
-                        "допуск / инструктаж / заземление нельзя выполнять параллельно с ремонтом."
-                    ),
-                }
-            )
+    if do_safety:
+        for i in range(n):
+            st = parsed.steps[i]
+            if _is_prepare_ppe_ground(_ot_blob(st, bodies[i])):
+                continue
+            if not (_ot_sensitive(st, bodies[i]) or _is_repair_work(st, bodies[i])):
+                continue
+            stripped = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", bodies[i], flags=re.I)
+            if stripped != bodies[i]:
+                bodies[i] = stripped
+                st.parallel = False
+                actions.append(
+                    {
+                        "kind": "safety_seq",
+                        "detail": (
+                            f"Шаг {nums[i]} «{st.title or 'работы'}» оставлен строго последовательным: "
+                            "допуск / инструктаж / установка заземлений не параллельны ремонту."
+                        ),
+                    }
+                )
 
     control_at: Dict[int, str] = {}
-    for i in range(n):
-        st = parsed.steps[i]
-        d = st.decision
-        loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
-        if not loops:
-            continue
-        bodies[i] = _cut_rework_loop(bodies[i])
-        prev = bodies[i - 1] if i else ""
-        if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
+    if do_loops:
+        for i in range(n):
+            st = parsed.steps[i]
+            d = st.decision
+            loops = bool(d and (d.no_back or (d.no_ref is not None and d.no_ref < st.num)))
+            if not loops:
+                continue
+            if only_loops is not None and i not in only_loops:
+                continue
+            bodies[i] = _cut_rework_loop(bodies[i])
+            prev = bodies[i - 1] if i else ""
+            if _CONTROL_HINT_RE.search(prev) or _CONTROL_HINT_RE.search(bodies[i]):
+                actions.append(
+                    {
+                        "kind": "zero_rework",
+                        "detail": f"Шаг {st.num}: петля возврата снята эскалацией, входной контроль уже есть.",
+                    }
+                )
+                continue
+            inserted = False
+            if do_control and i and (only_control is None or i in only_control):
+                prev_st = parsed.steps[i - 1]
+                prev_role = prev_st.role or ""
+                ctrl_role = next(
+                    (s.role for s in parsed.steps if s.role and s.role not in {st.role, prev_role}),
+                    "",
+                )
+                ctrl_body = (
+                    f"Параллельно: {ctrl_role} проводит предварительный входной контроль "
+                    f"комплектности документов и исходных данных перед шагом {st.num} (5 минут)."
+                )
+                ctrl_step = Step(
+                    idx=-1,
+                    num=0,
+                    role=ctrl_role,
+                    title="проводит предварительный входной контроль комплектности документов",
+                    parallel=True,
+                    hours=5.0 / 60.0,
+                )
+                if (
+                    ctrl_role
+                    and not _forbid_parallel(prev_st, ctrl_step, bodies[i - 1], ctrl_body)
+                    and not _ot_sensitive(prev_st, bodies[i - 1])
+                    and not _is_repair_work(prev_st, bodies[i - 1])
+                ):
+                    control_at[i] = ctrl_body
+                    inserted = True
             actions.append(
                 {
                     "kind": "zero_rework",
-                    "detail": f"Шаг {st.num}: петля возврата снята, входной контроль уже есть.",
+                    "detail": (
+                        f"Шаг {st.num} «{st.title or 'согласование'}»: цикл заменён эскалацией "
+                        "на исключительной ветке"
+                        + (", входной контроль параллелен независимому шагу (5 минут)." if inserted else ".")
+                    ),
                 }
             )
-            continue
-        prev_role = parsed.steps[i - 1].role if i else ""
-        ctrl_role = prev_role if prev_role and prev_role != st.role else next(
-            (s.role for s in parsed.steps if s.role and s.role != st.role), st.role
-        )
-        control_at[i] = (
-            f"{ctrl_role} проводит предварительный входной контроль комплектности документов "
-            f"и исходных данных перед шагом {st.num} (15 минут)."
-        )
-        actions.append(
-            {
-                "kind": "zero_rework",
-                "detail": f"Перед шагом {st.num} «{st.title or 'согласование'}» введён входной контроль, цикл доработки заменён эскалацией.",
-            }
-        )
 
     assembled: List[Tuple[Optional[int], str]] = []
     for i in range(n):
@@ -4424,46 +6099,216 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
     }
 
 
-def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
-    """Реинжиниринг As-Is → To-Be: параллелизация, Zero-Rework, автоматизация журналов.
+def _catalog_tobe_moves(regulation_text: str) -> Tuple[List[int], List[int], List[int]]:
+    """Индексы отдельных ходов: автоматизация, соседняя параллель, снятие цикла."""
+    raw_text = normalize_regulation(regulation_text or "")
+    try:
+        parsed = parse_regulation(raw_text)
+        _, raw_steps = _split_steps(raw_text)
+    except Exception:  # noqa: BLE001
+        return [], [], []
+    n = min(len(parsed.steps), len(raw_steps))
+    bodies = [raw_steps[i]["body"] for i in range(n)]
+    autos: List[int] = []
+    pairs: List[int] = []
+    loops: List[int] = []
+    for i in range(n):
+        body = bodies[i]
+        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+            autos.append(i)
+        d = parsed.steps[i].decision
+        if d and (d.no_back or (d.no_ref is not None and d.no_ref < parsed.steps[i].num)):
+            loops.append(i)
+    for i in range(n - 1):
+        a, b = parsed.steps[i], parsed.steps[i + 1]
+        if _is_parallel_body(bodies[i + 1]):
+            continue
+        if _forbid_parallel(a, b, bodies[i], bodies[i + 1]):
+            continue
+        if _independent_steps(a, b, bodies[i], bodies[i + 1]):
+            pairs.append(i)
+    return autos, pairs, loops
 
-    По умолчанию — детерминированный семантический оптимизатор (~0.05 с).
-    Облачная LLM включается только переменной BPMN_TOBE_LLM=1.
+
+_TOBE_FULL_ENUM_LIMIT = 48
+_TOBE_REBUILD_BUDGET = 64
+
+
+def _iter_tobe_selections(
+    autos: Sequence[int],
+    pairs: Sequence[int],
+    loops: Sequence[int],
+) -> List[Tuple[Set[int], Set[int], Set[int], Set[int]]]:
+    """Сочетания ходов. У цикла три состояния: не трогать, снять, снять и добавить контроль."""
+    auto_l, pair_l, loop_l = list(autos), list(pairs), list(loops)
+    count = (2 ** len(auto_l)) * (2 ** len(pair_l)) * (3 ** len(loop_l))
+    selections: List[Tuple[Set[int], Set[int], Set[int], Set[int]]] = []
+
+    def add(auto_idx: Sequence[int], pair_idx: Sequence[int], loop_states: Sequence[int]) -> None:
+        chosen_loops = {loop_l[i] for i, state in enumerate(loop_states) if state}
+        chosen_ctrl = {loop_l[i] for i, state in enumerate(loop_states) if state == 2}
+        selections.append((set(auto_idx), set(pair_idx), chosen_loops, chosen_ctrl))
+
+    if 0 < count <= _TOBE_FULL_ENUM_LIMIT:
+        for amask in range(2 ** len(auto_l)):
+            auto_idx = [auto_l[i] for i in range(len(auto_l)) if amask & (1 << i)]
+            for pmask in range(2 ** len(pair_l)):
+                pair_idx = [pair_l[i] for i in range(len(pair_l)) if pmask & (1 << i)]
+                states = [0] * len(loop_l)
+                if not loop_l:
+                    add(auto_idx, pair_idx, states)
+                    continue
+                for lmask in range(3 ** len(loop_l)):
+                    value = lmask
+                    for i in range(len(loop_l)):
+                        states[i] = value % 3
+                        value //= 3
+                    add(auto_idx, pair_idx, states)
+        return selections
+
+    full_states = [1] * len(loop_l)
+    ctrl_states = [2] * len(loop_l)
+    add(auto_l, pair_l, full_states)
+    add(auto_l, pair_l, ctrl_states)
+    add([], [], full_states)
+    for i in range(len(auto_l)):
+        add([auto_l[i]], [], [0] * len(loop_l))
+        add([a for k, a in enumerate(auto_l) if k != i], pair_l, full_states)
+    for i in range(len(pair_l)):
+        add([], [pair_l[i]], [0] * len(loop_l))
+        add(auto_l, [p for k, p in enumerate(pair_l) if k != i], full_states)
+    for i in range(len(loop_l)):
+        alone = [0] * len(loop_l)
+        alone[i] = 1
+        add([], [], alone)
+        with_ctrl = [0] * len(loop_l)
+        with_ctrl[i] = 2
+        add([], [], with_ctrl)
+        rest = [1] * len(loop_l)
+        rest[i] = 0
+        add(auto_l, pair_l, rest)
+    return selections
+
+
+def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
+    """Реинжиниринг As-Is → To-Be: поиск оптимума с откатом ходов, нарушающих ОТ или удлиняющих голый путь.
+
+    Лексикография после жёстких ограничений: короче путь с возвратами, затем короче голый КП, затем меньше шагов.
+    Сначала считаются прежние наборы классов ходов — это текущий To-Be. Затем перебираются сочетания отдельных ходов.
+    Сочетание заменяет текущий To-Be только если оно строго лучше. Если ни один кандидат не принят — возвращается As-Is.
+    Облачная LLM включается только переменной BPMN_TOBE_LLM=1 и проходит ту же проверку.
     """
     text = (regulation_text or "").strip()
     empty = {
         "sla_before_hours": 0.0, "sla_after_hours": 0.0, "sla_saved_hours": 0.0, "sla_saved_pct": 0.0,
         "rework_before": 0, "rework_after": 0, "rework_removed": 0,
         "rework_hours_before": 0.0, "rework_hours_after": 0.0,
+        "with_rework_before": 0.0, "with_rework_after": 0.0,
         "quality_before": 0, "quality_after": 0, "quality_gain": 0,
         "breach_before": False, "breach_after": False, "actions": [], "engine": "semantic-optimizer",
         "tobe_xml": "", "tobe_audit": {}, "tobe_error": "",
     }
     if len(text) < 20:
         return text, empty
-    engine = "semantic-optimizer"
-    optimized = None
+
+    asis_audit = audit_data or {}
+    asis_m = _tobe_metrics(asis_audit, text)
+    flagsets: List[Dict[str, bool]] = [
+        {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": False},
+        {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": True},
+        {"do_auto": True, "do_parallel": False, "do_safety": True, "do_loops": True, "do_control": False},
+        {"do_auto": False, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": False},
+        {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": False, "do_control": False},
+        {"do_auto": True, "do_parallel": False, "do_safety": False, "do_loops": True, "do_control": False},
+        {"do_auto": False, "do_parallel": False, "do_safety": True, "do_loops": True, "do_control": False},
+    ]
+    seen: set = set()
+    built = 0
+    best: Optional[Tuple[Tuple[float, float, float], str, List[Dict[str, str]], str, dict, str]] = None
+
+    def _consider(cand_text: str, cand_actions: List[Dict[str, str]], cand_engine: str) -> None:
+        nonlocal best, built
+        if built >= _TOBE_REBUILD_BUDGET:
+            return
+        key = normalize_regulation(cand_text or "")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        built += 1
+        try:
+            xml, new_audit, err = _rebuild_process(cand_text, f"to-be · {cand_engine}", [], use_llm=(cand_engine == "llm"))
+        except Exception as exc:  # noqa: BLE001
+            xml, new_audit, err = "", {}, f"{type(exc).__name__}: {exc}"
+        if err or not new_audit:
+            return
+        metrics = _tobe_metrics(new_audit, cand_text)
+        if not _tobe_feasible(asis_m, metrics, text, cand_text):
+            return
+        score = (metrics["rw"], metrics["cp"], metrics["n"])
+        pack = (score, cand_text, cand_actions or [], xml, new_audit, cand_engine)
+        if best is None or pack[0] < best[0]:
+            best = pack
+
     llm_text = None
     try:
-        llm_text = _try_llm_optimize_to_be(text, audit_data or {})
+        llm_text = _try_llm_optimize_to_be(text, asis_audit)
     except Exception:  # noqa: BLE001
         llm_text = None
     if llm_text:
-        optimized, engine = llm_text, "llm"
-        actions = _collect_tobe_actions(text, optimized)
-    else:
-        optimized, actions = _heuristic_optimize_to_be(text)
+        _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm")
+
+    for flags in flagsets:
+        opt_text, actions = _heuristic_optimize_to_be(text, **flags)
         if not actions:
-            actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
-    xml, new_audit, err = "", {}, ""
-    try:
-        xml, new_audit, err = _rebuild_process(optimized, f"to-be · {engine}", [], use_llm=(engine == "llm"))
-    except Exception as exc:  # noqa: BLE001
-        err = f"{type(exc).__name__}: {exc}"
-    delta = _tobe_delta(audit_data or {}, new_audit or {}, actions, engine)
+            continue
+        _consider(opt_text, actions, "semantic-optimizer")
+
+    autos, pairs, loops = _catalog_tobe_moves(text)
+    for auto_idx, pair_idx, loop_idx, ctrl_idx in _iter_tobe_selections(autos, pairs, loops):
+        if not (auto_idx or pair_idx or loop_idx or ctrl_idx):
+            continue
+        opt_text, actions = _heuristic_optimize_to_be(
+            text,
+            do_auto=bool(auto_idx),
+            do_parallel=bool(pair_idx),
+            do_safety=True,
+            do_loops=bool(loop_idx),
+            do_control=bool(ctrl_idx),
+            only_auto=auto_idx,
+            only_parallel=pair_idx,
+            only_loops=loop_idx,
+            only_control=ctrl_idx,
+        )
+        if not actions:
+            continue
+        _consider(opt_text, actions, "semantic-optimizer")
+
+    engine = "semantic-optimizer"
+    if best is None:
+        optimized = text
+        actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+        xml, new_audit, err = "", asis_audit, ""
+        if asis_audit.get("sla"):
+            pass
+        else:
+            try:
+                xml, new_audit, err = _rebuild_process(text, "to-be · as-is", [], use_llm=False)
+            except Exception as exc:  # noqa: BLE001
+                err = f"{type(exc).__name__}: {exc}"
+        delta = _tobe_delta(asis_audit, new_audit or asis_audit, actions, engine)
+        delta["tobe_xml"] = xml or ""
+        delta["tobe_audit"] = new_audit or asis_audit
+        delta["tobe_error"] = err or ""
+        return optimized, delta
+
+    _score, optimized, actions, xml, new_audit, engine = best
+    actions = _limit_escalation_actions(actions, asis_audit, new_audit)
+    if not actions:
+        actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+    delta = _tobe_delta(asis_audit, new_audit or {}, actions, engine)
     delta["tobe_xml"] = xml or ""
     delta["tobe_audit"] = new_audit or {}
-    delta["tobe_error"] = err or ""
+    delta["tobe_error"] = ""
     return optimized, delta
 
 

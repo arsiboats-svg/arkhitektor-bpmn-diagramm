@@ -183,7 +183,7 @@
       <bpmndi:BPMNShape id="Activity_2_di" bpmnElement="Activity_2" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
         <dc:Bounds x="598.0" y="362.5" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Gateway_1_di" bpmnElement="Gateway_1" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
+      <bpmndi:BPMNShape id="Gateway_1_di" bpmnElement="Gateway_1" isMarkerVisible="true" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
         <dc:Bounds x="822.0" y="383.2" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
           <dc:Bounds x="853.0" y="351.2" width="150.0" height="30.0" />
@@ -192,7 +192,7 @@
       <bpmndi:BPMNShape id="Activity_3_di" bpmnElement="Activity_3" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
         <dc:Bounds x="956.0" y="916.0" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Gateway_2_di" bpmnElement="Gateway_2" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
+      <bpmndi:BPMNShape id="Gateway_2_di" bpmnElement="Gateway_2" isMarkerVisible="true" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
         <dc:Bounds x="1180.0" y="936.8" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
           <dc:Bounds x="1066.6" y="899.8" width="132.4" height="15.0" />
@@ -226,7 +226,7 @@
       <bpmndi:BPMNShape id="Activity_8_di" bpmnElement="Activity_8" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
         <dc:Bounds x="2046.0" y="649.2" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Gateway_3_di" bpmnElement="Gateway_3" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
+      <bpmndi:BPMNShape id="Gateway_3_di" bpmnElement="Gateway_3" isMarkerVisible="true" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
         <dc:Bounds x="2306.0" y="670.0" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
           <dc:Bounds x="2175.0" y="618.0" width="150.0" height="30.0" />

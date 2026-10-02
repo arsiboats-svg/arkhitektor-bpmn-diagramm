@@ -91,8 +91,6 @@ def validate(path: str) -> List[str]:
         problems.append(f"дубликат id {dup}")
 
     text = open(path, encoding="utf-8").read()
-    if "isMarkerVisible" in text:
-        problems.append("присутствует isMarkerVisible")
     for tag in ("xmlns:bioc=", "xmlns:color="):
         if tag not in text:
             problems.append(f"нет объявления {tag}")
